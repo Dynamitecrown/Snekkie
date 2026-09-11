@@ -8,10 +8,13 @@ in the same config directory, same load/save shape as ProfileStore.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from .profiles import config_dir
+
+#: Keys every theme carries.
+THEME_KEYS = ("fg", "bg", "cursor", "selection")
 
 #: Preset colour themes: terminal foreground, background, cursor, and the
 #: highlight colour used for selected text. The 16-colour ANSI palette
@@ -55,6 +58,10 @@ class AppSettings:
     custom_cursor: str = "#3ad900"
     custom_selection: str = "#3a5a80"
 
+    #: Themes the user saved, name -> {fg, bg, cursor, selection}. Kept
+    #: separate from THEMES so a future preset can never clobber one.
+    saved_themes: dict[str, dict[str, str]] = field(default_factory=dict)
+
     # Defaults filled into a brand-new session's Advanced tab. A saved
     # profile's own values, once set, always win over these.
     font_family: str = ""
@@ -63,13 +70,27 @@ class AppSettings:
 
     show_sidebar: bool = True
 
+    def custom_colors(self) -> dict[str, str]:
+        """The unsaved, currently-being-edited custom scheme."""
+        return {
+            "fg": self.custom_fg, "bg": self.custom_bg,
+            "cursor": self.custom_cursor, "selection": self.custom_selection,
+        }
+
     def colors(self) -> dict[str, str]:
         if self.theme == "Custom":
-            return {
-                "fg": self.custom_fg, "bg": self.custom_bg,
-                "cursor": self.custom_cursor, "selection": self.custom_selection,
-            }
+            return self.custom_colors()
+        if self.theme in self.saved_themes:
+            scheme = self.saved_themes[self.theme]
+            # Fall back per key so a hand-edited settings.json missing one
+            # colour still yields a usable theme rather than a KeyError.
+            return {k: scheme.get(k, THEMES[DEFAULT_THEME][k])
+                    for k in THEME_KEYS}
         return THEMES.get(self.theme, THEMES[DEFAULT_THEME])
+
+    def theme_names(self) -> list[str]:
+        """Built-in presets first, then the user's own, then Custom."""
+        return [*THEMES, *sorted(self.saved_themes), "Custom"]
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -77,7 +98,21 @@ class AppSettings:
     @classmethod
     def from_dict(cls, data: dict) -> AppSettings:
         known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        values = {k: v for k, v in data.items() if k in known}
+        # settings.json is a plain text file users do edit by hand, so don't
+        # trust the shape of this one -- a malformed theme here would
+        # otherwise blow up at paint time, far from the cause.
+        raw_themes = values.get("saved_themes")
+        clean: dict[str, dict[str, str]] = {}
+        if isinstance(raw_themes, dict):
+            for name, scheme in raw_themes.items():
+                if isinstance(name, str) and isinstance(scheme, dict):
+                    colours = {k: v for k, v in scheme.items()
+                               if k in THEME_KEYS and isinstance(v, str)}
+                    if colours:
+                        clean[name] = colours
+        values["saved_themes"] = clean
+        return cls(**values)
 
 
 class SettingsStore:

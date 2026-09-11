@@ -133,23 +133,40 @@ class Terminal:
         except Exception:
             return 0
 
-    def scroll_to(self, lines_back: int) -> None:
-        """Move as close as possible to a target scroll depth.
+    def scroll_by(self, lines: int) -> bool:
+        """Scroll up (positive) or down (negative) by exactly `lines` rows.
 
-        pyte only exposes paging (prev_page/next_page move a fixed chunk of
-        lines at a time), not an absolute seek, so a scrollbar drag has to
-        walk there one page at a time. Lands within one page of the target.
+        pyte only advertises half-screen paging, but the distance prev_page
+        and next_page move is just `ceil(screen.lines * history.ratio)`, so
+        borrowing the ratio for the duration of one call makes it travel
+        whatever distance we ask for -- a line at a time for the wheel, or
+        straight to a target in one hop for a scrollbar drag.
         """
-        target = max(lines_back, 0)
-        guard = self.scroll_total + self.screen.lines + 1  # more than enough
-        while self.scroll_back < target and guard > 0:
-            if not self.page_up():
-                break
-            guard -= 1
-        while self.scroll_back > target and guard > 0:
-            if not self.page_down():
-                break
-            guard -= 1
+        if not lines:
+            return False
+        screen = self.screen
+        try:
+            step = max(abs(lines), 1)
+            before = self.scroll_back
+            saved = screen.history.ratio
+            screen.history = screen.history._replace(ratio=step / screen.lines)
+            try:
+                if lines > 0:
+                    screen.prev_page()
+                else:
+                    screen.next_page()
+            finally:
+                # Re-read history first: the page call replaced it to record
+                # the new position, which must not be rolled back with it.
+                screen.history = screen.history._replace(ratio=saved)
+            return self.scroll_back != before
+        except Exception:
+            return False
+
+    def scroll_to(self, lines_back: int) -> None:
+        """Jump straight to a target scroll depth. 0 == the live bottom."""
+        target = max(0, min(lines_back, self.scroll_total))
+        self.scroll_by(target - self.scroll_back)
 
     # -- housekeeping ------------------------------------------------------
 

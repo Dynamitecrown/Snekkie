@@ -145,6 +145,7 @@ class SessionTab(QWidget):
         try:
             self.scrollbar.setRange(0, total_lines)
             self.scrollbar.setPageStep(max(self.terminal.terminal.lines, 1))
+            self.scrollbar.setSingleStep(1)  # arrows step a line, not a page
             self.scrollbar.setValue(total_lines - lines_back)
         finally:
             self.scrollbar.blockSignals(blocked)

@@ -72,13 +72,20 @@ On Linux you'll need to be in the `dialout` group to open serial ports
 - **Saved sessions** — JSON profiles, PuTTY-style load/save/delete
 - **Real VT100/ANSI emulation** — 16/256/truecolour, bold, underline,
   reverse, scroll regions, cursor addressing. `nano` and `htop` behave.
-- **Scrollback** — mouse wheel or Shift+PgUp/PgDn
+- **Scrollback** — scrollbar, mouse wheel (three lines a notch, and
+  trackpad-sized fractions of a notch accumulate rather than being rounded
+  away), or Shift+PgUp/PgDn for whole pages
 - **PuTTY mouse habits** — selecting copies, right-click pastes
+- **Tab reaches the far end** — it completes commands instead of moving
+  focus, and Shift+Tab sends CSI Z
 - **Session logging** — raw byte log to a file per profile
-- **Preferences** (`Ctrl+,`) — colour theme (six built-in presets or fully
-  custom foreground/background/cursor/selection colours), default font and
-  size for new sessions, and default scrollback. Sidebar can be hidden with
-  `Ctrl+B`.
+- **Preferences** (`Ctrl+,`) — colour theme, default font and size for new
+  sessions, and default scrollback. Sidebar can be hidden with `Ctrl+B`.
+- **Saved themes** — build a scheme with the custom
+  foreground/background/cursor/selection pickers, *Save as…* it under a name,
+  and it joins the six built-in presets in the theme list. Saved themes live
+  in `settings.json` and can be deleted from the same dialog; the built-in
+  presets can't be overwritten.
 - **Device syntax highlighting** — pick a device type in the sidebar
   (currently just Cisco IOS, or None) and its keywords, IP addresses, `no`
   negations, and prompt line get coloured wherever they appear on screen —
@@ -162,9 +169,17 @@ Nothing else changes.
 
 **Colour schemes:** the four theme colours (foreground/background/cursor/
 selection) live in `settings.py`'s `THEMES` dict and are app-wide, set via
-Preferences. The 16-colour ANSI palette used for SGR codes is still the
-fixed `PALETTE` dict at the top of `ui/terminal.py` — move it into
-`AppSettings` too if you want that themeable as well.
+Preferences; anything the user saves goes in `AppSettings.saved_themes`
+instead, so adding a preset later can never clobber one of theirs. The
+16-colour ANSI palette used for SGR codes is still the fixed `PALETTE` dict
+at the top of `ui/terminal.py` — move it into `AppSettings` too if you want
+that themeable as well.
+
+**Scroll granularity:** pyte only exposes half-screen paging, so
+`Terminal.scroll_by()` borrows `history.ratio` for the duration of one
+`prev_page`/`next_page` call — the distance those move is just
+`ceil(screen.lines * ratio)`. That buys exact line-at-a-time scrolling for
+the wheel and a single-hop seek for a scrollbar drag.
 
 **A new device syntax:** add an entry to `SYNTAXES` in `ui/highlight.py` —
 a list of `(regex, category)` pairs, where `category` is a key in `COLORS`

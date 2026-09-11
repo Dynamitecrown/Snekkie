@@ -50,6 +50,10 @@ HIGHLIGHT_CACHE_MAX = 1000
 #: screen survives that copying it is not worth the detection cost.
 MAX_BLIT_ROWS = 16
 
+#: Lines the wheel scrolls per notch. pyte pages by half a screen, which is
+#: far too coarse to read with.
+WHEEL_LINES = 3
+
 
 def _resolve(color: str, *, bold: bool, default: str) -> QColor:
     if color == "default":
@@ -103,6 +107,8 @@ class TerminalWidget(QWidget):
         self._painted_cursor_row: int | None = None
         #: last (scroll_back, scroll_total, lines) handed to scroll_changed
         self._last_scroll: tuple[int, int, int] | None = None
+        #: sub-notch wheel movement not yet worth a whole line
+        self._wheel_remainder = 0
         #: row text -> {column: hex colour} from the syntax pass. Recomputing
         #: this per paint dominated rendering. Keyed on the text rather than
         #: the row number so it survives scrolling: a line that scrolls up a
@@ -570,14 +576,32 @@ class TerminalWidget(QWidget):
         else:
             super().keyPressEvent(event)
 
+    def focusNextPrevChild(self, next_child: bool) -> bool:
+        """Keep Tab for the far end instead of moving focus.
+
+        Qt consumes Tab and Shift+Tab for focus navigation before they ever
+        reach keyPressEvent, so pressing Tab to complete a command jumped to
+        the sidebar instead. Refusing here sends them on to keyPressEvent,
+        which encodes them as TAB and CSI Z -- what IOS completion and shell
+        completion both expect.
+        """
+        return False
+
     def wheelEvent(self, event):
-        steps = event.angleDelta().y()
-        if steps == 0:
+        """Scroll a few lines per notch, the way every other app does.
+
+        angleDelta is in eighths of a degree and a normal notch is 120, but
+        high-resolution wheels and trackpads send much smaller increments, so
+        the leftover is carried rather than rounded away -- otherwise fine
+        scrolling registers as nothing at all.
+        """
+        delta = event.angleDelta().y()
+        if not delta:
             return
-        moved = False
-        for _ in range(max(abs(steps) // 120, 1)):
-            moved |= self.terminal.page_up() if steps > 0 else self.terminal.page_down()
-        if moved:
+        self._wheel_remainder += delta * WHEEL_LINES
+        lines = int(self._wheel_remainder / 120)  # truncates toward zero
+        self._wheel_remainder -= lines * 120
+        if lines and self.terminal.scroll_by(lines):
             self._repaint_all()
             self._emit_scroll()
 
