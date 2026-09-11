@@ -9,6 +9,8 @@ this module is just a thin, well-behaved wrapper.
 
 from __future__ import annotations
 
+from itertools import islice
+
 import pyte
 
 #: DEC private mode 1 (cursor keys application mode). pyte stores private
@@ -85,6 +87,72 @@ class Terminal:
 
     def text(self) -> str:
         return "\n".join(self.line_text(y) for y in range(self.screen.lines))
+
+    # -- the whole document (scrollback + screen) --------------------------
+    #
+    # pyte keeps three pieces: history.top holds what scrolled off above the
+    # screen (oldest first), buffer holds the visible rows, history.bottom
+    # holds what sits below when scrolled back (nearest first). Concatenated
+    # they are the document, and an "absolute" row index addresses it, which
+    # is what a selection needs -- a screen row number stops meaning anything
+    # the moment the view scrolls under it.
+
+    @property
+    def view_top(self) -> int:
+        """Absolute index of the topmost visible row."""
+        try:
+            return len(self.screen.history.top)
+        except Exception:
+            return 0
+
+    @property
+    def total_lines(self) -> int:
+        try:
+            history = self.screen.history
+            return (len(history.top) + self.screen.lines
+                    + len(history.bottom))
+        except Exception:
+            return self.screen.lines
+
+    def document_rows(self, start: int, end: int) -> list:
+        """Rows at absolute indices [start, end], inclusive and clamped."""
+        try:
+            history = self.screen.history
+            top, bottom = history.top, history.bottom
+        except Exception:
+            return []
+        lines = self.screen.lines
+        top_len = len(top)
+        start = max(start, 0)
+        end = min(end, top_len + lines + len(bottom) - 1)
+        if start > end:
+            return []
+
+        rows: list = []
+        # islice rather than deque[i]: indexing a deque walks to the index, so
+        # doing it per row would make copying a long selection quadratic.
+        if start < top_len:
+            rows.extend(islice(top, start, min(end, top_len - 1) + 1))
+        screen_end = top_len + lines - 1
+        if end >= top_len and start <= screen_end:
+            first = max(start, top_len) - top_len
+            last = min(end, screen_end) - top_len
+            buffer = self.screen.buffer
+            rows.extend(buffer[y] for y in range(first, last + 1))
+        if end > screen_end:
+            first = max(start, screen_end + 1) - screen_end - 1
+            rows.extend(islice(bottom, first, end - screen_end))
+        return rows
+
+    def document_line_text(self, start: int, end: int) -> list[str]:
+        """Plain text of absolute rows [start, end], trailing blanks kept."""
+        cols = self.screen.columns
+        out = []
+        for row in self.document_rows(start, end):
+            blank = row.default
+            get = row.get
+            out.append("".join([get(x, blank).data for x in range(cols)]))
+        return out
 
     # -- scrollback --------------------------------------------------------
 

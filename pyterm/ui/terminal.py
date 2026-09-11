@@ -54,6 +54,11 @@ MAX_BLIT_ROWS = 16
 #: far too coarse to read with.
 WHEEL_LINES = 3
 
+#: How often a drag past the edge scrolls, and the most it moves per tick.
+#: Dragging further out scrolls faster, the way a browser does.
+AUTOSCROLL_INTERVAL = 40
+AUTOSCROLL_MAX_LINES = 12
+
 
 def _resolve(color: str, *, bold: bool, default: str) -> QColor:
     if color == "default":
@@ -91,9 +96,16 @@ class TerminalWidget(QWidget):
         # derived QColors and caches it builds are never missing.
         self._apply_theme(theme or {})
 
+        # Selection endpoints are (absolute document row, column), not screen
+        # rows: the view scrolls out from under a drag, and a copy has to be
+        # able to reach lines that are no longer displayed at all.
         self._sel_anchor: tuple[int, int] | None = None
         self._sel_head: tuple[int, int] | None = None
         self._selecting = False
+        self._drag_pos = None
+        self._autoscroll = QTimer(self)
+        self._autoscroll.setInterval(AUTOSCROLL_INTERVAL)
+        self._autoscroll.timeout.connect(self._autoscroll_step)
 
         self._last_cursor_row: int | None = None
 
@@ -420,6 +432,7 @@ class TerminalWidget(QWidget):
         last = min(int(rect.bottom() / ch) + 1, rows)
         sel = self._selection_range()
         sel_start, sel_end = sel if sel is not None else (-1, -1)
+        view_top = self.terminal.view_top
 
         # Qt re-resolves the font on every setFont, so only call it when the
         # style actually changes rather than once per run.
@@ -461,7 +474,9 @@ class TerminalWidget(QWidget):
                     column_overrides[column] = overrides[offset]
                 offset += len(cell.data)
             get_override = column_overrides.get
-            row_base = y * cols
+            # Selection is in document coordinates; the screen is a window
+            # onto it starting at view_top.
+            row_base = (view_top + y) * cols
             x = 0
             while x < cols:
                 char = chars[x]
@@ -608,9 +623,15 @@ class TerminalWidget(QWidget):
     # -- mouse / selection -------------------------------------------------
 
     def _cell_at(self, pos) -> tuple[int, int]:
+        """Absolute (document row, column) under a widget-relative point.
+
+        Clamped to the visible rows, so a drag past an edge keeps pinning the
+        head to the first or last line -- which then travels as the view
+        scrolls under it.
+        """
         col = min(max(int(pos.x() / self._cw), 0), self.terminal.columns - 1)
         row = min(max(int(pos.y() / self._ch), 0), self.terminal.lines - 1)
-        return row, col
+        return self.terminal.view_top + row, col
 
     def _selection_range(self) -> tuple[int, int] | None:
         if self._sel_anchor is None or self._sel_head is None:
@@ -629,23 +650,65 @@ class TerminalWidget(QWidget):
             # the scroll blit copy pixels that are about to be redrawn.
             self._painted_rows = []
 
+    def _autoscroll_lines(self, pos) -> int:
+        """Lines to scroll per tick for a drag this far past an edge.
+
+        Positive is toward older output. Speed ramps with distance, so a
+        small overshoot creeps and a big one moves quickly.
+        """
+        y = pos.y()
+        if y < 0:
+            distance, direction = -y, 1
+        elif y > self.height():
+            distance, direction = y - self.height(), -1
+        else:
+            return 0
+        step = 1 + int(distance / max(self._ch, 1))
+        return direction * min(step, AUTOSCROLL_MAX_LINES)
+
+    def _autoscroll_step(self) -> None:
+        if not self._selecting or self._sel_anchor is None or self._drag_pos is None:
+            self._autoscroll.stop()
+            return
+        lines = self._autoscroll_lines(self._drag_pos)
+        if not lines or not self.terminal.scroll_by(lines):
+            self._autoscroll.stop()  # nothing left to scroll into
+            return
+        # The head is clamped to the edge row, so re-reading it after the
+        # view moved is what extends the selection over the new lines.
+        self._sel_head = self._cell_at(self._drag_pos)
+        self._repaint_all()
+        self._emit_scroll()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.RightButton:
             self.paste()  # PuTTY habit: right-click pastes
             return
         if event.button() == Qt.LeftButton:
             self._selecting = True
+            self._drag_pos = event.position()
             self._sel_anchor = self._sel_head = self._cell_at(event.position())
             self.update()
 
     def mouseMoveEvent(self, event):
-        if self._selecting:
-            self._sel_head = self._cell_at(event.position())
-            self.update()
+        if not self._selecting:
+            return
+        self._drag_pos = event.position()
+        self._sel_head = self._cell_at(self._drag_pos)
+        # Qt keeps delivering moves outside the widget while a button is
+        # held, so this is where a drag past the edge is noticed.
+        if self._autoscroll_lines(self._drag_pos):
+            if not self._autoscroll.isActive():
+                self._autoscroll.start()
+        else:
+            self._autoscroll.stop()
+        self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self._selecting:
+            self._autoscroll.stop()
             self._selecting = False
+            self._drag_pos = None
             self._sel_head = self._cell_at(event.position())
             if self._sel_anchor == self._sel_head:
                 self._sel_anchor = self._sel_head = None
@@ -669,14 +732,17 @@ class TerminalWidget(QWidget):
             return ""
         cols = self.terminal.columns
         start, end = sel
-        lines = []
-        for y in range(start // cols, end // cols + 1):
-            lo = start - y * cols if y == start // cols else 0
-            hi = end - y * cols if y == end // cols else cols - 1
-            line = self.terminal.buffer[y]
-            lines.append("".join(line[x].data
-                                 for x in range(lo, hi + 1)).rstrip())
-        return "\n".join(lines)
+        first, last = start // cols, end // cols
+        # Read from the document rather than the screen: a selection dragged
+        # through a `show run` covers lines that scrolled off long ago.
+        out = []
+        for offset, text in enumerate(
+                self.terminal.document_line_text(first, last)):
+            y = first + offset
+            lo = start - y * cols if y == first else 0
+            hi = end - y * cols if y == last else cols - 1
+            out.append(text[lo:hi + 1].rstrip())
+        return "\n".join(out)
 
     def copy_selection(self) -> None:
         text = self.selected_text()
@@ -692,8 +758,10 @@ class TerminalWidget(QWidget):
             )
 
     def select_all(self) -> None:
+        """Select the whole document, scrollback included."""
         self._sel_anchor = (0, 0)
-        self._sel_head = (self.terminal.lines - 1, self.terminal.columns - 1)
+        self._sel_head = (max(self.terminal.total_lines - 1, 0),
+                          self.terminal.columns - 1)
         self.update()
 
     # -- focus -------------------------------------------------------------

@@ -76,6 +76,10 @@ On Linux you'll need to be in the `dialout` group to open serial ports
   trackpad-sized fractions of a notch accumulate rather than being rounded
   away), or Shift+PgUp/PgDn for whole pages
 - **PuTTY mouse habits** — selecting copies, right-click pastes
+- **Selection spans the scrollback** — drag past the top or bottom edge and
+  the view auto-scrolls, the way it does in a browser, so a `show run`
+  longer than the window can be selected in one go. Copies reach lines that
+  have scrolled off entirely, and `Ctrl+Shift+A` takes the whole buffer.
 - **Tab reaches the far end** — it completes commands instead of moving
   focus, and Shift+Tab sends CSI Z
 - **Session logging** — raw byte log to a file per profile
@@ -159,6 +163,19 @@ dump.
 pixels against a full redraw, and separately asserts the blit actually
 engages: a broken shift check still renders correctly, just slowly, so the
 pixel tests alone would not catch it.
+
+### Selection coordinates
+
+pyte keeps the document in three pieces: `history.top` (scrolled off above),
+`buffer` (the visible rows), and `history.bottom` (below, when scrolled
+back). Concatenated they are the document, and `Terminal.document_rows()`
+addresses it by absolute row.
+
+Selection endpoints are stored in those absolute coordinates, not screen
+rows. It has to be that way for dragging: the view scrolls out from under
+the drag, so a screen row number stops meaning anything mid-gesture, and the
+copy needs to reach lines that are no longer displayed. `paintEvent` maps
+back the other way, treating the screen as a window starting at `view_top`.
 
 ### Garbage collection
 
