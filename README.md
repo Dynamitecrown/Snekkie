@@ -2,6 +2,7 @@
 
 A tabbed SSH and serial terminal in Python — a PuTTY replacement you can
 actually read the source of.
+Also auto detects connected COM port so you don’t have to go digging into computer management to find which one to use. 
 
 > Snekkie was called **pyterm** until recently. Saved sessions and settings
 > from before the rename are copied over automatically the first time it
