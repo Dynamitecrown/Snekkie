@@ -84,6 +84,38 @@ def test_scroll_to_clamps_to_available_history():
     assert term.scroll_back == 0
 
 
+def test_a_long_seek_does_not_leave_rows_below_the_screen():
+    """pyte assumes a page fits on screen; a bigger step corrupts the buffer.
+
+    Asking prev_page to travel further than screen.lines makes it assign
+    buffer rows past the last line, and those stay there for the life of the
+    session -- a scrollbar drag used to leave hundreds behind, which is both
+    a leak and more for the garbage collector to walk.
+    """
+    term = Terminal(80, 24, scrollback=1000)
+    for i in range(500):
+        term.feed(f"line {i}\r\n".encode())
+
+    term.scroll_to(300)  # far further than the 24-row screen
+
+    assert term.scroll_back == 300
+    assert len(term.screen.buffer) <= term.lines + 1, "rows left below the screen"
+    assert term.scroll_total == 477, "history was consumed by the seek"
+    # The view still shows 24 consecutive lines from the right place.
+    assert term.line_text(0) == "line 177"
+    assert term.line_text(23) == "line 200"
+
+
+def test_seeking_back_and_forth_keeps_the_buffer_bounded():
+    term = Terminal(80, 24, scrollback=1000)
+    for i in range(500):
+        term.feed(f"line {i}\r\n".encode())
+
+    for target in (400, 0, 250, 5, 477, 0):
+        term.scroll_to(target)
+        assert len(term.screen.buffer) <= term.lines + 1
+
+
 def test_scrolling_back_does_not_lose_history():
     term = Terminal(80, 24, scrollback=1000)
     for i in range(200):

@@ -146,17 +146,32 @@ class Terminal:
             return False
         screen = self.screen
         try:
-            step = max(abs(lines), 1)
             before = self.scroll_back
+            up = lines > 0
+            remaining = abs(lines)
             saved = screen.history.ratio
-            screen.history = screen.history._replace(ratio=step / screen.lines)
             try:
-                if lines > 0:
-                    screen.prev_page()
-                else:
-                    screen.next_page()
+                while remaining > 0:
+                    # Never ask for more than a screenful in one call. pyte
+                    # swaps rows between the screen and history assuming the
+                    # distance fits on screen, and a larger step makes it
+                    # write buffer rows below the last line -- which stay in
+                    # the buffer for good, so a long scrollbar drag would
+                    # leave hundreds of them behind.
+                    step = min(remaining, screen.lines)
+                    screen.history = screen.history._replace(
+                        ratio=step / screen.lines)
+                    at = self.scroll_back
+                    if up:
+                        screen.prev_page()
+                    else:
+                        screen.next_page()
+                    moved = abs(self.scroll_back - at)
+                    if not moved:
+                        break  # ran out of history to scroll through
+                    remaining -= moved
             finally:
-                # Re-read history first: the page call replaced it to record
+                # Re-read history first: the page calls replaced it to record
                 # the new position, which must not be rolled back with it.
                 screen.history = screen.history._replace(ratio=saved)
             return self.scroll_back != before

@@ -160,6 +160,28 @@ pixels against a full redraw, and separately asserts the blit actually
 engages: a broken shift check still renders correctly, just slowly, so the
 pixel tests alone would not catch it.
 
+### Garbage collection
+
+Scrollback is a lot of small long-lived objects — one dict per row plus a
+`Char` per written cell, so 5000 lines is around 370k of them. A
+generation-2 pass walks all of it on the GUI thread, which freezes the whole
+app, tab bar and menus included, for ~90 ms on a filled 1920x1080 window.
+That is the "everything gets sluggish once there's history" symptom, and no
+amount of render tuning touches it.
+
+`tune_gc()` in `__main__.py` freezes what is alive at startup (Qt's widget
+tree lives for the life of the process anyway) and makes full passes rare.
+Cycles are still collected, just later. Scrollback itself is not cyclic, so
+refcounting reclaims it either way and the deferral costs no real memory —
+object counts come out the same. Worst-case stall drops about fourfold,
+matching what disabling the collector achieves without leaking cycles.
+
+Related: `Terminal.scroll_by()` never asks pyte to travel more than a
+screenful per call. pyte swaps rows between screen and history assuming the
+distance fits on screen, and a larger step makes it write buffer rows below
+the last line, which stay there for good — a single long scrollbar drag used
+to leave 550+ of them behind, feeding straight back into the problem above.
+
 ## Adding things
 
 **A new transport (telnet, raw TCP, local shell):** write one file in
