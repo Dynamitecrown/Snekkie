@@ -122,6 +122,9 @@ class SessionTab(QWidget):
             self._disconnected(str(exc))
 
     def _on_received(self, data: bytes) -> None:
+        # Queued signals may outlive the reader that sent them during reconnect.
+        if self.sender() is not None and self.sender() is not self._reader:
+            return
         self.terminal.feed(data)
         if self._log is not None:
             try:
@@ -135,6 +138,8 @@ class SessionTab(QWidget):
             self.transport.resize(cols, rows)
 
     def _on_reader_finished(self, reason: str) -> None:
+        if self.sender() is not None and self.sender() is not self._reader:
+            return
         self._disconnected(reason)
 
     # -- scrollbar -----------------------------------------------------------

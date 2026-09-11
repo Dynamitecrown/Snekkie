@@ -736,12 +736,13 @@ class TerminalWidget(QWidget):
         # Read from the document rather than the screen: a selection dragged
         # through a `show run` covers lines that scrolled off long ago.
         out = []
-        for offset, text in enumerate(
-                self.terminal.document_line_text(first, last)):
+        for offset, row in enumerate(
+                self.terminal.document_rows(first, last)):
             y = first + offset
             lo = start - y * cols if y == first else 0
             hi = end - y * cols if y == last else cols - 1
-            out.append(text[lo:hi + 1].rstrip())
+            out.append("".join(row.get(x, row.default).data
+                               for x in range(lo, hi + 1)).rstrip())
         return "\n".join(out)
 
     def copy_selection(self) -> None:

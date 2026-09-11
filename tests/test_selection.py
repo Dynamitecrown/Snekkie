@@ -218,3 +218,16 @@ def test_selection_inside_one_screen_still_works(widget):
     widget._sel_head = (top, 7)
 
     assert widget.selected_text() == widget.terminal.line_text(0)[:8]
+
+
+def test_selection_uses_columns_after_wide_character(qapp):
+    from snekkie.ui.terminal import TerminalWidget
+
+    widget = TerminalWidget()
+    try:
+        widget.feed("\u754cabc".encode())
+        widget._sel_anchor = (0, 2)
+        widget._sel_head = (0, 3)
+        assert widget.selected_text() == "ab"
+    finally:
+        widget.close()

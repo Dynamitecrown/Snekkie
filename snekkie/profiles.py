@@ -37,19 +37,20 @@ def migrate_legacy_config() -> None:
     anything here goes wrong the originals are still sitting in the old
     directory, and a stale copy costs nothing.
 
-    Only runs when the new directory has no config of its own, so it can
-    never overwrite newer settings.
+    Copy only missing known files, so interrupted migrations can resume
+    without overwriting newer settings.
     """
     new = config_dir()
     old = new.with_name(LEGACY_DIR_NAME)
     try:
         if old == new or not old.is_dir():
             return
-        if any(new.glob("*.json")):
-            return  # already set up here; leave it alone
         new.mkdir(parents=True, exist_ok=True)
-        for item in old.glob("*.json"):
-            shutil.copy2(item, new / item.name)
+        for name in ("sessions.json", "settings.json"):
+            item = old / name
+            destination = new / name
+            if item.is_file() and not destination.exists():
+                shutil.copy2(item, destination)
     except OSError:
         pass  # non-fatal: worst case the sessions get re-created by hand
 

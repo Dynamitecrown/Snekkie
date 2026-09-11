@@ -228,7 +228,7 @@ class Terminal:
                     # leave hundreds of them behind.
                     step = min(remaining, screen.lines)
                     screen.history = screen.history._replace(
-                        ratio=step / screen.lines)
+                        ratio=(step - 0.5) / screen.lines)
                     at = self.scroll_back
                     if up:
                         screen.prev_page()

@@ -175,3 +175,16 @@ def test_tab_and_shift_tab_are_sent_to_the_far_end(widget):
     widget.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Backtab,
                                    Qt.ShiftModifier, ""))
     assert sent[-1] == b"\x1b[Z"
+
+
+def test_scroll_distance_avoids_float_rounding():
+    from snekkie.emulation import Terminal
+
+    for height in range(2, 80):
+        terminal = Terminal(40, height, scrollback=200)
+        terminal.feed(b"line\r\n" * 160)
+        for distance in range(1, height + 1):
+            terminal.scroll_to(distance)
+            assert terminal.scroll_back == distance, (height, distance)
+        terminal.scroll_to(0)
+        assert terminal.scroll_back == 0

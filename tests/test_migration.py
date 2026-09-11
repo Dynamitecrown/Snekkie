@@ -88,3 +88,13 @@ def test_migration_runs_twice_without_duplicating(config_home):
 
     store = ProfileStore(profiles.config_dir() / "sessions.json")
     assert store.names() == ["core-switch"]
+
+
+def test_migration_resumes_with_existing_settings(config_home):
+    _write_legacy(config_home)
+    new = profiles.config_dir()
+    new.mkdir()
+    (new / "settings.json").write_text('{"font_family":"Consolas"}')
+    migrate_legacy_config()
+    assert ProfileStore(new / "sessions.json").names() == ["core-switch"]
+    assert SettingsStore(new / "settings.json").load().font_family == "Consolas"

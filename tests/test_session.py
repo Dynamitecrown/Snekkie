@@ -154,3 +154,28 @@ def test_reader_thread_stops_cleanly(qapp):
     tab.shutdown()
     assert time.time() - start < 3, "shutdown blocked for too long"
     os.close(master)
+
+
+def test_old_reader_events_do_not_disconnect_reconnected_session(qapp, monkeypatch):
+    from unittest.mock import Mock
+
+    from snekkie.ui.session import ReaderThread, SessionTab
+
+    monkeypatch.setattr(ReaderThread, "start", lambda self: None)
+    transport = Mock(is_connected=True)
+    tab = SessionTab(Profile(), transport)
+    old = tab._reader
+    old.received.disconnect()
+    old.finished_with.disconnect()
+    old.received.connect(tab._on_received, Qt.QueuedConnection)
+    old.finished_with.connect(tab._on_reader_finished, Qt.QueuedConnection)
+    old.received.emit(b"stale output")
+    old.finished_with.emit("old connection closed")
+    tab._start_reader()  # replace the active reader before queued delivery
+    try:
+        qapp.processEvents()
+        transport.close.assert_not_called()
+        assert "stale output" not in tab.terminal.terminal.text()
+    finally:
+        tab.shutdown()
+        tab.close()
