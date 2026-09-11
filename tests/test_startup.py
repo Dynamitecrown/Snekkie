@@ -6,7 +6,7 @@ objects, and a generation-2 pass over that stalls the GUI thread for ~90ms.
 
 import gc
 
-from pyterm.__main__ import tune_gc
+from snekkie.__main__ import tune_gc
 
 
 def test_tune_gc_makes_full_collections_rare_without_disabling_them():

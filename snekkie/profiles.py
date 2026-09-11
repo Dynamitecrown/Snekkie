@@ -9,9 +9,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
+
+#: What the config directory was called before the app was renamed. Kept so
+#: an existing install's saved sessions survive the change.
+LEGACY_DIR_NAME = "pyterm"
 
 
 def config_dir() -> Path:
@@ -21,7 +26,32 @@ def config_dir() -> Path:
         base = Path.home() / "Library" / "Application Support"
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return base / "pyterm"
+    return base / "snekkie"
+
+
+def migrate_legacy_config() -> None:
+    """Carry saved sessions and settings over from the old pyterm directory.
+
+    Renaming the app moved where it looks for its config, which would present
+    as every saved session having vanished. Copies rather than moves: if
+    anything here goes wrong the originals are still sitting in the old
+    directory, and a stale copy costs nothing.
+
+    Only runs when the new directory has no config of its own, so it can
+    never overwrite newer settings.
+    """
+    new = config_dir()
+    old = new.with_name(LEGACY_DIR_NAME)
+    try:
+        if old == new or not old.is_dir():
+            return
+        if any(new.glob("*.json")):
+            return  # already set up here; leave it alone
+        new.mkdir(parents=True, exist_ok=True)
+        for item in old.glob("*.json"):
+            shutil.copy2(item, new / item.name)
+    except OSError:
+        pass  # non-fatal: worst case the sessions get re-created by hand
 
 
 @dataclass

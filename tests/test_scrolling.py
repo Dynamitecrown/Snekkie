@@ -10,8 +10,8 @@ import pytest
 from PySide6.QtCore import QEvent, QPoint, Qt
 from PySide6.QtGui import QKeyEvent, QWheelEvent
 
-from pyterm.emulation import Terminal
-from pyterm.ui.terminal import WHEEL_LINES, TerminalWidget
+from snekkie.emulation import Terminal
+from snekkie.ui.terminal import WHEEL_LINES, TerminalWidget
 
 
 @pytest.fixture

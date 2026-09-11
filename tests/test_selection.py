@@ -9,7 +9,7 @@ import pytest
 from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QMouseEvent
 
-from pyterm.ui.terminal import AUTOSCROLL_MAX_LINES, TerminalWidget
+from snekkie.ui.terminal import AUTOSCROLL_MAX_LINES, TerminalWidget
 
 
 @pytest.fixture

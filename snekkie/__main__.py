@@ -1,4 +1,4 @@
-"""Entry point: python -m pyterm"""
+"""Entry point: python -m snekkie"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
+from .profiles import migrate_legacy_config
 from .ui.window import MainWindow
 
 
@@ -41,8 +42,11 @@ def tune_gc() -> None:
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("PyTerm")
-    app.setOrganizationName("PyTerm")
+    app.setApplicationName("Snekkie")
+    app.setOrganizationName("Snekkie")
+
+    # Before anything reads config: the app used to store it elsewhere.
+    migrate_legacy_config()
 
     window = MainWindow()
     window.show()

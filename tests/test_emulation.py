@@ -5,7 +5,7 @@ garbled output that is painful to diagnose by eye, and they are easy to
 introduce when swapping or upgrading the emulator underneath.
 """
 
-from pyterm.emulation import Terminal
+from snekkie.emulation import Terminal
 
 
 def test_plain_text_lands_on_the_screen():

@@ -1,7 +1,12 @@
-# PyTerm
+# Snekkie
 
 A tabbed SSH and serial terminal in Python — a PuTTY replacement you can
 actually read the source of.
+
+> Snekkie was called **pyterm** until recently. Saved sessions and settings
+> from before the rename are copied over automatically the first time it
+> starts: config now lives in `%APPDATA%\snekkie` (`~/.config/snekkie` on
+> Linux), and the old directory is left untouched as a fallback.
 
 ## Install
 
@@ -15,8 +20,8 @@ Two ways to run it:
   virtual environment and installs dependencies (~150 MB, mostly PySide6);
   every run after that just launches the app. Requires Python.
 - **Standalone .exe:** double-click **`build-windows.bat`** once to produce
-  `dist\pyterm.exe` (also needs Python, just for the build step). After
-  that, `pyterm.exe` runs on its own — no Python required, safe to pin to
+  `dist\snekkie.exe` (also needs Python, just for the build step). After
+  that, `snekkie.exe` runs on its own — no Python required, safe to pin to
   the taskbar or copy to another machine. Re-run `build-windows.bat` after
   pulling changes to refresh it.
 
@@ -26,7 +31,7 @@ Manual way, in PowerShell from the project folder:
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python -m pyterm
+python -m snekkie
 ```
 
 If `Activate.ps1` is blocked by the execution policy, either unblock it for
@@ -54,7 +59,7 @@ PuTTY's agent work if you pick *SSH agent / default keys* as the auth method.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python -m pyterm
+python -m snekkie
 ```
 
 On Linux you'll need to be in the `dialout` group to open serial ports
@@ -101,7 +106,7 @@ Passwords are deliberately never written to disk.
 ## Layout
 
 ```
-pyterm/
+snekkie/
 ├── profiles.py            saved sessions (JSON, no secrets)
 ├── settings.py            app-wide preferences (theme, default font)
 ├── emulation.py           pyte wrapper — the screen model
@@ -252,18 +257,18 @@ where Backspace misbehaves, flip `Qt.Key_Backspace` to `b"\x08"`.
 
 ```bash
 pip install pyinstaller
-pyinstaller --noconsole --onefile --name pyterm launcher.py
+pyinstaller --noconsole --onefile --name snekkie launcher.py
 ```
 
-(`launcher.py` at the repo root, not `pyterm/__main__.py` — PyInstaller runs
+(`launcher.py` at the repo root, not `snekkie/__main__.py` — PyInstaller runs
 the entry script as a bare top-level module with no parent package, which
 breaks the package's relative imports if you point it at `__main__.py`
 directly.)
 
-On Windows that produces `dist\pyterm.exe`, which runs on machines with no
+On Windows that produces `dist\snekkie.exe`, which runs on machines with no
 Python installed. Note that one-file PyInstaller builds are a common
 antivirus false positive — if Defender quarantines it, drop `--onefile` and
-ship the `dist\pyterm\` folder instead.
+ship the `dist\snekkie\` folder instead.
 
 ```
 ```
@@ -273,7 +278,7 @@ ship the `dist\pyterm\` folder instead.
 ```bash
 pip install -e ".[dev]"
 pytest
-ruff check pyterm tests
+ruff check snekkie tests
 ```
 
 The test suite covers the emulation layer (escape sequences, colour, resize,

@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pyterm"
+name = "snekkie"
 version = "0.1.0"
 description = "A tabbed SSH and serial terminal"
 readme = "README.md"
@@ -40,11 +40,11 @@ dev = [
 build = ["pyinstaller>=6.0"]
 
 [project.gui-scripts]
-# Installs a pyterm launcher that opens with no console window behind it.
-pyterm = "pyterm.__main__:main"
+# Installs a snekkie launcher that opens with no console window behind it.
+snekkie = "snekkie.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["pyterm*"]
+include = ["snekkie*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -8,8 +8,8 @@ redraw rather than checking for exceptions.
 
 import pytest
 
-from pyterm.ui.highlight import COLORS, highlight_line
-from pyterm.ui.terminal import TerminalWidget
+from snekkie.ui.highlight import COLORS, highlight_line
+from snekkie.ui.terminal import TerminalWidget
 
 CISCO = (
     b"Switch1#show running-config\r\n"
@@ -172,7 +172,7 @@ def test_highlight_cache_survives_scrolling(widget, qapp):
 
 
 def test_highlight_cache_is_bounded(widget, qapp):
-    from pyterm.ui.terminal import HIGHLIGHT_CACHE_MAX
+    from snekkie.ui.terminal import HIGHLIGHT_CACHE_MAX
 
     for i in range(HIGHLIGHT_CACHE_MAX + 200):
         widget.feed(f"interface GigabitEthernet0/{i}\r\n".encode())

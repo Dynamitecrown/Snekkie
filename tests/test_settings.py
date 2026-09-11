@@ -4,7 +4,7 @@ settings.json is a plain file people do edit by hand, so the loader has to
 survive a malformed theme rather than blowing up later at paint time.
 """
 
-from pyterm.settings import (
+from snekkie.settings import (
     DEFAULT_THEME,
     THEME_KEYS,
     THEMES,
@@ -84,6 +84,13 @@ def test_malformed_saved_themes_are_discarded_not_fatal():
     })
     assert list(settings.saved_themes) == ["ok"]
     assert settings.saved_themes["ok"] == {"fg": "#ffffff"}
+
+
+def test_theme_renamed_by_the_rebrand_still_resolves():
+    """A settings.json written as pyterm names the old default theme."""
+    settings = AppSettings(theme="PyTerm Dark")
+
+    assert settings.colors() == THEMES["Snekkie Dark"]
 
 
 def test_corrupt_settings_file_degrades_to_defaults(tmp_path):

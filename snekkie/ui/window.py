@@ -28,7 +28,7 @@ from .style import build_stylesheet
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PyTerm")
+        self.setWindowTitle("Snekkie")
         self.resize(1000, 640)
 
         self.store = ProfileStore()

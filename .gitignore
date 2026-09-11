@@ -44,7 +44,7 @@ desktop.ini
 logs/
 session*.txt
 
-# Saved sessions normally live in %APPDATA%\pyterm, but if you ever point the
+# Saved sessions normally live in %APPDATA%\snekkie, but if you ever point the
 # store at the project folder for testing, keep it out of the history.
 sessions.json
 

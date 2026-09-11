@@ -1,6 +1,6 @@
 @echo off
 rem ---------------------------------------------------------------------
-rem PyTerm launcher for Windows.
+rem Snekkie launcher for Windows.
 rem First run: creates a virtual environment and installs the app.
 rem Later runs: verifies imports, then launches with no console window.
 rem ---------------------------------------------------------------------
@@ -9,7 +9,7 @@ cd /d "%~dp0"
 
 set "VENV_PY=.venv\Scripts\python.exe"
 set "VENV_PYW=.venv\Scripts\pythonw.exe"
-set "CHECK=%TEMP%\pyterm_startup_error.txt"
+set "CHECK=%TEMP%\snekkie_startup_error.txt"
 
 where python >nul 2>&1
 if errorlevel 1 (
@@ -38,10 +38,10 @@ if not exist "%VENV_PY%" (
 
 rem pythonw.exe has no console, so a startup crash would close this window
 rem with no explanation. Check the imports first and report properly.
-"%VENV_PY%" -c "import pyterm, PySide6, paramiko, serial, pyte" 2>"%CHECK%"
+"%VENV_PY%" -c "import snekkie, PySide6, paramiko, serial, pyte" 2>"%CHECK%"
 if errorlevel 1 (
     echo.
-    echo   PyTerm could not start. The error was:
+    echo   Snekkie could not start. The error was:
     echo.
     type "%CHECK%"
     echo.
@@ -52,7 +52,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-start "" "%VENV_PYW%" -m pyterm
+start "" "%VENV_PYW%" -m snekkie
 exit /b 0
 
 :fail

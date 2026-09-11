@@ -12,8 +12,8 @@ import pytest
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QGuiApplication, QKeyEvent
 
-from pyterm.profiles import Profile
-from pyterm.ui.terminal import TerminalWidget
+from snekkie.profiles import Profile
+from snekkie.ui.terminal import TerminalWidget
 
 needs_pty = pytest.mark.skipif(
     sys.platform == "win32", reason="no pty on Windows"
@@ -91,8 +91,8 @@ def test_ctrl_shift_c_copies_rather_than_interrupting(widget):
 
 @needs_pty
 def test_session_round_trip(qapp, tmp_path):
-    from pyterm.transport.serialport import SerialTransport
-    from pyterm.ui.session import SessionTab
+    from snekkie.transport.serialport import SerialTransport
+    from snekkie.ui.session import SessionTab
 
     master, slave = os.openpty()
     device = os.ttyname(slave)
@@ -138,8 +138,8 @@ def test_session_round_trip(qapp, tmp_path):
 @needs_pty
 def test_reader_thread_stops_cleanly(qapp):
     """Shutdown must not hang or leave a thread running."""
-    from pyterm.transport.serialport import SerialTransport
-    from pyterm.ui.session import SessionTab
+    from snekkie.transport.serialport import SerialTransport
+    from snekkie.ui.session import SessionTab
 
     master, slave = os.openpty()
     device = os.ttyname(slave)

@@ -8,7 +8,7 @@ import pytest
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QKeyEvent
 
-from pyterm.ui import keys
+from snekkie.ui import keys
 
 
 def key_event(key, mods=Qt.NoModifier, text=""):

@@ -39,7 +39,7 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Lint
-        run: ruff check pyterm tests
+        run: ruff check snekkie tests
 
       - name: Test
         env:
@@ -64,9 +64,9 @@ jobs:
         run: pip install -e ".[build]"
 
       - name: Build
-        run: pyinstaller --noconsole --onefile --name pyterm launcher.py
+        run: pyinstaller --noconsole --onefile --name snekkie launcher.py
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pyterm-windows
-          path: dist/pyterm.exe
+          name: snekkie-windows
+          path: dist/snekkie.exe

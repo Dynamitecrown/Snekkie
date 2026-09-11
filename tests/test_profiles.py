@@ -4,9 +4,9 @@ import json
 
 import pytest
 
-from pyterm import transport
-from pyterm.profiles import Profile, ProfileStore
-from pyterm.transport import TransportError
+from snekkie import transport
+from snekkie.profiles import Profile, ProfileStore
+from snekkie.transport import TransportError
 
 
 @pytest.fixture

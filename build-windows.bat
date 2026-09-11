@@ -1,6 +1,6 @@
 @echo off
 rem ---------------------------------------------------------------------
-rem Builds dist\pyterm.exe: a standalone executable that needs no Python
+rem Builds dist\snekkie.exe: a standalone executable that needs no Python
 rem install to run. Re-run this after pulling changes to refresh the exe.
 rem ---------------------------------------------------------------------
 setlocal
@@ -29,15 +29,15 @@ echo Installing build dependencies ...
 "%VENV_PY%" -m pip install -e ".[build]" || goto fail
 
 echo.
-echo Building dist\pyterm.exe ...
+echo Building dist\snekkie.exe ...
 echo.
-"%VENV_PY%" -m PyInstaller --noconsole --onefile --name pyterm launcher.py || goto fail
+"%VENV_PY%" -m PyInstaller --noconsole --onefile --name snekkie launcher.py || goto fail
 
 echo.
-echo Done. dist\pyterm.exe is ready to run or pin to your taskbar.
+echo Done. dist\snekkie.exe is ready to run or pin to your taskbar.
 echo Note: one-file builds are a common antivirus false positive. If
 echo Defender quarantines it, edit this script to drop --onefile and
-echo ship the dist\pyterm\ folder instead.
+echo ship the dist\snekkie\ folder instead.
 echo.
 pause
 exit /b 0

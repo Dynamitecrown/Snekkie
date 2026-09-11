@@ -21,7 +21,7 @@ THEME_KEYS = ("fg", "bg", "cursor", "selection")
 #: (terminal.py's PALETTE) stays fixed across themes -- these four are what
 #: actually change the terminal's look at a glance.
 THEMES: dict[str, dict[str, str]] = {
-    "PyTerm Dark": {
+    "Snekkie Dark": {
         "fg": "#d0d0d0", "bg": "#1a1a1a",
         "cursor": "#3ad900", "selection": "#3a5a80",
     },
@@ -47,7 +47,12 @@ THEMES: dict[str, dict[str, str]] = {
     },
 }
 
-DEFAULT_THEME = "PyTerm Dark"
+DEFAULT_THEME = "Snekkie Dark"
+
+#: Themes that have been renamed. A settings.json written before the app was
+#: renamed still says "PyTerm Dark", and without this it would quietly fall
+#: back to the default instead of resolving to the same colours.
+THEME_ALIASES = {"PyTerm Dark": "Snekkie Dark"}
 
 
 @dataclass
@@ -86,7 +91,8 @@ class AppSettings:
             # colour still yields a usable theme rather than a KeyError.
             return {k: scheme.get(k, THEMES[DEFAULT_THEME][k])
                     for k in THEME_KEYS}
-        return THEMES.get(self.theme, THEMES[DEFAULT_THEME])
+        name = THEME_ALIASES.get(self.theme, self.theme)
+        return THEMES.get(name, THEMES[DEFAULT_THEME])
 
     def theme_names(self) -> list[str]:
         """Built-in presets first, then the user's own, then Custom."""
