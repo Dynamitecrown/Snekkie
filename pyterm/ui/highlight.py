@@ -57,10 +57,16 @@ def highlight_line(text: str, syntax: str) -> dict[int, str]:
     rules = SYNTAXES.get(syntax)
     if not rules or not text.strip():
         return {}
+    # Trailing blanks are most of a terminal row and can never match, so
+    # only run the regexes over the part of the line that holds text.
+    end = len(text.rstrip())
+    if not end:
+        return {}
+    text = text[:end]
     overrides: dict[int, str] = {}
     for pattern, category in rules:
         color = COLORS[category]
         for match in pattern.finditer(text):
-            for col in range(match.start(), match.end()):
-                overrides[col] = color
+            overrides.update(
+                dict.fromkeys(range(match.start(), match.end()), color))
     return overrides

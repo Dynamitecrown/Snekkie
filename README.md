@@ -121,11 +121,37 @@ Each session runs a `ReaderThread` that blocks on `transport.read()` and
 emits bytes via a Qt signal. Signals queue across threads, so pyte and the
 widget are only ever touched from the GUI thread — pyte is not thread-safe.
 
-Rendering is throttled to one repaint per 25 ms, and only repaints the rows
+Rendering is throttled to one repaint per 25 ms, and repaints only the rows
 pyte reports as actually changed (`Screen.dirty`) plus wherever the cursor
-was and now is — a keystroke's echo repaints one line, not the whole
-visible viewport. Without the interval throttle, a `show run` dump would
-still trigger a repaint per packet and the UI would crawl.
+was and now is — typing a character invalidates one line, not the whole
+viewport. Without the interval throttle a `show run` dump would trigger a
+repaint per packet and the UI would crawl; without the dirty-row tracking
+every keystroke would cost a full-screen redraw once the screen filled up.
+
+Dirty-row tracking alone doesn't help a *full* screen, though: once there is
+history, every new line scrolls, so every row's text changes and pyte marks
+the whole screen dirty. Redrawing all of it per line is what made a
+maximised window crawl — 37 ms a line at 1920x1080. So `_try_blit_scroll`
+copies the screen's pixels up with `QWidget.scroll()` and repaints only the
+newly exposed strip. It works out the shift by checking the current buffer
+against a per-row record of what is actually drawn: if every surviving row
+matches the row *n* below where it used to be, the copy is provably right.
+Anything that breaks the match — an in-place edit, a row still waiting to be
+painted, a resize — falls back to repainting. That turned a 72-row repaint
+into a 2-row one, about 6x faster.
+
+`paintEvent` is the other hot path, so it avoids per-run allocation: fonts
+are cached by (bold, italic, underline), resolved `QColor`s are memoised,
+each row's text is built once and sliced per run, blank cells are fetched
+with `line.get` to skip pyte's `__missing__`, and the syntax-highlight pass
+is cached by row *text* — keyed that way so a line keeps its colours when it
+scrolls up a row, which a row-indexed cache would miss on every line of a
+dump.
+
+`tests/test_render.py` guards all of this by comparing incrementally painted
+pixels against a full redraw, and separately asserts the blit actually
+engages: a broken shift check still renders correctly, just slowly, so the
+pixel tests alone would not catch it.
 
 ## Adding things
 
@@ -198,8 +224,9 @@ ruff check pyterm tests
 
 The test suite covers the emulation layer (escape sequences, colour, resize,
 scrollback, split UTF-8), key encoding, profile persistence, the transport
-registry, and an end-to-end session over a real pty. The pty tests skip on
-Windows. CI runs everything on Windows and Linux across Python 3.10 and 3.13.
+registry, the renderer (incremental repaint correctness, highlight caching),
+and an end-to-end session over a real pty. The pty tests skip on Windows. CI
+runs everything on Windows and Linux across Python 3.10 and 3.13.
 
 Tagging a release as `vX.Y.Z` and pushing the tag builds a Windows .exe as a
 workflow artifact.

@@ -111,6 +111,46 @@ class Terminal:
         except Exception:
             return False
 
+    @property
+    def scroll_back(self) -> int:
+        """Lines currently scrolled back from live. 0 == at the bottom."""
+        try:
+            return len(self.screen.history.bottom)
+        except Exception:
+            return 0
+
+    @property
+    def scroll_total(self) -> int:
+        """Lines available to scroll through right now.
+
+        top + bottom is stable while scrolled back: pyte snaps to the live
+        bottom before processing any new data (see HistoryScreen.before_event),
+        so nothing is added to either queue mid-scroll to throw this off.
+        """
+        try:
+            history = self.screen.history
+            return len(history.top) + len(history.bottom)
+        except Exception:
+            return 0
+
+    def scroll_to(self, lines_back: int) -> None:
+        """Move as close as possible to a target scroll depth.
+
+        pyte only exposes paging (prev_page/next_page move a fixed chunk of
+        lines at a time), not an absolute seek, so a scrollbar drag has to
+        walk there one page at a time. Lands within one page of the target.
+        """
+        target = max(lines_back, 0)
+        guard = self.scroll_total + self.screen.lines + 1  # more than enough
+        while self.scroll_back < target and guard > 0:
+            if not self.page_up():
+                break
+            guard -= 1
+        while self.scroll_back > target and guard > 0:
+            if not self.page_down():
+                break
+            guard -= 1
+
     # -- housekeeping ------------------------------------------------------
 
     def reset(self) -> None:

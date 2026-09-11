@@ -4,8 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal
-from PySide6.QtWidgets import QLabel, QMessageBox, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QScrollBar,
+    QVBoxLayout,
+    QWidget,
+)
 
 from .. import transport as transport_mod
 from ..profiles import Profile
@@ -69,18 +76,29 @@ class SessionTab(QWidget):
             theme=theme,
             syntax=profile.device_syntax,
         )
+        self.scrollbar = QScrollBar(Qt.Vertical)
+        self.scrollbar.setRange(0, 0)
+
         self.banner = QLabel()
         self.banner.setVisible(False)
         self.banner.setStyleSheet(
             "background:#552222; color:#eee; padding:4px;"
         )
 
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(self.terminal, 1)
+        body.addWidget(self.scrollbar)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self.banner)
-        layout.addWidget(self.terminal, 1)
+        layout.addLayout(body, 1)
 
+        self.terminal.scroll_changed.connect(self._sync_scrollbar)
+        self.scrollbar.valueChanged.connect(self._on_scrollbar_moved)
         self.terminal.data_typed.connect(self._on_typed)
         self.terminal.size_changed.connect(self._on_resized)
 
@@ -119,6 +137,21 @@ class SessionTab(QWidget):
     def _on_reader_finished(self, reason: str) -> None:
         self._disconnected(reason)
 
+    # -- scrollbar -----------------------------------------------------------
+
+    def _sync_scrollbar(self, lines_back: int, total_lines: int) -> None:
+        """Update the control without feeding valueChanged back into scrolling."""
+        blocked = self.scrollbar.blockSignals(True)
+        try:
+            self.scrollbar.setRange(0, total_lines)
+            self.scrollbar.setPageStep(max(self.terminal.terminal.lines, 1))
+            self.scrollbar.setValue(total_lines - lines_back)
+        finally:
+            self.scrollbar.blockSignals(blocked)
+
+    def _on_scrollbar_moved(self, value: int) -> None:
+        self.terminal.scroll_to(self.scrollbar.maximum() - value)
+
     # -- state -------------------------------------------------------------
 
     @property
@@ -152,6 +185,7 @@ class SessionTab(QWidget):
         except TransportError as exc:
             QMessageBox.warning(self, "Reconnect failed", str(exc))
             return False
+        self._open_log()
         self.terminal.reset()
         self.banner.setVisible(False)
         self.title_changed.emit(self.profile.name)
