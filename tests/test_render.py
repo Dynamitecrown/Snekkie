@@ -99,15 +99,9 @@ def _stream(widget, qapp, lines, prefix="ip address 10.0"):
         qapp.processEvents()
 
 
-def _whole_pixel_rows(widget):
-    """Round the row height so the blit can engage on any platform.
-
-    The blit deliberately refuses fractional row heights, and some default
-    fonts (Linux CI's among them) have one, which would leave these tests
-    exercising only the fallback.
-    """
-    widget._ch = float(round(widget._ch))
-    widget._apply_geometry()
+def test_row_height_is_whole_pixels(widget):
+    """The blit copies by whole pixels, so rows must sit on whole pixels."""
+    assert widget._ch.is_integer()
 
 
 def test_scrolling_blits_instead_of_repainting_every_row(widget, qapp):
@@ -117,7 +111,6 @@ def test_scrolling_blits_instead_of_repainting_every_row(widget, qapp):
     matched, so it silently fell back to full repaints. Pixels stayed correct,
     which is exactly why the pixel tests alone could not catch it.
     """
-    _whole_pixel_rows(widget)
     for i in range(120):
         widget.feed(f"line {i} interface GigabitEthernet0/{i}\r\n".encode())
     qapp.processEvents()
@@ -254,7 +247,6 @@ def test_blit_rejects_fractional_pixel_shifts(widget, qapp):
 
 
 def test_scroll_blit_invalidates_the_copied_cursor(widget, qapp):
-    _whole_pixel_rows(widget)
     widget.feed(b"same text\r\n" * 60)
     qapp.processEvents()
     widget.repaint()

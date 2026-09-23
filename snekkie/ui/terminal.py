@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import QRect, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
@@ -157,7 +159,11 @@ class TerminalWidget(QWidget):
 
         metrics = QFontMetricsF(font)
         self._cw = max(metrics.horizontalAdvance("M"), 1.0)
-        self._ch = max(metrics.height(), 1.0)
+        # Whole pixels, rounded up so descenders never clip. Some fonts
+        # (Linux's default monospace among them) report a fractional height,
+        # which puts rows on fractional pixels and stops the scroll blit from
+        # ever engaging, since it can only copy by whole pixels.
+        self._ch = float(max(math.ceil(metrics.height()), 1))
         self._baseline = metrics.ascent()
 
     def _styled_font(self, bold: bool, italic: bool, underline: bool) -> QFont:
