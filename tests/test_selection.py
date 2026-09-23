@@ -205,9 +205,10 @@ def test_highlight_is_drawn_on_the_selected_lines_after_scrolling(qapp):
     w.repaint()
     moved = w.terminal.view_top
     assert highlighted_rows() == [r - moved for r in selected]
-    # Same content, drawn five rows further down.
+    # Same content, drawn five rows further down. Nothing has left the
+    # scrollback yet, so a row's absolute index is the number it printed.
     assert w.terminal.line_text(selected[0] - moved).strip() == \
-        f"line {selected[0] - top + 181:03}"
+        f"line {selected[0]:03}"
     w.close()
 
 
