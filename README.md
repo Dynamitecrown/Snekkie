@@ -20,6 +20,30 @@ A clean, tabbed SSH and serial terminal written in Python — a lightweight, rea
 
 ---
 
+## Screenshots
+
+### Checking a switch at a glance
+
+`show ip interface brief` and `show cdp neighbors` on a Catalyst switch, with Cisco IOS highlighting turned on. Keywords, IP addresses, and the prompt are colored so the useful parts of long output stand out. Several sessions stay open in tabs, and saved sessions are one double-click away in the sidebar.
+
+![Snekkie running show ip interface brief and show cdp neighbors on a Cisco switch](docs/screenshots/show-commands.png)
+
+### Configuring an interface
+
+Bringing a port up: check its current config with `show running-config interface`, enter `configure terminal`, run `no shutdown`, then save with `write memory`. The prompt tracks each mode (`#`, `(config)#`, `(config-if)#`), and the switch's link-up messages appear as they arrive.
+
+![Snekkie configuring GigabitEthernet1/0/5 with no shutdown](docs/screenshots/configure-interface.png)
+
+### Full-width terminal and copy-on-select
+
+Hide the sidebar with **Ctrl+B** to give the terminal the whole window. Dragging over output selects and copies it in one step, PuTTY-style, and right-click pastes.
+
+![Snekkie with the sidebar hidden and part of show vlan brief selected](docs/screenshots/full-width.png)
+
+*Screenshots are from a demo session; the switch output is sample data.*
+
+---
+
 ## Download
 
 Ready-to-run builds are on the [Releases page](https://github.com/Dynamitecrown/Snekkie/releases/latest). No Python needed.
