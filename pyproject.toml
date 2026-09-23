@@ -46,6 +46,9 @@ snekkie = "snekkie.__main__:main"
 [tool.setuptools.packages.find]
 include = ["snekkie*"]
 
+[tool.setuptools.package-data]
+snekkie = ["assets/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 timeout = 60

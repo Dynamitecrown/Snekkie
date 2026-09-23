@@ -66,7 +66,7 @@ jobs:
         run: pip install -e ".[build]"
 
       - name: Build
-        run: pyinstaller --noconsole --onefile --name snekkie launcher.py
+        run: pyinstaller --noconsole --onefile --name snekkie --icon snekkie/assets/icon.ico --add-data "snekkie/assets:snekkie/assets" launcher.py
 
       - uses: actions/upload-artifact@v4
         with:
@@ -101,7 +101,7 @@ jobs:
         run: pip install -e ".[build]"
 
       - name: Build
-        run: pyinstaller --onefile --name snekkie launcher.py
+        run: pyinstaller --onefile --name snekkie --add-data "snekkie/assets:snekkie/assets" launcher.py
 
       # A tarball, because release downloads drop the executable bit.
       - name: Package

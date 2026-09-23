@@ -1,4 +1,6 @@
-# Snekkie
+<p align="center">
+  <img src="docs/banner.jpg" alt="Snekkie" width="100%">
+</p>
 
 A clean, tabbed SSH and serial terminal written in Python — a lightweight, readable alternative to PuTTY with automatic COM port detection.
 

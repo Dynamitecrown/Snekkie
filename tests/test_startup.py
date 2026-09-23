@@ -6,7 +6,7 @@ objects, and a generation-2 pass over that stalls the GUI thread for ~90ms.
 
 import gc
 
-from snekkie.__main__ import tune_gc
+from snekkie.__main__ import ICON_PATH, tune_gc
 
 
 def test_tune_gc_makes_full_collections_rare_without_disabling_them():
@@ -34,3 +34,12 @@ def test_tune_gc_freezes_what_is_already_alive():
     finally:
         gc.set_threshold(*before)
         gc.unfreeze()
+
+
+def test_app_icon_loads(qapp):
+    """A missing or unreadable icon silently falls back to a blank one."""
+    from PySide6.QtGui import QIcon
+
+    assert ICON_PATH.is_file()
+    assert not QIcon(str(ICON_PATH)).isNull()
+    assert ICON_PATH.with_suffix(".ico").is_file(), "the exe build needs it"

@@ -31,7 +31,7 @@ echo Installing build dependencies ...
 echo.
 echo Building dist\snekkie.exe ...
 echo.
-"%VENV_PY%" -m PyInstaller --noconsole --onefile --name snekkie launcher.py || goto fail
+"%VENV_PY%" -m PyInstaller --noconsole --onefile --name snekkie --icon snekkie\assets\icon.ico --add-data "snekkie\assets;snekkie\assets" launcher.py || goto fail
 
 echo.
 echo Done. dist\snekkie.exe is ready to run or pin to your taskbar.

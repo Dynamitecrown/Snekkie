@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import gc
 import sys
+from pathlib import Path
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from .profiles import migrate_legacy_config
@@ -40,10 +42,35 @@ def tune_gc() -> None:
     gc.freeze()
 
 
+#: Next to this file both in a source checkout and in the PyInstaller build,
+#: which unpacks the package's data files into the same layout.
+ICON_PATH = Path(__file__).parent / "assets" / "icon.png"
+
+
+def set_windows_app_id() -> None:
+    """Give the taskbar our icon rather than Python's.
+
+    Run from source, the process is python.exe, and Windows groups the window
+    under that executable's icon regardless of the window's own. An explicit
+    AppUserModelID makes it a separate app with the icon we set. The built
+    exe carries the icon itself, so this only matters from source.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Snekkie.Snekkie")
+    except (AttributeError, OSError):
+        pass  # cosmetic only; never worth failing startup over
+
+
 def main() -> int:
+    set_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("Snekkie")
     app.setOrganizationName("Snekkie")
+    app.setWindowIcon(QIcon(str(ICON_PATH)))
 
     # Before anything reads config: the app used to store it elsewhere.
     migrate_legacy_config()
