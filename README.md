@@ -110,3 +110,9 @@ pyinstaller --noconsole --onefile --name snekkie launcher.py
 - In-buffer text search.
 - Terminal mouse tracking modes (1000/1002/1006) for interactive CLI apps (`vim`).
 - SFTP file transfer tab.
+
+---
+
+## License
+
+Snekkie is free software, licensed under the [GNU General Public License v3.0 or later](LICENSE). You may use, study, share, and modify it; if you distribute a modified version, it must also be released under the GPL with its source code available.

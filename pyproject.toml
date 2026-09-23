@@ -8,13 +8,13 @@ version = "1.0.0"
 description = "A tabbed SSH and serial terminal"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "Lucas" }]
 keywords = ["ssh", "serial", "terminal", "console", "cisco", "putty"]
 classifiers = [
     "Environment :: X11 Applications :: Qt",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Programming Language :: Python :: 3",
     "Topic :: Terminals :: Serial",
     "Topic :: Terminals :: Terminal Emulators/X Terminals",
