@@ -191,6 +191,7 @@ class TerminalWidget(QWidget):
         # and its background in the other, so they cannot share a key.
         self._fg_cache: dict[tuple[str, bool], QColor] = {}
         self._bg_cache: dict[str, QColor] = {}
+        self._override_cache: dict[str, QColor] = {}
 
     def _fg_color(self, color: str, bold: bool) -> QColor:
         key = (color, bold)
@@ -209,6 +210,14 @@ class TerminalWidget(QWidget):
             if len(self._bg_cache) >= 1024:
                 self._bg_cache.clear()
             self._bg_cache[color] = resolved
+        return resolved
+
+    def _override_color(self, color: str) -> QColor:
+        # Syntax colours come from a handful of fixed hex strings, so this
+        # never grows past a few entries.
+        resolved = self._override_cache.get(color)
+        if resolved is None:
+            resolved = self._override_cache[color] = QColor(color)
         return resolved
 
     def _invalidate_caches(self) -> None:
@@ -443,7 +452,10 @@ class TerminalWidget(QWidget):
         bg_color = self._bg_color
         styled_font = self._styled_font
         row_overrides = self._row_overrides
+        override_color = self._override_color
         col_range = range(cols)
+        region = event.region()
+        width = self.width()
 
         # Tracks what is actually on screen, so _try_blit_scroll can tell
         # whether the pixels it wants to copy are still trustworthy. Only
@@ -461,18 +473,19 @@ class TerminalWidget(QWidget):
             chars = [line.get(i, line.default) for i in col_range]
             row_text = "".join([c.data for c in chars])
             # Partial exposure does not establish that a whole row is valid.
-            row_rect = QRect(0, int(top), self.width(), int(ch) + 1)
-            painted_rows[y] = (tuple(chars) if event.region().contains(row_rect)
+            row_rect = QRect(0, int(top), width, int(ch) + 1)
+            painted_rows[y] = (tuple(chars) if region.contains(row_rect)
                                else None)
-            overrides = row_overrides(row_text) if highlighting else {}
+            overrides = row_overrides(row_text) if highlighting else None
             # Syntax offsets are Unicode string offsets; terminal columns
             # include empty continuation cells for wide glyphs.
             column_overrides = {}
-            offset = 0
-            for column, cell in enumerate(chars):
-                if offset in overrides and cell.data:
-                    column_overrides[column] = overrides[offset]
-                offset += len(cell.data)
+            if overrides:
+                offset = 0
+                for column, cell in enumerate(chars):
+                    if offset in overrides and cell.data:
+                        column_overrides[column] = overrides[offset]
+                    offset += len(cell.data)
             get_override = column_overrides.get
             # Selection is in document coordinates; the screen is a window
             # onto it starting at view_top.
@@ -508,7 +521,7 @@ class TerminalWidget(QWidget):
                 if c_reverse:
                     fg, bg = bg, fg
                 if override and not selected:
-                    fg = QColor(override)
+                    fg = override_color(override)
                 if selected:
                     bg = self._sel_qcolor
 
@@ -517,7 +530,7 @@ class TerminalWidget(QWidget):
                         QRect(int(x * cw), int(top),
                               int((run_end - x) * cw) + 1, int(ch) + 1), bg)
 
-                text = "".join(c.data for c in chars[x:run_end])
+                text = "".join([c.data for c in chars[x:run_end]])
                 if text.strip():
                     font = styled_font(c_bold, c_italics, c_under)
                     if font is not cur_font:

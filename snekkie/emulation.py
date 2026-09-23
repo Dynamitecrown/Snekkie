@@ -83,7 +83,8 @@ class Terminal:
         """Plain text of one visible row, trailing blanks stripped."""
         line = self.screen.buffer[row]
         cols = self.screen.columns
-        return "".join(line[x].data for x in range(cols)).rstrip()
+        get, blank = line.get, line.default
+        return "".join([get(x, blank).data for x in range(cols)]).rstrip()
 
     def text(self) -> str:
         return "\n".join(self.line_text(y) for y in range(self.screen.lines))
