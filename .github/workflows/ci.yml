@@ -47,13 +47,12 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: pytest -v
 
-  build-exe:
-    # Only builds the Windows executable for tagged releases.
-    if: startsWith(github.ref, 'refs/tags/v')
+  build-windows:
+    # Builds for tagged releases, or on demand from the Actions tab so the
+    # packaging can be checked without publishing anything.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: windows-latest
-    permissions:
-      contents: write  # needed to create the release
 
     steps:
       - uses: actions/checkout@v4
@@ -74,11 +73,64 @@ jobs:
           name: snekkie-windows
           path: dist/snekkie.exe
 
-      # Publishes the tag as a GitHub release with the exe attached. GitHub
-      # adds the source code archives to every release by itself.
+  build-linux:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: test
+    # The binary only runs on systems whose glibc is at least as new as the
+    # one it was built against, so build on the oldest supported runner.
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # Present at build time so PyInstaller bundles them, which lets the
+      # binary run under X11 as well as Wayland.
+      - name: Install Qt system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0
+
+      - name: Install project
+        run: pip install -e ".[build]"
+
+      - name: Build
+        run: pyinstaller --onefile --name snekkie launcher.py
+
+      # A tarball, because release downloads drop the executable bit.
+      - name: Package
+        run: tar -czf snekkie-linux-x86_64.tar.gz -C dist snekkie
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snekkie-linux
+          path: snekkie-linux-x86_64.tar.gz
+
+  release:
+    # Publishes the tag as a GitHub release with both builds attached. GitHub
+    # adds the source code archives to every release by itself.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to create the release
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/snekkie.exe             --title "Snekkie ${GITHUB_REF_NAME#v}" --generate-notes
+          gh release create "$GITHUB_REF_NAME" \
+            snekkie.exe snekkie-linux-x86_64.tar.gz \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Snekkie ${GITHUB_REF_NAME#v}" --generate-notes

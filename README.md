@@ -18,9 +18,22 @@ A clean, tabbed SSH and serial terminal written in Python — a lightweight, rea
 
 ---
 
+## Download
+
+Ready-to-run builds are on the [Releases page](https://github.com/Dynamitecrown/Snekkie/releases/latest). No Python needed.
+
+- **Windows:** Download `snekkie.exe` and double-click it. It isn't code-signed, so SmartScreen may warn on first launch: choose **More info → Run anyway**.
+- **Linux (x86_64):** Download `snekkie-linux-x86_64.tar.gz`, then:
+  ```bash
+  tar -xzf snekkie-linux-x86_64.tar.gz
+  ./snekkie
+  ```
+
+---
+
 ## Installation & Launch
 
-Requires **Python 3.10+**.
+To run from source instead. Requires **Python 3.10+**.
 
 ### Windows
 
