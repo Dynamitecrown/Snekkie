@@ -1,0 +1,46 @@
+[package]
+name = "snekkie"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A tabbed SSH and serial terminal"
+license = "GPL-3.0-or-later"
+authors = ["Lucas"]
+repository = "https://github.com/Dynamitecrown/Snekkie"
+keywords = ["ssh", "serial", "terminal", "console", "cisco"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "accesskit"] }
+egui = "0.36"
+alacritty_terminal = "0.26"
+russh = { version = "0.63", default-features = false, features = ["ring", "rsa", "flate2", "des"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+serialport = { version = "4.10", default-features = false, features = ["usbportinfo-location"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "7"
+regex = "1"
+parking_lot = "0.12"
+rfd = "0.17"
+arboard = { version = "3.6", default-features = false }
+fontdb = "0.24"
+pollster = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+egui_kittest = { version = "0.36", features = ["eframe"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

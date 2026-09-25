@@ -1,43 +1,49 @@
 @echo off
 rem ---------------------------------------------------------------------
-rem Builds dist\snekkie.exe: a standalone executable that needs no Python
-rem install to run. Re-run this after pulling changes to refresh the exe.
+rem Builds Snekkie on Windows:
+rem   target\release\snekkie.exe        the app (runs on its own, too)
+rem   dist\Snekkie-Setup-<version>.exe  the installer, if NSIS is installed
+rem Needs Rust (https://rustup.rs). For the installer, also NSIS 3
+rem (https://nsis.sourceforge.io, or: winget install NSIS.NSIS).
 rem ---------------------------------------------------------------------
 setlocal
 cd /d "%~dp0"
 
-set "VENV_PY=.venv\Scripts\python.exe"
-
-where python >nul 2>&1
+where cargo >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo   Python was not found on your PATH.
-    echo   Install Python 3.10 or newer from https://www.python.org/downloads/
-    echo   and tick "Add python.exe to PATH" on the first installer screen.
+    echo   Rust was not found. Install it from https://rustup.rs and run this again.
     echo.
     pause
     exit /b 1
 )
 
-if not exist "%VENV_PY%" (
-    echo Creating virtual environment in .venv ...
-    python -m venv .venv || goto fail
+echo Building snekkie.exe ...
+cargo build --release || goto fail
+
+for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "(cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version"`) do set "VERSION=%%v"
+
+set "MAKENSIS="
+where makensis >nul 2>&1 && set "MAKENSIS=makensis"
+if not defined MAKENSIS if exist "%ProgramFiles(x86)%\NSIS\makensis.exe" set "MAKENSIS=%ProgramFiles(x86)%\NSIS\makensis.exe"
+if not defined MAKENSIS if exist "%ProgramFiles%\NSIS\makensis.exe" set "MAKENSIS=%ProgramFiles%\NSIS\makensis.exe"
+if not defined MAKENSIS (
+    echo.
+    echo Built target\release\snekkie.exe.
+    echo NSIS was not found, so no installer was made. Install NSIS 3 to build one.
+    echo.
+    pause
+    exit /b 0
 )
 
-echo Installing build dependencies ...
-"%VENV_PY%" -m pip install --upgrade pip || goto fail
-"%VENV_PY%" -m pip install -e ".[build]" || goto fail
+if not exist dist mkdir dist
+echo Building the installer for version %VERSION% ...
+"%MAKENSIS%" /V2 /DVERSION=%VERSION% /DEXE=..\target\release\snekkie.exe installer\snekkie.nsi || goto fail
 
 echo.
-echo Building dist\snekkie.exe ...
-echo.
-"%VENV_PY%" -m PyInstaller --noconsole --onefile --name snekkie --icon snekkie\assets\icon.ico --add-data "snekkie\assets;snekkie\assets" launcher.py || goto fail
-
-echo.
-echo Done. dist\snekkie.exe is ready to run or pin to your taskbar.
-echo Note: one-file builds are a common antivirus false positive. If
-echo Defender quarantines it, edit this script to drop --onefile and
-echo ship the dist\snekkie\ folder instead.
+echo Done:
+echo   target\release\snekkie.exe
+echo   dist\Snekkie-Setup-%VERSION%.exe
 echo.
 pause
 exit /b 0

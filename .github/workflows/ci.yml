@@ -7,45 +7,38 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
-        # Windows is the primary target, Linux catches platform assumptions
-        # and runs the pty-based serial tests that Windows has to skip.
+        # Windows is the primary target. Linux also runs the pty-based
+        # serial tests that Windows has to skip.
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.10", "3.13"]
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
+          components: clippy, rustfmt
 
-      # PySide6 needs X libraries present even for offscreen rendering.
-      - name: Install Qt system dependencies
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
-            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
-            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0
-
-      - name: Install project
-        run: pip install -e ".[dev]"
+        run: cargo fmt --check
 
       - name: Lint
-        run: ruff check snekkie tests
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: pytest -v
+        run: cargo test
 
   build-windows:
     # Builds for tagged releases, or on demand from the Actions tab so the
@@ -54,24 +47,70 @@ jobs:
     needs: test
     runs-on: windows-latest
 
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-          cache: pip
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install project
-        run: pip install -e ".[build]"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read the version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          # A tag that doesn't match Cargo.toml would publish an installer
+          # that reports the wrong version and breaks upgrade detection.
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $tag = $env:GITHUB_REF_NAME.Substring(1)
+            if ($tag -ne $version) {
+              Write-Error "Tag v$tag does not match the version in Cargo.toml ($version). Bump Cargo.toml, commit, and tag again."
+              exit 1
+            }
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Build
-        run: pyinstaller --noconsole --onefile --name snekkie --icon snekkie/assets/icon.ico --add-data "snekkie/assets:snekkie/assets" launcher.py
+        run: cargo build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snekkie-windows-exe
+          path: target/release/snekkie.exe
+
+  installer:
+    # Linux's NSIS package can build a 64-bit installer (the official Windows
+    # one can't), and it's the build the installer was tested with.
+    needs: build-windows
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: snekkie-windows-exe
+          path: exe
+
+      - name: Install NSIS
+        run: sudo apt-get update && sudo apt-get install -y nsis
+
+      - name: Build the installer
+        env:
+          VERSION: ${{ needs.build-windows.outputs.version }}
+        run: |
+          mkdir -p dist
+          makensis -V2 -DVERSION="$VERSION" -DEXE=../exe/snekkie.exe installer/snekkie.nsi
+          # The bare exe too, for anyone who'd rather not install.
+          cp exe/snekkie.exe "dist/snekkie-$VERSION-portable.exe"
 
       - uses: actions/upload-artifact@v4
         with:
           name: snekkie-windows
-          path: dist/snekkie.exe
+          path: dist/*.exe
 
   build-linux:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
@@ -83,29 +122,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-          cache: pip
+      - uses: dtolnay/rust-toolchain@stable
 
-      # Present at build time so PyInstaller bundles them, which lets the
-      # binary run under X11 as well as Wayland.
-      - name: Install Qt system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
-            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
-            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0
-
-      - name: Install project
-        run: pip install -e ".[build]"
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: pyinstaller --onefile --name snekkie --add-data "snekkie/assets:snekkie/assets" launcher.py
+        run: cargo build --release
 
       # A tarball, because release downloads drop the executable bit.
       - name: Package
-        run: tar -czf snekkie-linux-x86_64.tar.gz -C dist snekkie
+        run: tar -czf snekkie-linux-x86_64.tar.gz -C target/release snekkie
 
       - uses: actions/upload-artifact@v4
         with:
@@ -113,10 +139,11 @@ jobs:
           path: snekkie-linux-x86_64.tar.gz
 
   release:
-    # Publishes the tag as a GitHub release with both builds attached. GitHub
-    # adds the source code archives to every release by itself.
+    # Publishes the tag as a GitHub release with the builds attached. A tag
+    # with a suffix (v2.1.0-beta.1) becomes a pre-release, so testers can
+    # try it without it showing up as the latest version.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-windows, build-linux]
+    needs: [installer, build-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write  # needed to create the release
@@ -130,7 +157,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" \
-            snekkie.exe snekkie-linux-x86_64.tar.gz \
+            Snekkie-Setup-*.exe snekkie-*-portable.exe snekkie-linux-x86_64.tar.gz \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Snekkie ${GITHUB_REF_NAME#v}" --generate-notes
+            --title "Snekkie ${GITHUB_REF_NAME#v}" --generate-notes $prerelease
