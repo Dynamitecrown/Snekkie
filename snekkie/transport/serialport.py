@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
+
 import serial
 import serial.tools.list_ports
 
@@ -27,10 +30,54 @@ STOPBITS = {1: serial.STOPBITS_ONE,
             2: serial.STOPBITS_TWO}
 
 
-def list_ports() -> list[tuple[str, str]]:
-    """Available ports as (device, description) pairs."""
-    return [(p.device, p.description or p.device)
-            for p in serial.tools.list_ports.comports()]
+@dataclass(frozen=True)
+class PortInfo:
+    """One detected serial port, labelled for the port picker."""
+
+    device: str
+    description: str = ""
+    serial_number: str = ""
+    location: str = ""
+    hwid: str = ""
+
+    @property
+    def label(self) -> str:
+        """e.g. "COM4 — USB Serial Port  [SN A10K3X]".
+
+        Two identical USB console cables share a description, so the serial
+        number (or, failing that, the USB location) is what tells them apart.
+        """
+        # Windows already appends "(COM4)" to the description; don't repeat it.
+        desc = self.description
+        suffix = f"({self.device})"
+        if desc.endswith(suffix):
+            desc = desc[:-len(suffix)].rstrip()
+        if desc in ("", "n/a", self.device):
+            text = self.device
+        else:
+            text = f"{self.device} — {desc}"
+        if self.serial_number:
+            text += f"  [SN {self.serial_number}]"
+        elif self.location:
+            text += f"  [USB {self.location}]"
+        return text
+
+
+def _natural_key(device: str) -> list:
+    """Sort COM2 before COM10 and ttyUSB2 before ttyUSB10."""
+    return [int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", device)]
+
+
+def list_ports() -> list[PortInfo]:
+    """Currently attached serial ports, in natural device order."""
+    ports = [PortInfo(device=p.device,
+                      description=p.description or "",
+                      serial_number=p.serial_number or "",
+                      location=p.location or "",
+                      hwid=p.hwid or "")
+             for p in serial.tools.list_ports.comports()]
+    return sorted(ports, key=lambda port: _natural_key(port.device))
 
 
 @register("serial", "Serial")
