@@ -12,7 +12,7 @@ A clean, tabbed SSH and serial terminal written in Python — a lightweight, rea
 
 - **Integrated Layout:** Permanent sidebar for quick-connect and saved profiles; no popup dialogs.
 - **SSH:** Password, private key, and SSH agent (Pageant) auth with `known_hosts` verification.
-- **Serial:** Auto-detects COM ports, full baud/parity/stop-bit control, flow control, and Cisco break signals.
+- **Serial:** Auto-detects COM ports and lists them in a drop-down (labelled by adapter serial number, so several identical console cables can be told apart), full baud/parity/stop-bit control, flow control, and Cisco break signals.
 - **Tabs & Profiles:** Multi-tab sessions (reconnect, duplicate, drag) and zero-secret JSON profiles.
 - **VT100 / Truecolor:** Full 24-bit color, ANSI styles, cursor addressing, and smooth scrollback (works with `htop`, `nano`).
 - **Terminal UX:** PuTTY-style copy-on-select / right-click paste, multi-screen drag selection, and raw byte session logging.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -87,13 +88,34 @@ class SSHPage(QWidget):
         return ""
 
 
+class PortComboBox(QComboBox):
+    """Drop-down that re-scans for serial ports each time it is opened, so a
+    console cable plugged in after launch shows up without hitting Refresh."""
+
+    about_to_show = Signal()
+
+    def showPopup(self):
+        self.about_to_show.emit()
+        super().showPopup()
+
+
+# Item data for the trailing "Other…" entry (typed-in device paths).
+_OTHER = "\x00other"
+
+
 class SerialPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.device = QComboBox()
-        self.device.setEditable(True)
+        self.device = PortComboBox()
+        self.device.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.device.setMinimumContentsLength(12)
+        self.device.about_to_show.connect(self.refresh_ports)
+        self.device.activated.connect(self._port_activated)
+        self.device.currentIndexChanged.connect(self._remember_index)
+        self._last_index = -1
+        self._custom: list[str] = []  # devices typed in via "Other…"
         refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self.refresh_ports)
+        refresh.clicked.connect(lambda: self.refresh_ports())
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(self.device, 1)
@@ -138,28 +160,65 @@ class SerialPage(QWidget):
 
         self.refresh_ports()
 
-    def refresh_ports(self):
-        current = self.device.currentText()
+    def refresh_ports(self, prefer: str | None = None):
+        """Re-scan and rebuild the list, keeping the chosen port if it's
+        still there. With exactly one port attached it is picked for you;
+        with several, nothing is picked until you choose, so a session never
+        silently lands on the wrong console cable."""
+        wanted = self._selected_device() if prefer is None else prefer
+        ports = list_ports()
+        detected = {port.device for port in ports}
+
+        self.device.blockSignals(True)
         self.device.clear()
-        for device, description in list_ports():
-            label = device if description == device else f"{device} — {description}"
-            self.device.addItem(label, device)
-        if current:
-            self.device.setCurrentText(current)
+        for port in ports:
+            self.device.addItem(port.label, port.device)
+            self.device.setItemData(self.device.count() - 1,
+                                    port.hwid or port.device, Qt.ToolTipRole)
+        # A saved or typed-in device that isn't attached right now stays
+        # selectable instead of vanishing from the form.
+        extra = [d for d in (*self._custom, wanted) if d and d not in detected]
+        for device in dict.fromkeys(extra):
+            self.device.addItem(f"{device}  (not detected)", device)
+        self.device.addItem("Other…", _OTHER)
+
+        if len(ports) > 1:
+            self.device.setPlaceholderText(f"Choose a port ({len(ports)} detected)")
+        elif ports:
+            self.device.setPlaceholderText("Choose a port")
+        else:
+            self.device.setPlaceholderText("No serial ports detected")
+
+        index = self.device.findData(wanted) if wanted else -1
+        if index < 0 and len(ports) == 1:
+            index = 0
+        self.device.setCurrentIndex(index)
+        self._last_index = index
+        self.device.blockSignals(False)
+
+    def _remember_index(self, index: int):
+        if self.device.itemData(index) != _OTHER:
+            self._last_index = index
+
+    def _port_activated(self, index: int):
+        if self.device.itemData(index) != _OTHER:
+            return
+        device, ok = QInputDialog.getText(
+            self, "Serial port", "Device name or path (e.g. COM7, /dev/ttyUSB0):")
+        device = device.strip()
+        if not ok or not device:
+            self.device.setCurrentIndex(self._last_index)
+            return
+        if device not in self._custom:
+            self._custom.append(device)
+        self.refresh_ports(prefer=device)
 
     def _selected_device(self) -> str:
         data = self.device.currentData()
-        if data:
-            return data
-        return self.device.currentText().split(" — ")[0].strip()
+        return data if data and data != _OTHER else ""
 
     def load(self, p: Profile):
-        if p.device:
-            index = self.device.findData(p.device)
-            if index >= 0:
-                self.device.setCurrentIndex(index)
-            else:
-                self.device.setCurrentText(p.device)
+        self.refresh_ports(prefer=p.device)
         self.baud.setCurrentText(str(p.baud))
         self.bytesize.setCurrentText(str(p.bytesize))
         self.parity.setCurrentText(p.parity)
@@ -183,7 +242,7 @@ class SerialPage(QWidget):
 
     def validate(self) -> str:
         if not self._selected_device():
-            return "Select a serial port."
+            return "Choose a serial port from the Port list."
         return ""
 
 
