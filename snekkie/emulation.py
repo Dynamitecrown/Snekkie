@@ -46,6 +46,25 @@ class _HistoryScreen(pyte.HistoryScreen):
 
     __getattribute__ = object.__getattribute__
 
+    def after_event(self, event: str) -> None:
+        # pyte's version trims cells past the right edge after a page move,
+        # but pops from each row while iterating it. Rows that scrolled off
+        # before a narrowing resize are still wider than the screen, so the
+        # first scroll back raised RuntimeError and scrolling silently
+        # stopped working. It also kept the cell at index == columns.
+        if event in ("prev_page", "next_page"):
+            columns = self.columns
+            for line in self.buffer.values():
+                for x in [x for x in line if x >= columns]:
+                    del line[x]
+
+        # If we're at the bottom of the history buffer and DECTCEM is set,
+        # show the cursor -- unchanged from pyte.
+        self.cursor.hidden = not (
+            self.history.position == self.history.size
+            and pyte.modes.DECTCEM in self.mode
+        )
+
 
 for _event in pyte.HistoryScreen._wrapped:
     _handler = getattr(pyte.HistoryScreen, _event, None)

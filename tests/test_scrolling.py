@@ -188,3 +188,22 @@ def test_scroll_distance_avoids_float_rounding():
             assert terminal.scroll_back == distance, (height, distance)
         terminal.scroll_to(0)
         assert terminal.scroll_back == 0
+
+
+def test_scrollback_survives_a_narrowing_resize():
+    """Rows wider than the screen must not break paging back through them.
+
+    pyte trims them while iterating the same dict, which raised and left
+    the view stuck at the live bottom after the window got narrower.
+    """
+    t = Terminal(80, 24, 500)
+    t.feed(b"".join(b"line %d, long enough to run past forty columns\r\n" % i
+                    for i in range(100)))
+    t.resize(40, 24)
+
+    assert t.page_up()
+    assert t.scroll_back > 0
+    assert t.scroll_by(3)
+    assert all(x < 40 for row in t.buffer.values() for x in row)
+    assert t.scroll_by(-t.scroll_back)
+    assert not t.scrolled_back
