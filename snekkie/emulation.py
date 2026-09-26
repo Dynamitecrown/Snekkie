@@ -21,9 +21,61 @@ DECCKM = 1 << 5
 DECTCEM = pyte.modes.DECTCEM
 
 
+def _wrap_event(event: str, handler):
+    def inner(self, *args, **kwargs):
+        self.before_event(event)
+        result = handler(self, *args, **kwargs)
+        self.after_event(event)
+        return result
+    inner.__name__ = event
+    return inner
+
+
+class _HistoryScreen(pyte.HistoryScreen):
+    """HistoryScreen without its per-attribute-access hook.
+
+    pyte wraps the event methods by overriding __getattribute__, so every
+    attribute read on the screen -- self.cursor, self.columns, self.buffer,
+    thousands per line of output inside pyte's own draw loop -- runs a Python
+    function, and every method lookup builds a fresh closure. That hook was
+    most of the cost of feeding output. Installing the same before/after
+    wrappers once, as ordinary methods, behaves identically (internal calls
+    such as self.index() still resolve to the wrapped version) and lets
+    attribute access go back to the C fast path.
+    """
+
+    __getattribute__ = object.__getattribute__
+
+    def after_event(self, event: str) -> None:
+        # pyte's version trims cells past the right edge after a page move,
+        # but pops from each row while iterating it. Rows that scrolled off
+        # before a narrowing resize are still wider than the screen, so the
+        # first scroll back raised RuntimeError and scrolling silently
+        # stopped working. It also kept the cell at index == columns.
+        if event in ("prev_page", "next_page"):
+            columns = self.columns
+            for line in self.buffer.values():
+                for x in [x for x in line if x >= columns]:
+                    del line[x]
+
+        # If we're at the bottom of the history buffer and DECTCEM is set,
+        # show the cursor -- unchanged from pyte.
+        self.cursor.hidden = not (
+            self.history.position == self.history.size
+            and pyte.modes.DECTCEM in self.mode
+        )
+
+
+for _event in pyte.HistoryScreen._wrapped:
+    _handler = getattr(pyte.HistoryScreen, _event, None)
+    if callable(_handler):
+        setattr(_HistoryScreen, _event, _wrap_event(_event, _handler))
+del _event, _handler
+
+
 class Terminal:
     def __init__(self, cols: int = 80, rows: int = 24, scrollback: int = 5000):
-        self.screen = pyte.HistoryScreen(
+        self.screen = _HistoryScreen(
             max(cols, 2), max(rows, 2), history=max(scrollback, 0), ratio=0.5
         )
         self.stream = pyte.ByteStream(self.screen)

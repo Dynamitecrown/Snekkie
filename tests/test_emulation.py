@@ -5,7 +5,9 @@ garbled output that is painful to diagnose by eye, and they are easy to
 introduce when swapping or upgrading the emulator underneath.
 """
 
-from snekkie.emulation import Terminal
+import pyte
+
+from snekkie.emulation import Terminal, _HistoryScreen
 
 
 def test_plain_text_lands_on_the_screen():
@@ -109,3 +111,27 @@ def test_reset_restores_geometry():
     t.reset()
     assert (t.columns, t.lines) == (100, 30)
     assert t.line_text(0) == ""
+
+
+def test_screen_matches_stock_history_screen():
+    """The fast screen must behave exactly like pyte's own HistoryScreen."""
+    data = (b"\x1b[31mred\x1b[0m\r\n" + b"interface Gi1/0/1\r\n" * 40
+            + b"\x1b[?25l\x1b[5;10Hx\x1b[K\x1b[3;20r\x1bM\x1b[L\x1b[?25h")
+    stock = pyte.HistoryScreen(40, 12, history=100, ratio=0.5)
+    fast = _HistoryScreen(40, 12, history=100, ratio=0.5)
+
+    def state(screen):
+        return ([dict(screen.buffer[y]) for y in range(screen.lines)],
+                (screen.cursor.x, screen.cursor.y, screen.cursor.hidden),
+                [dict(line) for line in screen.history.top],
+                [dict(line) for line in screen.history.bottom],
+                screen.history.position, set(screen.mode), set(screen.dirty))
+
+    for screen in (stock, fast):
+        pyte.ByteStream(screen).feed(data)
+        screen.prev_page()
+        screen.prev_page()
+        screen.next_page()
+    assert state(fast) == state(stock)
+    # ...without the per-attribute hook that made the stock one slow.
+    assert _HistoryScreen.__getattribute__ is object.__getattribute__

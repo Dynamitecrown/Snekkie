@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from itertools import repeat
 
 from PySide6.QtCore import QRect, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -277,8 +278,10 @@ class TerminalWidget(QWidget):
     def _row_cells(self, y: int) -> tuple:
         """Immutable cell snapshot, including ANSI attributes and wide cells."""
         line = self.terminal.buffer[y]
-        return tuple(line.get(i, line.default)
-                     for i in range(self.terminal.columns))
+        cols = self.terminal.columns
+        # map over dict.get stays in C; a generator here was a Python frame
+        # resumption per cell, a few thousand per snapshot of the screen.
+        return tuple(map(line.get, range(cols), repeat(line.default, cols)))
 
     def _row_text(self, y: int) -> str:
         # line.get(i, blank) rather than line[i]: pyte rows only store cells
@@ -314,10 +317,23 @@ class TerminalWidget(QWidget):
 
         if self._selection_range() is not None:
             return None
-        current = [self._row_cells(y) for y in range(rows)]
+        # Snapshots are taken lazily: a burst that scrolled further than
+        # MAX_BLIT_ROWS -- most of a `show run` dump -- is ruled out by the
+        # top row alone, without paying to snapshot the rest of the screen.
+        current: list[tuple | None] = [None] * rows
+
+        def cells(y: int) -> tuple:
+            row = current[y]
+            if row is None:
+                row = current[y] = self._row_cells(y)
+            return row
+
+        top_row = cells(0)
         # Enough of the screen has to survive the shift to be worth copying.
         min_prefix = rows // 2
         for n in range(1, min(MAX_BLIT_ROWS, rows - 1) + 1):
+            if top_row != painted[n]:
+                continue
             # How far down does the shifted screen still match what is drawn?
             # Not all the way, normally: the line that triggered the scroll was
             # written into the bottom row first, so it lands inside this range
@@ -329,7 +345,7 @@ class TerminalWidget(QWidget):
                 continue
             limit = rows - n
             matched = 0
-            while matched < limit and current[matched] == painted[matched + n]:
+            while matched < limit and cells(matched) == painted[matched + n]:
                 matched += 1
             if matched >= min_prefix:
                 self.scroll(0, -int(n * self._ch))
@@ -476,7 +492,7 @@ class TerminalWidget(QWidget):
             # pyte lines are dicts that materialise blanks on access. Pulling
             # the row out once turns two dict lookups per cell (here and in
             # the run scan below) into one, and list indexing after that.
-            chars = [line.get(i, line.default) for i in col_range]
+            chars = list(map(line.get, col_range, repeat(line.default, cols)))
             row_text = "".join([c.data for c in chars])
             # Partial exposure does not establish that a whole row is valid.
             row_rect = QRect(0, int(top), width, int(ch) + 1)
