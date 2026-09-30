@@ -7,11 +7,11 @@
 ; and are never touched by installing, upgrading or uninstalling.
 ;
 ; Build (from the repository root):
-;   makensis -DVERSION=2.0.0 -DEXE=target\release\snekkie.exe installer\snekkie.nsi
+;   makensis -DVERSION=2.1.0 -DEXE=target\release\snekkie.exe installer\snekkie.nsi
 ;
 ; Unattended use:
-;   Snekkie-Setup-2.0.0.exe /S            install or upgrade silently
-;   Snekkie-Setup-2.0.0.exe /S /D=C:\Dir  ...into a specific folder (first install)
+;   Snekkie-Setup-2.1.0.exe /S            install or upgrade silently
+;   Snekkie-Setup-2.1.0.exe /S /D=C:\Dir  ...into a specific folder (first install)
 ;   "%LOCALAPPDATA%\Programs\Snekkie\uninstall.exe" /S
 
 ; A 64-bit installer where this NSIS has the stubs for one (Linux packages
