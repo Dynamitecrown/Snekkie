@@ -61,8 +61,8 @@ Download `Snekkie-Setup-<version>.exe` and run it.
 - **Uninstalling:** from *Apps & features*. Saved sessions and settings (`%APPDATA%\snekkie`) are left in place, so reinstalling later picks up where you left off.
 - **Rolling out to several machines:** the installer runs unattended with `/S`:
   ```
-  Snekkie-Setup-2.1.0.exe /S                 install or upgrade silently
-  Snekkie-Setup-2.1.0.exe /S /D=C:\Tools\Snekkie   first install into a specific folder
+  Snekkie-Setup-2.2.0.exe /S                 install or upgrade silently
+  Snekkie-Setup-2.2.0.exe /S /D=C:\Tools\Snekkie   first install into a specific folder
   "%LOCALAPPDATA%\Programs\Snekkie\uninstall.exe" /S
   ```
   A silent upgrade exits with code 5 if Snekkie is running, and refuses to downgrade.
