@@ -7,5 +7,6 @@ pub mod render;
 pub mod sidebar;
 pub mod style;
 pub mod terminal_view;
+pub mod updater;
 
 pub use app::{Paths, SnekkieApp};

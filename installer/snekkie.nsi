@@ -13,6 +13,10 @@
 ;   Snekkie-Setup-2.1.0.exe /S            install or upgrade silently
 ;   Snekkie-Setup-2.1.0.exe /S /D=C:\Dir  ...into a specific folder (first install)
 ;   "%LOCALAPPDATA%\Programs\Snekkie\uninstall.exe" /S
+;
+; Snekkie's own "Update now" runs the new installer with /UPDATE and then
+; closes. On an existing install that skips straight to installing: it
+; waits for Snekkie to close, upgrades it, and starts it again.
 
 ; A 64-bit installer where this NSIS has the stubs for one (Linux packages
 ; do; release builds are made there). The official Windows NSIS only ships
@@ -71,6 +75,7 @@ VIAddVersionKey "CompanyName" "${PUBLISHER}"
 
 Var InstalledVersion
 Var IsUpgrade
+Var IsUpdate
 Var WelcomeText
 
 !define MUI_ICON "..\assets\icon.ico"
@@ -80,6 +85,7 @@ Var WelcomeText
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TITLE "${APP_NAME} ${VERSION}"
 !define MUI_WELCOMEPAGE_TEXT "$WelcomeText"
+!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipOnUpdate
 !insertmacro MUI_PAGE_WELCOME
 ; The GPL is a licence to share and change the program, not terms you
 ; must accept to use it, so this page informs rather than asks. Upgrades
@@ -100,6 +106,8 @@ Var WelcomeText
 !define MUI_FINISHPAGE_SHOWREADME_TEXT "Create a desktop shortcut"
 !define MUI_FINISHPAGE_SHOWREADME_NOTCHECKED
 !define MUI_FINISHPAGE_SHOWREADME_FUNCTION CreateDesktopShortcut
+; An update restarts Snekkie by itself (see .onInstSuccess).
+!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipOnUpdate
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -109,16 +117,32 @@ Var WelcomeText
 
 ; Wait until Snekkie isn't running, asking the user to close it. Aborts
 ; if they cancel, or straight away in silent mode, where there's nobody to
-; ask and replacing a running exe would fail anyway.
+; ask and replacing a running exe would fail anyway. An update started from
+; Snekkie first gives it up to 30 seconds to close by itself.
 !macro WAIT_FOR_APP_TO_CLOSE UN
 Function ${UN}WaitForAppToClose
+  StrCpy $R9 0
   check:
     ; SYNCHRONIZE access is enough to see whether the mutex exists.
     System::Call 'kernel32::OpenMutexW(i 0x00100000, i 0, w "${APP_MUTEX}") p .r1'
     ${If} $1 == 0
+      ${If} $R9 > 0
+        ; Windows can hold on to the exe for a moment after the process
+        ; has let go of the mutex.
+        Sleep 1000
+      ${EndIf}
       Return
     ${EndIf}
     System::Call 'kernel32::CloseHandle(p r1)'
+    ${If} $IsUpdate == 1
+    ${AndIf} $R9 < 120
+      ${If} $R9 == 0
+        DetailPrint "Waiting for ${APP_NAME} to close..."
+      ${EndIf}
+      IntOp $R9 $R9 + 1
+      Sleep 250
+      Goto check
+    ${EndIf}
     ${If} ${Silent}
       SetErrorLevel 5
       Abort "${APP_NAME} is running. Close it and run this again."
@@ -134,6 +158,7 @@ FunctionEnd
 
 Function .onInit
   StrCpy $IsUpgrade 0
+  StrCpy $IsUpdate 0
   ReadRegStr $InstalledVersion HKCU "${UNINSTALL_KEY}" "DisplayVersion"
   ${If} $InstalledVersion == ""
     StrCpy $WelcomeText "Setup will install ${APP_NAME} ${VERSION} on your computer.$\r$\n$\r$\nNo administrator rights are needed. Click Next to continue."
@@ -141,6 +166,14 @@ Function .onInit
   ${EndIf}
 
   StrCpy $IsUpgrade 1
+  ; Only an existing install can be updated this way; a first install
+  ; always gets the full set of pages.
+  ${GetParameters} $0
+  ClearErrors
+  ${GetOptions} $0 "/UPDATE" $1
+  ${IfNot} ${Errors}
+    StrCpy $IsUpdate 1
+  ${EndIf}
   ReadRegStr $1 HKCU "${UNINSTALL_KEY}" "InstallLocation"
   ${If} $1 != ""
     StrCpy $INSTDIR $1
@@ -168,11 +201,27 @@ Function SkipOnUpgrade
   ${EndIf}
 FunctionEnd
 
+Function SkipOnUpdate
+  ${If} $IsUpdate == 1
+    Abort
+  ${EndIf}
+FunctionEnd
+
+Function .onInstSuccess
+  ${If} $IsUpdate == 1
+    Exec '"$INSTDIR\snekkie.exe"'
+  ${EndIf}
+FunctionEnd
+
 Function CreateDesktopShortcut
   CreateShortcut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\snekkie.exe"
 FunctionEnd
 
 Section "Install"
+  ${If} $IsUpdate == 1
+    ; Nothing to read on the way out: carry on once installed.
+    SetAutoClose true
+  ${EndIf}
   Call WaitForAppToClose
 
   SetOutPath "$INSTDIR"

@@ -19,6 +19,7 @@ Version 2 is a ground-up rewrite in Rust of the original Python app. It installs
 - **VT100 / truecolor:** Full 24-bit colour, ANSI styles, cursor addressing, and smooth scrollback (works with `htop`, `nano`, `vim`). Terminal emulation is [alacritty_terminal](https://crates.io/crates/alacritty_terminal), the engine inside the Alacritty terminal.
 - **Terminal UX:** PuTTY-style copy-on-select / right-click paste, multi-screen drag selection, and raw byte session logging.
 - **Syntax highlighting:** Live keyword, IP and prompt colouring (e.g. Cisco IOS).
+- **Updates:** Checks for a new release each time it starts, and shows **Update to x.y.z** in the menu bar when there is one. One click downloads it, checks it, installs it and restarts Snekkie.
 
 ---
 
@@ -55,7 +56,8 @@ Builds are on the [Releases page](https://github.com/Dynamitecrown/Snekkie/relea
 Download `Snekkie-Setup-<version>.exe` and run it.
 
 - **No administrator rights needed.** Snekkie installs for the current user into `%LOCALAPPDATA%\Programs\Snekkie`, with a Start menu shortcut and an entry in *Apps & features*.
-- **Upgrading:** download the newer installer and run it. It finds the existing install, updates it in place, and keeps your saved sessions and settings. If Snekkie is open it asks you to close it first.
+- **Updating:** when a new version is out, Snekkie shows **Update to x.y.z** at the right of the menu bar. Click it, then **Update now**: Snekkie downloads the installer, checks it against the release's published SHA-256, and restarts into the new version (asking first if any sessions are connected). Saved sessions and settings are kept. **Help → Check for updates…** checks on demand; the check at startup can be turned off in Preferences. It only ever offers full releases, never pre-releases.
+- **Upgrading by hand:** download the newer installer and run it. It finds the existing install, updates it in place, and keeps your saved sessions and settings. If Snekkie is open it asks you to close it first.
 - **Uninstalling:** from *Apps & features*. Saved sessions and settings (`%APPDATA%\snekkie`) are left in place, so reinstalling later picks up where you left off.
 - **Rolling out to several machines:** the installer runs unattended with `/S`:
   ```
@@ -67,7 +69,7 @@ Download `Snekkie-Setup-<version>.exe` and run it.
 
 The installer and app aren't code-signed, so SmartScreen may warn the first time: choose **More info → Run anyway**.
 
-Prefer not to install? `snekkie-<version>-portable.exe` is the same program as a single file; run it from anywhere. It doesn't update itself.
+Prefer not to install? `snekkie-<version>-portable.exe` is the same program as a single file; run it from anywhere. It tells you when there's a new version and links to the download, but doesn't update itself.
 
 ### Linux (x86_64)
 
@@ -130,6 +132,8 @@ On Windows, `build-windows.bat` builds `target\release\snekkie.exe` and, if [NSI
 
 CI then tests everything, builds the Windows installer, portable exe and Linux tarball, and publishes them as a GitHub release. It refuses to build a tag that doesn't match `Cargo.toml`, so an installer can never report the wrong version. A tag with a suffix, such as `v2.1.0-beta.1`, is published as a pre-release, which is handy for trying a build with one user before everyone gets it.
 
+Once a full release is published, every copy of Snekkie offers it the next time it starts. The in-app update looks for the installer by its name, `Snekkie-Setup-<version>.exe`, so keep that name.
+
 ---
 
 ## Architecture overview
@@ -140,6 +144,7 @@ src/
 ├── config.rs          # Where files live, legacy config migration
 ├── profiles.rs        # Saved sessions (sessions.json)
 ├── settings.rs        # App preferences and colour themes (settings.json)
+├── update.rs          # Checking GitHub for a new release; downloading and running its installer
 ├── session.rs         # One tab: transport + emulator + log file
 ├── transport/         # Byte-stream engines: SSH (russh), serial (serialport)
 ├── terminal/          # Emulation (alacritty_terminal), colours, keys, highlighting

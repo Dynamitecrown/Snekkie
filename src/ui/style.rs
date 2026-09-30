@@ -92,6 +92,14 @@ pub fn accent_button(text: &str, accent: Color32) -> egui::Button<'static> {
         .min_size(egui::vec2(0.0, 30.0))
 }
 
+/// A small, rounded accent-filled button that fits in the menu bar.
+pub fn accent_pill(text: &str, accent: Color32) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(text.to_string()).color(text_on(accent)).strong())
+        .fill(accent)
+        .stroke(Stroke::NONE)
+        .corner_radius(CornerRadius::same(10))
+}
+
 /// A tab-strip button: plain text, underlined in the accent colour when
 /// selected, greyed out when disabled.
 pub fn tab_button(ui: &mut egui::Ui, text: &str, selected: bool, enabled: bool, accent: Color32) -> egui::Response {

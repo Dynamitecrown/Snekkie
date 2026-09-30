@@ -168,6 +168,9 @@ impl Preferences {
             RichText::new("Font settings apply to sessions opened from now on.").color(style::TEXT_SECONDARY).small(),
         );
 
+        ui.add_space(6.0);
+        ui.checkbox(&mut self.settings.check_for_updates, "Check for updates when Snekkie starts");
+
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             if ui.button("Cancel").clicked() {

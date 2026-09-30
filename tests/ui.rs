@@ -196,3 +196,75 @@ fn telnet_session_from_the_form() {
     }
     assert_eq!(harness.state().tab_titles(), [format!("127.0.0.1:{port}")]);
 }
+
+fn newer_release(installer_url: &str) -> snekkie::update::Release {
+    snekkie::update::Release {
+        version: "99.0.0".into(),
+        page: "https://github.com/Dynamitecrown/Snekkie/releases/tag/v99.0.0".into(),
+        installer: Some(snekkie::update::Asset {
+            name: "Snekkie-Setup-99.0.0.exe".into(),
+            url: installer_url.into(),
+            size: 1000,
+            sha256: None,
+        }),
+    }
+}
+
+fn update_summary() -> String {
+    format!("Snekkie 99.0.0 is available. You have {}.", env!("CARGO_PKG_VERSION"))
+}
+
+/// A newer release shows in the menu bar. A copy the installer didn't put
+/// there can't update itself, so it points at the release page.
+#[test]
+fn a_portable_copy_points_at_the_release_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(&dir);
+    assert!(harness.query_by_label_contains("Update to").is_none());
+
+    harness.state_mut().offer_update(newer_release("https://example.invalid/setup.exe"), false);
+    harness.run_ok();
+    harness.get_by_label("Update to 99.0.0").click();
+    harness.run_ok();
+    assert_eq!(harness.state().dialog_texts(), [update_summary()]);
+    harness.get_by_label("Open release page");
+    assert!(harness.query_by_label("Update now").is_none());
+
+    harness.get_by_label("Later").click();
+    harness.run_ok();
+    assert!(harness.state().dialog_texts().is_empty());
+    // Still on offer for later.
+    harness.get_by_label("Update to 99.0.0");
+}
+
+/// An installed copy offers to update itself, but never on a stray Enter,
+/// and a failed download is reported and can be tried again.
+#[test]
+fn an_installed_copy_updates_itself_only_when_asked() {
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(&dir);
+    // Plain http is refused, so this fails without touching the network.
+    harness.state_mut().offer_update(newer_release("http://127.0.0.1:9/Snekkie-Setup-99.0.0.exe"), true);
+    harness.run_ok();
+    harness.get_by_label("Update to 99.0.0").click();
+    harness.run_ok();
+    harness.get_by_label("What's new in 99.0.0");
+
+    harness.key_press(egui::Key::Enter);
+    harness.run_ok();
+    assert_eq!(harness.state().dialog_texts(), [update_summary()], "Enter should not start the update");
+
+    harness.get_by_label("Update now").click();
+    harness.run_ok();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !harness.state().dialog_texts().iter().any(|t| t.starts_with("Could not download the update")) {
+        assert!(Instant::now() < deadline, "dialogs: {:?}", harness.state().dialog_texts());
+        std::thread::sleep(Duration::from_millis(20));
+        harness.run_ok();
+    }
+    harness.key_press(egui::Key::Enter);
+    harness.run_ok();
+    harness.get_by_label("Update to 99.0.0");
+}

@@ -16,12 +16,14 @@ use super::preferences::{self, Preferences};
 use super::sidebar::{self, Sidebar};
 use super::style;
 use super::terminal_view::{TerminalView, ViewOptions};
+use super::updater::{self, Updater};
 use crate::profiles::{Auth, Kind, Profile, ProfileStore};
 use crate::session::{ConnectContext, NoticeLevel, Session, State};
 use crate::settings::{AppSettings, SettingsStore};
 use crate::terminal::keys;
 use crate::transport::serial::PortInfo;
 use crate::transport::ssh::{self, HostKeyAsker, HostKeyQuestion};
+use crate::update::{self, Release};
 
 /// How long a status bar message stays up, in seconds.
 const FLASH_SECONDS: f64 = 4.0;
@@ -61,6 +63,7 @@ enum ConfirmAction {
     DeleteSaved(String),
     ReplaceTheme(String),
     DeleteTheme(String),
+    InstallUpdate,
 }
 
 enum InputAction {
@@ -77,6 +80,7 @@ enum Dialog {
     Confirm { title: String, text: String, action: ConfirmAction },
     Input { title: String, label: String, text: String, secret: bool, action: InputAction, focus: bool },
     HostKey(Box<HostKeyQuestion>),
+    Update { release: Release, installable: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +99,9 @@ enum Command {
     ToggleSidebar,
     Preferences,
     Shortcuts,
+    CheckForUpdates,
+    ShowUpdate,
+    InstallUpdate,
     About,
     NextTab,
     PreviousTab,
@@ -137,11 +144,18 @@ pub struct SnekkieApp {
     /// Whether the terminal had the keyboard when a dialog opened, so it
     /// can have it back when the dialog closes.
     terminal_had_focus: bool,
+    updater: Updater,
 }
 
 impl SnekkieApp {
     pub fn new(paths: Paths) -> Self {
-        Self::with_port_lister(paths, crate::transport::serial::list_ports)
+        let mut app = Self::with_port_lister(paths, crate::transport::serial::list_ports);
+        // Only the real app goes online by itself; tests build theirs
+        // with_port_lister.
+        if app.settings.check_for_updates {
+            app.updater.check_at_startup();
+        }
+        app
     }
 
     /// Styling needs the egui context, so it happens on the first frame
@@ -176,6 +190,7 @@ impl SnekkieApp {
             accent: Color32::TRANSPARENT,
             dragging_tab: None,
             terminal_had_focus: false,
+            updater: Updater::new(),
         }
     }
 
@@ -241,6 +256,77 @@ impl SnekkieApp {
             queue.lock().push_back(question);
             ctx.request_repaint();
         })
+    }
+
+    fn live_sessions(&self) -> usize {
+        self.tabs.iter().filter(|t| t.session.is_live()).count()
+    }
+
+    /// Close the window without asking, hanging up every session.
+    fn quit_now(&mut self, ctx: &egui::Context) {
+        self.allow_close = true;
+        for tab in &self.tabs {
+            tab.session.shutdown();
+        }
+        ctx.send_viewport_cmd(ViewportCommand::Close);
+    }
+
+    // -- updating -------------------------------------------------------
+
+    fn show_update(&mut self) {
+        if let updater::Status::Available(release) = &self.updater.status {
+            let installable = self.updater.can_install && release.installer.is_some();
+            self.dialogs.push(Dialog::Update { release: release.clone(), installable });
+        }
+    }
+
+    /// Restart into the downloaded update, asking first if that would cut
+    /// sessions off.
+    fn request_install(&mut self, ctx: &egui::Context) {
+        let live = self.live_sessions();
+        if live == 0 {
+            self.install_update(ctx);
+        } else {
+            self.confirm(
+                "Restart to update",
+                format!(
+                    "Snekkie will close to install the update, then start again. \
+                     This disconnects {live} session(s). Restart now?"
+                ),
+                ConfirmAction::InstallUpdate,
+            );
+        }
+    }
+
+    fn install_update(&mut self, ctx: &egui::Context) {
+        let Some(installer) = self.updater.installer().cloned() else { return };
+        match update::run_installer(&installer) {
+            // The installer waits for this window to close.
+            Ok(()) => self.quit_now(ctx),
+            Err(e) => self.message("Update", format!("Could not start the installer: {e}")),
+        }
+    }
+
+    fn update_events(&mut self, ctx: &egui::Context) {
+        for event in self.updater.poll(ctx) {
+            match event {
+                updater::Event::UpToDate => self.message(
+                    "Check for updates",
+                    format!("You have the latest version, Snekkie {}.", update::CURRENT_VERSION),
+                ),
+                updater::Event::Found => self.show_update(),
+                updater::Event::Failed(text) => self.message("Update", text),
+                updater::Event::Downloaded => {
+                    // Straight on to installing, unless that would cut off
+                    // a session or something the user is in the middle of.
+                    if self.live_sessions() == 0 && !self.modal_open() {
+                        self.install_update(ctx);
+                    } else {
+                        self.flash(ctx, "Update downloaded. Click “Restart to update” when you're ready.");
+                    }
+                }
+            }
+        }
     }
 
     // -- connecting -----------------------------------------------------
@@ -405,6 +491,17 @@ impl SnekkieApp {
                 self.save_settings();
             }
             Command::Preferences => self.preferences = Some(Preferences::new(&self.settings)),
+            Command::CheckForUpdates => match self.updater.status {
+                updater::Status::Idle | updater::Status::Checking => {
+                    self.flash(ctx, "Checking for updates…");
+                    self.updater.check(ctx, true);
+                }
+                updater::Status::Available(_) => self.show_update(),
+                updater::Status::Downloading { .. } => self.flash(ctx, "The update is downloading."),
+                updater::Status::Ready { .. } => self.request_install(ctx),
+            },
+            Command::ShowUpdate => self.show_update(),
+            Command::InstallUpdate => self.request_install(ctx),
             Command::Shortcuts => {
                 self.dialogs.push(Dialog::Message {
                     title: "Keyboard shortcuts".into(),
@@ -473,6 +570,7 @@ impl SnekkieApp {
 
     fn poll_background(&mut self, ctx: &egui::Context) {
         self.fonts.poll(ctx);
+        self.update_events(ctx);
         let questions: Vec<HostKeyQuestion> = self.host_keys.lock().drain(..).collect();
         self.dialogs.extend(questions.into_iter().map(|q| Dialog::HostKey(Box::new(q))));
         // A host key question whose connection gave up (tab closed, timed
@@ -507,7 +605,7 @@ impl SnekkieApp {
         if !ctx.input(|i| i.viewport().close_requested()) || self.allow_close {
             return;
         }
-        let live = self.tabs.iter().filter(|t| t.session.is_live()).count();
+        let live = self.live_sessions();
         if live == 0 {
             return;
         }
@@ -574,7 +672,27 @@ impl SnekkieApp {
             });
             ui.menu_button("Help", |ui| {
                 item(ui, "Keyboard shortcuts", "", Command::Shortcuts);
+                item(ui, "Check for updates…", "", Command::CheckForUpdates);
                 item(ui, "About Snekkie", "", Command::About);
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| match &self.updater.status {
+                updater::Status::Available(release) => {
+                    let button = style::accent_pill(&format!("Update to {}", release.version), self.accent);
+                    if ui.add(button).on_hover_text(update_summary(release)).clicked() {
+                        commands.push(Command::ShowUpdate);
+                    }
+                }
+                updater::Status::Downloading { percent, .. } => {
+                    ui.label(RichText::new(format!("Downloading update… {percent}%")).color(style::TEXT_SECONDARY));
+                }
+                updater::Status::Ready { release, .. } => {
+                    let button = style::accent_pill("Restart to update", self.accent);
+                    let hover = format!("Snekkie {} is downloaded and ready to install.", release.version);
+                    if ui.add(button).on_hover_text(hover).clicked() {
+                        commands.push(Command::InstallUpdate);
+                    }
+                }
+                updater::Status::Idle | updater::Status::Checking => {}
             });
         });
         if let Some(profile) = open_saved {
@@ -924,6 +1042,36 @@ impl SnekkieApp {
                         }
                     });
                 }
+                Dialog::Update { release, installable } => {
+                    ui.heading("Update available");
+                    ui.add_space(6.0);
+                    ui.add(egui::Label::new(update_summary(release)).wrap());
+                    ui.add_space(4.0);
+                    let how = if *installable {
+                        "Snekkie downloads it, then restarts to install it, asking first if any sessions \
+                         are connected. Saved sessions and settings are kept."
+                    } else {
+                        "This copy of Snekkie wasn't installed with the installer, so it can't update \
+                         itself. Download the new version from its release page."
+                    };
+                    ui.add(egui::Label::new(RichText::new(how).color(style::TEXT_SECONDARY)).wrap());
+                    if *installable {
+                        ui.add_space(4.0);
+                        ui.hyperlink_to(format!("What's new in {}", release.version), &release.page);
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        // Deliberately not on Enter: a check from the Help
+                        // menu can open this while you're typing.
+                        let go = if *installable { "Update now" } else { "Open release page" };
+                        if ui.button(go).clicked() {
+                            result = Some(DialogResult::Yes);
+                        }
+                        if ui.button("Later").clicked() || escape {
+                            close = true;
+                        }
+                    });
+                }
             }
         });
         if modal.should_close() && !matches!(self.dialogs.last(), Some(Dialog::HostKey(_))) {
@@ -947,13 +1095,8 @@ impl SnekkieApp {
             }
             (Dialog::Confirm { action, .. }, DialogResult::Yes) => match action {
                 ConfirmAction::CloseTab(id) => self.close_tab(id, true),
-                ConfirmAction::Quit => {
-                    self.allow_close = true;
-                    for tab in &self.tabs {
-                        tab.session.shutdown();
-                    }
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
-                }
+                ConfirmAction::Quit => self.quit_now(ctx),
+                ConfirmAction::InstallUpdate => self.install_update(ctx),
                 ConfirmAction::DeleteSaved(name) => {
                     if let Err(e) = self.store.remove(&name) {
                         self.message("Delete session", format!("Could not save sessions: {e}"));
@@ -972,6 +1115,13 @@ impl SnekkieApp {
                     }
                 }
             },
+            (Dialog::Update { release, installable }, DialogResult::Yes) => {
+                if installable {
+                    self.updater.download(ctx);
+                } else {
+                    ctx.open_url(egui::OpenUrl::new_tab(release.page));
+                }
+            }
             (Dialog::Input { action, .. }, DialogResult::Text(text)) => match action {
                 InputAction::Password(pending) => self.start_connect(ctx, *pending, text, String::new()),
                 InputAction::Passphrase(pending) => self.start_connect(ctx, *pending, String::new(), text),
@@ -1124,8 +1274,16 @@ impl SnekkieApp {
                 Dialog::Message { text, .. } | Dialog::Confirm { text, .. } => text.clone(),
                 Dialog::Input { label, .. } => label.clone(),
                 Dialog::HostKey(q) => q.fingerprint.clone(),
+                Dialog::Update { release, .. } => update_summary(release),
             })
             .collect()
+    }
+
+    /// Act as if the startup check had found `release`.
+    #[doc(hidden)]
+    pub fn offer_update(&mut self, release: Release, can_install: bool) {
+        self.updater.status = updater::Status::Available(release);
+        self.updater.can_install = can_install;
     }
 
     #[doc(hidden)]
@@ -1147,6 +1305,10 @@ impl SnekkieApp {
     pub fn active_screen_text(&self) -> Option<String> {
         self.current().map(|t| t.session.shared.emulator.lock().screen_text())
     }
+}
+
+fn update_summary(release: &Release) -> String {
+    format!("Snekkie {} is available. You have {}.", release.version, update::CURRENT_VERSION)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

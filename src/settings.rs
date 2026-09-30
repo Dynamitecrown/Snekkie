@@ -127,6 +127,9 @@ pub struct AppSettings {
     pub scrollback: u32,
     #[serde(deserialize_with = "lenient")]
     pub show_sidebar: bool,
+    /// Ask GitHub for a newer release each time Snekkie starts.
+    #[serde(deserialize_with = "lenient")]
+    pub check_for_updates: bool,
 }
 
 impl Default for AppSettings {
@@ -142,6 +145,7 @@ impl Default for AppSettings {
             font_size: 11,
             scrollback: 5000,
             show_sidebar: true,
+            check_for_updates: true,
         }
     }
 }
@@ -290,6 +294,8 @@ mod tests {
         assert_eq!(theme.cursor, Theme::default().cursor);
         assert_eq!(settings.font_family, "Consolas");
         assert!(!settings.show_sidebar);
+        // Written before update checks existed: they're on.
+        assert!(settings.check_for_updates);
         assert_eq!(settings.theme_names().last().unwrap(), "Custom");
         assert!(settings.theme_names().contains(&"Mine".to_string()));
     }

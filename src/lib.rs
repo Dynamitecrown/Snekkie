@@ -7,6 +7,7 @@ pub mod settings;
 pub mod terminal;
 pub mod transport;
 pub mod ui;
+pub mod update;
 
 /// Name of the mutex a running Snekkie holds on Windows. The installer
 /// checks for it so it can ask you to close Snekkie before upgrading.

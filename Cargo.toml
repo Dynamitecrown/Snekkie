@@ -11,7 +11,7 @@ keywords = ["ssh", "serial", "terminal", "console", "cisco"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "accesskit"] }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "accesskit", "links"] }
 egui = "0.36"
 alacritty_terminal = "0.26"
 russh = { version = "0.63", default-features = false, features = ["ring", "rsa", "flate2", "des"] }
@@ -28,9 +28,12 @@ fontdb = "0.24"
 pollster = "0.4"
 socket2 = "0.6"
 image = { version = "0.25", default-features = false, features = ["png"] }
+ureq = { version = "3.4", default-features = false, features = ["rustls", "platform-verifier", "win-system-proxy", "json"] }
+sha2 = "0.11"
+semver = "1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 winresource = "0.1"
