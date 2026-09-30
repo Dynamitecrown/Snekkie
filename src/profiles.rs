@@ -27,22 +27,54 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Ssh,
+    Telnet,
+    Raw,
     Serial,
 }
 
 impl Kind {
+    pub const ALL: [Kind; 4] = [Kind::Ssh, Kind::Telnet, Kind::Raw, Kind::Serial];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Ssh => "ssh",
+            Kind::Telnet => "telnet",
+            Kind::Raw => "raw",
             Kind::Serial => "serial",
+        }
+    }
+
+    pub fn parse(s: &str) -> Kind {
+        match s {
+            "telnet" => Kind::Telnet,
+            "raw" => Kind::Raw,
+            "serial" => Kind::Serial,
+            _ => Kind::Ssh,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Kind::Ssh => "SSH",
+            Kind::Telnet => "Telnet",
+            Kind::Raw => "Raw TCP",
             Kind::Serial => "Serial",
         }
+    }
+
+    /// The well-known port. Raw TCP has none: it's whatever port the
+    /// console server maps to the line you want.
+    pub fn default_port(self) -> Option<u16> {
+        match self {
+            Kind::Ssh => Some(22),
+            Kind::Telnet => Some(23),
+            Kind::Raw | Kind::Serial => None,
+        }
+    }
+
+    /// Connects over the network, so has a host and port.
+    pub fn is_network(self) -> bool {
+        self != Kind::Serial
     }
 }
 
@@ -86,16 +118,22 @@ impl Auth {
 pub struct Profile {
     #[serde(deserialize_with = "lenient")]
     pub name: String,
-    /// "ssh" or "serial". Kept as a string so the file stays readable by the
-    /// Python releases; see [`Profile::kind`].
+    /// "ssh", "telnet", "raw" or "serial". Kept as a string so the file
+    /// stays readable by the Python releases; see [`Profile::kind`].
     #[serde(deserialize_with = "lenient")]
     pub kind: String,
 
-    // SSH
+    // SSH, telnet and raw TCP
     #[serde(deserialize_with = "lenient")]
     pub host: String,
     #[serde(deserialize_with = "lenient")]
     pub port: u16,
+    /// Seconds between keepalives, so a firewall doesn't drop an idle
+    /// session. 0 = off.
+    #[serde(deserialize_with = "lenient")]
+    pub keepalive: u32,
+
+    // SSH
     #[serde(deserialize_with = "lenient")]
     pub username: String,
     /// "password", "key" or "agent".
@@ -143,6 +181,7 @@ impl Default for Profile {
             kind: "ssh".into(),
             host: String::new(),
             port: 22,
+            keepalive: 60,
             username: String::new(),
             auth: "password".into(),
             key_file: String::new(),
@@ -164,7 +203,7 @@ impl Default for Profile {
 
 impl Profile {
     pub fn kind(&self) -> Kind {
-        if self.kind == "serial" { Kind::Serial } else { Kind::Ssh }
+        Kind::parse(&self.kind)
     }
 
     pub fn set_kind(&mut self, kind: Kind) {
@@ -367,6 +406,23 @@ mod tests {
     }
 
     #[test]
+    fn older_sessions_get_keepalives_and_new_kinds_round_trip() {
+        let (_dir, mut store) = store_with(PYTHON_SESSIONS);
+        assert_eq!(store.get("core-switch").unwrap().keepalive, 60);
+
+        for kind in Kind::ALL {
+            let name = kind.as_str();
+            store.put(Profile { name: name.into(), kind: name.into(), keepalive: 0, ..Profile::default() }).unwrap();
+        }
+        let reloaded = ProfileStore::open(store.path.clone());
+        for kind in Kind::ALL {
+            let profile = reloaded.get(kind.as_str()).unwrap();
+            assert_eq!(profile.kind(), kind);
+            assert_eq!(profile.keepalive, 0);
+        }
+    }
+
+    #[test]
     fn garbage_file_loads_as_empty() {
         let (_dir, store) = store_with("{ not json");
         assert!(store.profiles.is_empty());
@@ -403,6 +459,7 @@ mod tests {
             "kind",
             "host",
             "port",
+            "keepalive",
             "username",
             "auth",
             "key_file",

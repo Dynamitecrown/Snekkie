@@ -13,9 +13,17 @@ use crate::transport::serial::{self, BAUD_RATES, DATA_BITS, PARITIES, PortInfo, 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
-    Ssh,
+    /// Host and port, plus login details for SSH.
+    Network,
     Serial,
     Advanced,
+}
+
+impl Page {
+    /// The page with a session type's own settings.
+    fn for_kind(kind: Kind) -> Page {
+        if kind == Kind::Serial { Page::Serial } else { Page::Network }
+    }
 }
 
 /// What the sidebar asks the app to do.
@@ -74,8 +82,8 @@ pub fn port_placeholder(ports: &[PortInfo]) -> String {
 
 pub fn validate(profile: &Profile) -> Result<(), String> {
     match profile.kind() {
-        Kind::Ssh if profile.host.trim().is_empty() => Err("Enter a host to connect to.".into()),
         Kind::Serial if profile.device.trim().is_empty() => Err("Choose a serial port from the Port list.".into()),
+        kind if kind.is_network() && profile.host.trim().is_empty() => Err("Enter a host to connect to.".into()),
         _ => Ok(()),
     }
 }
@@ -102,7 +110,7 @@ impl Sidebar {
     pub fn with_port_lister(settings: &AppSettings, list_ports: fn() -> Vec<PortInfo>) -> Self {
         let mut sidebar = Sidebar {
             draft: Profile::default(),
-            page: Page::Ssh,
+            page: Page::Network,
             ports: Vec::new(),
             custom_devices: Vec::new(),
             port_popup_was_open: false,
@@ -128,10 +136,7 @@ impl Sidebar {
 
     /// Fill the form from a profile.
     pub fn load(&mut self, profile: Profile) {
-        self.page = match profile.kind() {
-            Kind::Ssh => Page::Ssh,
-            Kind::Serial => Page::Serial,
-        };
+        self.page = Page::for_kind(profile.kind());
         self.draft = profile;
         self.refresh_ports();
     }
@@ -161,20 +166,27 @@ impl Sidebar {
     }
 
     pub fn set_kind(&mut self, kind: Kind) {
+        // Follow the protocol's usual port, unless another one was typed in.
+        let usual = Kind::ALL.iter().any(|k| k.default_port() == Some(self.draft.port));
+        if usual && let Some(port) = kind.default_port() {
+            self.draft.port = port;
+        }
         self.draft.set_kind(kind);
-        self.page = match kind {
-            Kind::Ssh => Page::Ssh,
-            Kind::Serial => Page::Serial,
-        };
+        self.page = Page::for_kind(kind);
     }
 
     /// The profile to connect with: the form, named sensibly.
     pub fn collect(&self) -> Profile {
         let mut profile = self.draft.clone();
         if profile.name.trim().is_empty() || profile.name == "New session" {
-            profile.name = match profile.kind() {
-                Kind::Ssh => profile.host.trim().to_string(),
+            let kind = profile.kind();
+            let host = profile.host.trim();
+            profile.name = match kind {
                 Kind::Serial => profile.device.trim().to_string(),
+                // A console server is one host with a port per line, so
+                // the port is what tells its sessions apart.
+                _ if host.is_empty() || kind.default_port() == Some(profile.port) => host.to_string(),
+                _ => format!("{host}:{}", profile.port),
             };
             if profile.name.is_empty() {
                 profile.name = "session".into();
@@ -203,8 +215,9 @@ impl Sidebar {
             ComboBox::from_id_salt("kind").width(ui.available_width()).truncate().selected_text(kind.label()).show_ui(
                 ui,
                 |ui| {
-                    ui.selectable_value(&mut kind, Kind::Ssh, "SSH");
-                    ui.selectable_value(&mut kind, Kind::Serial, "Serial");
+                    for option in Kind::ALL {
+                        ui.selectable_value(&mut kind, option, option.label());
+                    }
                 },
             );
             if kind != self.draft.kind() {
@@ -224,16 +237,11 @@ impl Sidebar {
         });
         ui.add_space(6.0);
 
-        // Page tabs. Only the page matching the type is enabled, plus
-        // Advanced.
+        // Page tabs: the type's own settings, then Advanced.
         ui.horizontal(|ui| {
             let kind = self.draft.kind();
-            for (page, label, enabled) in [
-                (Page::Ssh, "SSH", kind == Kind::Ssh),
-                (Page::Serial, "Serial", kind == Kind::Serial),
-                (Page::Advanced, "Advanced", true),
-            ] {
-                if style::tab_button(ui, label, self.page == page, enabled, accent).clicked() {
+            for (page, label) in [(Page::for_kind(kind), kind.label()), (Page::Advanced, "Advanced")] {
+                if style::tab_button(ui, label, self.page == page, true, accent).clicked() {
                     self.page = page;
                 }
             }
@@ -244,7 +252,7 @@ impl Sidebar {
             |ui| {
                 ui.set_width(ui.available_width());
                 match self.page {
-                    Page::Ssh => self.ssh_page(ui, &mut actions),
+                    Page::Network => self.network_page(ui, &mut actions),
                     Page::Serial => self.serial_page(ui, &mut actions),
                     Page::Advanced => self.advanced_page(ui, monospace_fonts, &mut actions),
                 }
@@ -266,14 +274,38 @@ impl Sidebar {
         actions
     }
 
-    fn ssh_page(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+    fn network_page(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         row(ui, "Host", |ui| {
             let host = ui.add(text_field(&mut self.draft.host, "hostname or IP", ui.available_width()));
-            if std::mem::take(&mut self.focus_host) && self.page == Page::Ssh {
+            if std::mem::take(&mut self.focus_host) && self.page == Page::Network {
                 host.request_focus();
             }
         });
         row(ui, "Port", |ui| ui.add(DragValue::new(&mut self.draft.port).range(1..=65535).speed(0.2)));
+        if self.draft.kind() == Kind::Ssh {
+            self.ssh_login(ui, actions);
+        }
+        row(ui, "Keepalive", |ui| {
+            ui.add(
+                DragValue::new(&mut self.draft.keepalive)
+                    .range(0..=3600)
+                    .speed(1.0)
+                    .custom_formatter(|v, _| if v == 0.0 { "off".into() } else { format!("{v} s") })
+                    .custom_parser(|text| {
+                        let text = text.trim();
+                        if text.eq_ignore_ascii_case("off") {
+                            return Some(0.0);
+                        }
+                        text.trim_end_matches('s').trim().parse().ok()
+                    }),
+            )
+            .on_hover_text(
+                "Seconds between keepalives, which stop a firewall dropping an idle session. 0 turns them off.",
+            )
+        });
+    }
+
+    fn ssh_login(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         row(ui, "Username", |ui| ui.add(text_field(&mut self.draft.username, "", ui.available_width())));
         let mut auth = self.draft.auth();
         row(ui, "Authentication", |ui| {
@@ -645,8 +677,40 @@ mod tests {
     }
 
     #[test]
-    fn ssh_needs_a_host() {
-        assert_eq!(validate(&Profile::default()).unwrap_err(), "Enter a host to connect to.");
-        assert!(validate(&Profile { host: "r1".into(), ..Profile::default() }).is_ok());
+    fn network_sessions_need_a_host() {
+        for kind in [Kind::Ssh, Kind::Telnet, Kind::Raw] {
+            let profile = Profile { kind: kind.as_str().into(), ..Profile::default() };
+            assert_eq!(validate(&profile).unwrap_err(), "Enter a host to connect to.");
+            assert!(validate(&Profile { host: "r1".into(), ..profile }).is_ok());
+        }
+    }
+
+    #[test]
+    fn port_follows_the_protocol_unless_typed_in() {
+        let mut sidebar = Sidebar::with_port_lister(&AppSettings::default(), two_cables);
+        assert_eq!(sidebar.draft.port, 22);
+        sidebar.set_kind(Kind::Telnet);
+        assert_eq!(sidebar.draft.port, 23);
+        sidebar.set_kind(Kind::Ssh);
+        assert_eq!(sidebar.draft.port, 22);
+        // Raw TCP has no usual port, so it keeps what's there...
+        sidebar.set_kind(Kind::Raw);
+        assert_eq!(sidebar.draft.port, 22);
+        // ...and a console server's line port survives switching to telnet.
+        sidebar.draft.port = 2003;
+        sidebar.set_kind(Kind::Telnet);
+        assert_eq!(sidebar.draft.port, 2003);
+    }
+
+    #[test]
+    fn console_server_sessions_are_named_by_port() {
+        let mut sidebar = Sidebar::with_port_lister(&AppSettings::default(), two_cables);
+        sidebar.set_kind(Kind::Telnet);
+        sidebar.draft.host = "cs1".into();
+        assert_eq!(sidebar.collect().name, "cs1");
+        sidebar.draft.port = 2003;
+        assert_eq!(sidebar.collect().name, "cs1:2003");
+        sidebar.set_kind(Kind::Raw);
+        assert_eq!(sidebar.collect().name, "cs1:2003");
     }
 }

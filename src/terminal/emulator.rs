@@ -251,9 +251,9 @@ impl Emulator {
         self.term.grid_mut().clear_history();
     }
 
-    /// Clear the screen the way Ctrl+L does in a shell: everything above
-    /// the cursor's line scrolls into the history, so the prompt you're
-    /// typing at ends up on the top row and nothing is lost.
+    /// Clear the screen and the scrollback: the prompt you're typing at
+    /// moves to the top row and everything above it is gone, including the
+    /// history you could otherwise scroll back to.
     pub fn clear(&mut self) {
         self.scroll_to_bottom();
         let row = self.cursor().line.0;
@@ -261,6 +261,8 @@ impl Emulator {
             // SU scrolls the screen up into the history; CUU follows it.
             self.feed(format!("\x1b[{row}S\x1b[{row}A").as_bytes());
         }
+        // ED 3 (what `clear` sends on Linux) then drops the history.
+        self.feed(b"\x1b[3J");
     }
 
     /// Plain text of one visible row, trailing blanks stripped.
@@ -399,18 +401,34 @@ mod tests {
     }
 
     #[test]
-    fn clear_keeps_the_prompt_and_the_history() {
+    fn clear_keeps_the_prompt_and_drops_the_history() {
         let (mut emu, _) = emulator(20, 4, 100);
         fill(&mut emu, 10);
         emu.feed(b"Switch#sh");
-        let history = emu.history_size();
+        assert!(emu.history_size() > 0);
         emu.clear();
         assert_eq!(emu.screen_text().trim(), "Switch#sh");
         assert_eq!(emu.cursor(), Point::new(Line(0), Column(9)));
-        // The lines that were on screen went into the history.
-        assert_eq!(emu.history_size(), history + 3);
-        emu.scroll_to(1);
-        assert_eq!(emu.line_text(0), "line 9");
+        assert_eq!(emu.history_size(), 0);
+        assert!(!emu.scroll_by(1)); // nothing left to scroll back to
+    }
+
+    #[test]
+    fn clear_while_scrolled_back_drops_the_history() {
+        let (mut emu, _) = emulator(20, 4, 100);
+        fill(&mut emu, 10);
+        emu.scroll_to(5);
+        emu.select_all();
+        emu.clear();
+        assert_eq!(emu.display_offset(), 0);
+        assert_eq!(emu.history_size(), 0);
+        assert!(emu.selection_text().is_none());
+    }
+
+    #[test]
+    fn reset_drops_the_history() {
+        let (mut emu, _) = emulator(20, 4, 100);
+        fill(&mut emu, 10);
         emu.reset();
         assert_eq!(emu.history_size(), 0);
     }

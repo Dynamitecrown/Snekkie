@@ -4146,6 +4146,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serialport",
+ "socket2",
  "tempfile",
  "tokio",
  "windows-sys 0.61.2",

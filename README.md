@@ -12,6 +12,8 @@ Version 2 is a ground-up rewrite in Rust of the original Python app. It installs
 
 - **Integrated layout:** Permanent sidebar for quick-connect and saved sessions; no popup dialogs to get in the way.
 - **SSH:** Password (including keyboard-interactive, as most network gear uses), private key, and SSH agent (Pageant or the Windows OpenSSH agent) auth, with `known_hosts` verification. Older gear that only speaks SHA-1 key exchange, CBC ciphers or `ssh-rsa` host keys still connects; modern algorithms are always preferred.
+- **Telnet & raw TCP:** For older gear, lab consoles (GNS3, EVE-NG) and console servers. Telnet negotiates window size and terminal type, and sends break through to the device's console line; raw TCP passes bytes through untouched.
+- **Keepalives:** Idle SSH, telnet and raw sessions send a keepalive every 60 seconds (adjustable per session, or off) so firewalls don't drop them, and an SSH session whose server stops answering is closed with a clear reason instead of hanging.
 - **Serial:** Auto-detects COM ports and lists them in a drop-down, labelled by adapter serial number so several identical console cables can be told apart. Full baud/data/parity/stop-bit control, flow control, and Cisco break signals.
 - **Tabs & profiles:** Multi-tab sessions (reconnect, duplicate, drag to reorder) and zero-secret JSON profiles. Connecting happens in the background, so a slow or dead host never freezes the window.
 - **VT100 / truecolor:** Full 24-bit colour, ANSI styles, cursor addressing, and smooth scrollback (works with `htop`, `nano`, `vim`). Terminal emulation is [alacritty_terminal](https://crates.io/crates/alacritty_terminal), the engine inside the Alacritty terminal.
@@ -98,8 +100,8 @@ tar -xzf snekkie-linux-x86_64.tar.gz
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste (selecting also copies, right-click also pastes) |
 | Shift+PgUp / Shift+PgDn | Scroll back through history |
-| Ctrl+Shift+L | Clear screen (the history is kept) |
-| Ctrl+Shift+B | Send break (serial only) |
+| Ctrl+Shift+L | Clear screen and scrollback |
+| Ctrl+Shift+B | Send break (serial and telnet) |
 | Ctrl+B | Toggle sidebar |
 | Ctrl+, | Preferences |
 

@@ -16,7 +16,7 @@ use crate::profiles::{Kind, Profile};
 use crate::settings::Theme;
 use crate::terminal::emulator::{Emulator, Responder};
 use crate::transport::ssh::{Credentials, HostKeyAsker};
-use crate::transport::{Command, Link, Sink, serial, ssh};
+use crate::transport::{Command, Link, Sink, serial, ssh, tcp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
@@ -160,13 +160,14 @@ impl Session {
         self.open_log();
 
         let sink: Arc<dyn Sink> = Arc::new(SessionSink { shared: self.shared.clone(), generation });
+        let size = {
+            let emu = self.shared.emulator.lock();
+            (emu.columns() as u16, emu.lines() as u16)
+        };
         let link = match self.profile.kind() {
             Kind::Serial => serial::start(self.profile.clone(), sink),
+            Kind::Telnet | Kind::Raw => tcp::start(cx.runtime, self.profile.clone(), size, sink),
             Kind::Ssh => {
-                let size = {
-                    let emu = self.shared.emulator.lock();
-                    (emu.columns() as u16, emu.lines() as u16)
-                };
                 let credentials = Credentials {
                     password: cx.password,
                     key_passphrase: cx.key_passphrase,
@@ -234,13 +235,16 @@ impl Session {
 
     pub fn send_break(&self) {
         match (self.profile.kind(), self.state()) {
-            (Kind::Ssh, _) => self.shared.notify(NoticeLevel::Warning, "SSH sessions do not support break".into()),
-            (Kind::Serial, State::Connected) => {
+            (Kind::Ssh | Kind::Raw, _) => {
+                let text = format!("{} sessions do not support break", self.profile.kind().label());
+                self.shared.notify(NoticeLevel::Warning, text);
+            }
+            (Kind::Serial | Kind::Telnet, State::Connected) => {
                 if let Some(link) = self.link.lock().as_ref() {
                     link.send(Command::Break);
                 }
             }
-            (Kind::Serial, _) => self.shared.notify(NoticeLevel::Warning, "Not connected".into()),
+            (Kind::Serial | Kind::Telnet, _) => self.shared.notify(NoticeLevel::Warning, "Not connected".into()),
         }
     }
 
@@ -260,6 +264,7 @@ impl Session {
     pub fn description(&self) -> String {
         match self.profile.kind() {
             Kind::Ssh => ssh::description(&self.profile),
+            Kind::Telnet | Kind::Raw => tcp::description(&self.profile),
             Kind::Serial => serial::description(&self.profile),
         }
     }

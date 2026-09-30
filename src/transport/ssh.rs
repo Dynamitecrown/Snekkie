@@ -6,23 +6,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use russh::client::{self, AuthResult, Handle, KeyboardInteractiveAuthResponse};
+use parking_lot::Mutex;
+use russh::client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect, MethodKind, Preferred, cipher, kex, mac};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot;
 
-use super::{Command, Link, Sink};
+use super::{CONNECT_TIMEOUT, Command, Link, Sink, TERM, connect_tcp, keepalive_interval};
 use crate::profiles::{Auth, Profile};
-
-/// How long the TCP connection and the SSH handshake each get before giving
-/// up. Time spent waiting for the user to answer a host key prompt doesn't
-/// count.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
-
-const TERM: &str = "xterm-256color";
 
 /// Default key files tried in "SSH agent / default keys" mode, like
 /// OpenSSH and paramiko do.
@@ -111,9 +104,13 @@ pub fn preferred_algorithms() -> Preferred {
     }
 }
 
-fn client_config() -> client::Config {
+fn client_config(profile: &Profile) -> client::Config {
     let mut config = client::Config {
         preferred: preferred_algorithms(),
+        // Sent only after this long without hearing from the server. After
+        // `keepalive_max` (3) go unanswered, the connection is given up as
+        // dead instead of hanging forever.
+        keepalive_interval: keepalive_interval(profile.keepalive),
         // Without this, Nagle's algorithm sits on the one-byte packets an
         // interactive shell sends per keystroke: the classic "SSH typing
         // feels laggy" complaint.
@@ -148,6 +145,8 @@ struct Client {
     /// Set while a host key prompt is up, so the handshake timeout pauses.
     waiting_for_user: Arc<AtomicBool>,
     sink: Arc<dyn Sink>,
+    /// Why the connection dropped, if it failed rather than being closed.
+    lost: Arc<Mutex<Option<String>>>,
 }
 
 impl client::Handler for Client {
@@ -194,6 +193,24 @@ impl client::Handler for Client {
         let text = banner.replace("\r\n", "\n").replace('\n', "\r\n");
         self.sink.data(text.as_bytes());
         Ok(())
+    }
+
+    async fn disconnected(&mut self, reason: DisconnectReason<Error>) -> Result<(), Error> {
+        match reason {
+            DisconnectReason::ReceivedDisconnect(_) => Ok(()),
+            DisconnectReason::Error(e) => {
+                // Called before the channel reports it's gone, so the session
+                // can say why instead of a bare "closed".
+                *self.lost.lock() = Some(match &e {
+                    Error::Ssh(russh::Error::KeepaliveTimeout) => {
+                        format!("Connection lost: {} stopped answering keepalives", self.host)
+                    }
+                    Error::Ssh(e) => format!("Connection lost: {e}"),
+                    other => format!("Connection lost: {other:?}"),
+                });
+                Err(e)
+            }
+        }
     }
 }
 
@@ -362,16 +379,13 @@ async fn establish(
     credentials: &Credentials,
     ask: HostKeyAsker,
     sink: Arc<dyn Sink>,
+    lost: Arc<Mutex<Option<String>>>,
 ) -> Result<Session, String> {
     let host = profile.host.trim().to_string();
-    let target = (host.trim_start_matches('[').trim_end_matches(']'), profile.port);
-    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => return Err(format!("Could not connect to {host}: {e}")),
-        Err(_) => return Err(format!("Could not connect to {host}: timed out")),
-    };
-    let _ = stream.set_nodelay(true);
+    let stream = connect_tcp(&host, profile.port).await?;
 
+    // Time spent waiting for the user to answer a host key prompt doesn't
+    // count towards the handshake timeout.
     let waiting = Arc::new(AtomicBool::new(false));
     let handler = Client {
         host: host.clone(),
@@ -380,8 +394,9 @@ async fn establish(
         ask,
         waiting_for_user: waiting.clone(),
         sink,
+        lost,
     };
-    let handshake = client::connect_stream(Arc::new(client_config()), stream, handler);
+    let handshake = client::connect_stream(Arc::new(client_config(profile)), stream, handler);
     tokio::pin!(handshake);
     let mut idle = Duration::ZERO;
     let tick = Duration::from_millis(250);
@@ -428,10 +443,11 @@ async fn run(
     sink: Arc<dyn Sink>,
     mut commands: UnboundedReceiver<Command>,
 ) -> Option<String> {
+    let lost = Arc::new(Mutex::new(None));
     // Keep an eye on the command queue while connecting, so closing the tab
     // cancels a slow connect and a resize during it isn't lost.
     let handle = {
-        let connecting = establish(&profile, &credentials, ask, sink.clone());
+        let connecting = establish(&profile, &credentials, ask, sink.clone(), lost.clone());
         tokio::pin!(connecting);
         loop {
             tokio::select! {
@@ -468,7 +484,7 @@ async fn run(
                 Some(ChannelMsg::Data { data }) => sink.data(&data),
                 Some(ChannelMsg::ExtendedData { data, .. }) => sink.data(&data),
                 Some(ChannelMsg::Close) | None => {
-                    return Some("Connection closed by remote host".into());
+                    return Some(lost.lock().take().unwrap_or_else(|| "Connection closed by remote host".into()));
                 }
                 Some(_) => {}
             },

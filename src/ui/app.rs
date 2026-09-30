@@ -37,8 +37,8 @@ Ctrl+Q          Quit
 Ctrl+Shift+C    Copy      (selecting also copies)
 Ctrl+Shift+V    Paste     (right-click also pastes)
 Shift+PgUp/Dn   Scroll back through history
-Ctrl+Shift+L    Clear screen
-Ctrl+Shift+B    Send break (serial only)
+Ctrl+Shift+L    Clear screen and scrollback
+Ctrl+Shift+B    Send break (serial, telnet)
 
 Ctrl+B          Toggle sidebar
 Ctrl+,          Preferences";
@@ -557,7 +557,7 @@ impl SnekkieApp {
                 item(ui, "Select all", "Ctrl+Shift+A", Command::SelectAll);
             });
             ui.menu_button("Terminal", |ui| {
-                item(ui, "Clear screen", "Ctrl+Shift+L", Command::ClearScreen);
+                item(ui, "Clear screen and scrollback", "Ctrl+Shift+L", Command::ClearScreen);
                 item(ui, "Reset terminal", "", Command::ResetTerminal);
                 ui.separator();
                 item(ui, "Send break", "Ctrl+Shift+B", Command::SendBreak);

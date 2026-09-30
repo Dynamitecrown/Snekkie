@@ -159,3 +159,40 @@ fn confirming_a_dialog_sends_nothing_to_the_device() {
     assert!(harness.state().tab_titles().is_empty());
     assert_eq!(device.read(&mut buf).unwrap_or(0), 0, "the dialog's Enter leaked to the device");
 }
+
+/// Picking Telnet in the form shows its settings, and connecting from it
+/// reaches a device with the negotiation kept off the screen.
+#[test]
+fn telnet_session_from_the_form() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(&dir);
+    harness.get_by_value("SSH").click();
+    harness.run_ok();
+    harness.get_by_label("Telnet").click();
+    harness.run_ok();
+    // No login fields for telnet, its usual port, keepalives on.
+    assert!(harness.query_by_label("Username").is_none());
+    assert_eq!(harness.state_mut().sidebar_draft().port, 23);
+    harness.get_by_value("60 s");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let draft = harness.state_mut().sidebar_draft();
+    draft.host = "127.0.0.1".into();
+    draft.port = port;
+    harness.get_by_label("Connect").click();
+    harness.run_ok();
+
+    let (mut device, _) = listener.accept().unwrap();
+    device.write_all(b"\xff\xfb\x01Router>").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while harness.state().active_screen_text().is_none_or(|text| text.trim() != "Router>") {
+        assert!(Instant::now() < deadline, "screen: {:?}", harness.state().active_screen_text());
+        harness.run_ok();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(harness.state().tab_titles(), [format!("127.0.0.1:{port}")]);
+}

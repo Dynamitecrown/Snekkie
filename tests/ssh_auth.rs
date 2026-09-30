@@ -4,6 +4,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use common::{Event, Recorder};
@@ -12,6 +13,8 @@ use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use snekkie::profiles::Profile;
 use snekkie::transport::ssh::{self, Credentials, HostKeyAsker, HostKeyQuestion};
 use snekkie::transport::{Link, Sink};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 const WAIT: Duration = Duration::from_secs(10);
 const PASSWORD: &str = "correct horse";
@@ -134,10 +137,15 @@ fn start_server(mode: Mode) -> Harness {
 
 impl Harness {
     fn connect(&self, password: &str) -> (Arc<Recorder>, Link) {
+        self.connect_to(self.port, password, 0)
+    }
+
+    fn connect_to(&self, port: u16, password: &str, keepalive: u32) -> (Arc<Recorder>, Link) {
         let recorder = Recorder::new();
         let profile = Profile {
             host: "127.0.0.1".into(),
-            port: self.port,
+            port,
+            keepalive,
             username: "admin".into(),
             auth: "password".into(),
             ..Profile::default()
@@ -154,6 +162,40 @@ impl Harness {
             ssh::start(self.runtime.handle(), profile, credentials, (80, 24), ask, recorder.clone() as Arc<dyn Sink>);
         (recorder, link)
     }
+}
+
+/// Passes traffic to the server until `frozen` is set, then silently stops,
+/// like a firewall that has forgotten the connection.
+fn start_proxy(harness: &Harness, frozen: Arc<AtomicBool>) -> u16 {
+    async fn pipe(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, frozen: Arc<AtomicBool>) {
+        let mut buf = vec![0u8; 8192];
+        while let Ok(n) = from.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            if frozen.load(Ordering::SeqCst) {
+                // Hold both ends open and pass nothing on.
+                std::future::pending::<()>().await;
+            }
+            if to.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    let listener = harness.runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let target = harness.port;
+    harness.runtime.spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let server = tokio::net::TcpStream::connect(("127.0.0.1", target)).await.unwrap();
+            let (client_read, client_write) = client.into_split();
+            let (server_read, server_write) = server.into_split();
+            tokio::spawn(pipe(client_read, server_write, frozen.clone()));
+            tokio::spawn(pipe(server_read, client_write, frozen.clone()));
+        }
+    });
+    port
 }
 
 fn assert_logs_in(mode: Mode) {
@@ -198,4 +240,27 @@ fn wrong_password_through_keyboard_interactive() {
 #[test]
 fn password_rejected_then_keyboard_interactive_with_empty_round() {
     assert_logs_in(Mode::PasswordRejectedThenKeyboardInteractive);
+}
+
+#[test]
+fn keepalives_notice_a_dead_connection() {
+    let harness = start_server(Mode::Password);
+    let frozen = Arc::new(AtomicBool::new(false));
+    let port = start_proxy(&harness, frozen.clone());
+    let (recorder, _link) = harness.connect_to(port, PASSWORD, 1);
+    recorder.wait_event(WAIT, |e| *e == Event::Connected);
+    recorder.wait_text(WAIT, "welcome");
+
+    // Quiet but healthy: the server answers each keepalive, so it stays up.
+    std::thread::sleep(Duration::from_millis(4500));
+    assert!(!recorder.events().iter().any(|e| matches!(e, Event::Closed(_))), "{:?}", recorder.events());
+
+    // Gone silent: given up after three unanswered keepalives.
+    frozen.store(true, Ordering::SeqCst);
+    match recorder.wait_event(WAIT, |e| matches!(e, Event::Closed(_))) {
+        Event::Closed(Some(reason)) => {
+            assert_eq!(reason, "Connection lost: 127.0.0.1 stopped answering keepalives");
+        }
+        other => panic!("expected the connection to be given up, got {other:?}"),
+    }
 }
