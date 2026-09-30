@@ -8,13 +8,14 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
 use crate::profiles::{Kind, Profile};
 use crate::settings::Theme;
 use crate::terminal::emulator::{Emulator, Responder};
+use crate::terminal::keys;
 use crate::transport::ssh::{Credentials, HostKeyAsker};
 use crate::transport::{Command, Link, Sink, serial, ssh, tcp};
 
@@ -45,6 +46,8 @@ pub struct Shared {
     state: Mutex<State>,
     log: Mutex<Option<File>>,
     notices: Mutex<Vec<Notice>>,
+    /// The far end has agreed to echo what's typed (telnet only).
+    remote_echo: AtomicBool,
     /// Bumped on every (re)connect, so a worker from a previous connection
     /// can't write into the new one.
     generation: AtomicU64,
@@ -58,6 +61,16 @@ impl Shared {
 
     fn notify(&self, level: NoticeLevel, text: String) {
         self.notices.lock().push(Notice { level, text });
+        (self.repaint)();
+    }
+
+    /// Put bytes on the screen and in the log.
+    fn show(&self, bytes: &[u8]) {
+        if let Some(log) = self.log.lock().as_mut() {
+            // Losing the log shouldn't kill the session.
+            let _ = log.write_all(bytes).and_then(|_| log.flush());
+        }
+        self.emulator.lock().feed(bytes);
         (self.repaint)();
     }
 }
@@ -76,15 +89,9 @@ impl Sink for SessionSink {
     }
 
     fn data(&self, bytes: &[u8]) {
-        if !self.shared.is_current(self.generation) {
-            return;
+        if self.shared.is_current(self.generation) {
+            self.shared.show(bytes);
         }
-        if let Some(log) = self.shared.log.lock().as_mut() {
-            // Losing the log shouldn't kill the session.
-            let _ = log.write_all(bytes).and_then(|_| log.flush());
-        }
-        self.shared.emulator.lock().feed(bytes);
-        (self.shared.repaint)();
     }
 
     fn closed(&self, reason: Option<String>) {
@@ -105,6 +112,12 @@ impl Sink for SessionSink {
         }
         let level = if message == "Break sent" { NoticeLevel::Info } else { NoticeLevel::Warning };
         self.shared.notify(level, message);
+    }
+
+    fn remote_echo(&self, on: bool) {
+        if self.shared.is_current(self.generation) {
+            self.shared.remote_echo.store(on, Ordering::SeqCst);
+        }
     }
 }
 
@@ -144,6 +157,7 @@ impl Session {
             state: Mutex::new(State::Connecting),
             log: Mutex::new(None),
             notices: Mutex::new(Vec::new()),
+            remote_echo: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             repaint: Box::new(repaint),
         });
@@ -157,6 +171,7 @@ impl Session {
         }
         let generation = self.shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
         *self.shared.state.lock() = State::Connecting;
+        self.shared.remote_echo.store(false, Ordering::SeqCst);
         self.open_log();
 
         let sink: Arc<dyn Sink> = Arc::new(SessionSink { shared: self.shared.clone(), generation });
@@ -218,13 +233,23 @@ impl Session {
         std::mem::take(&mut *self.shared.notices.lock())
     }
 
-    /// Send what the user typed. Dropped unless connected.
+    /// Send what the user typed, and draw it too if the far end won't.
+    /// Dropped unless connected.
     pub fn write(&self, bytes: Vec<u8>) {
-        if self.is_connected()
-            && let Some(link) = self.link.lock().as_ref()
-        {
+        if !self.is_connected() {
+            return;
+        }
+        let echo = self.echoes_locally().then(|| keys::local_echo(&bytes));
+        if let Some(link) = self.link.lock().as_ref() {
             link.write(bytes);
         }
+        if let Some(echo) = echo.filter(|e| !e.is_empty()) {
+            self.shared.show(&echo);
+        }
+    }
+
+    pub fn echoes_locally(&self) -> bool {
+        self.profile.local_echo().applies(self.profile.kind(), self.shared.remote_echo.load(Ordering::SeqCst))
     }
 
     pub fn resize(&self, columns: usize, lines: usize) {

@@ -235,6 +235,11 @@ impl Telnet {
         out
     }
 
+    /// Whether the server has agreed to echo what's typed.
+    pub fn remote_echo(&self) -> bool {
+        self.remote[ECHO as usize] == Side::On
+    }
+
     /// The window changed size. Returns what to tell the server, if it
     /// asked to be told.
     pub fn resize(&mut self, columns: u16, lines: u16) -> Vec<u8> {
@@ -336,6 +341,16 @@ mod tests {
         // Linemode (34) and environment (39).
         let received = telnet.receive(&[IAC, DO, 34, IAC, WILL, 39]);
         assert_eq!(received.reply, [IAC, WONT, 34, IAC, DONT, 39]);
+    }
+
+    #[test]
+    fn remote_echo_follows_negotiation() {
+        let mut telnet = started();
+        assert!(!telnet.remote_echo(), "asked, not yet agreed");
+        telnet.receive(&[IAC, WILL, ECHO]);
+        assert!(telnet.remote_echo());
+        telnet.receive(&[IAC, WONT, ECHO]);
+        assert!(!telnet.remote_echo());
     }
 
     #[test]

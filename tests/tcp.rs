@@ -99,6 +99,8 @@ fn telnet_negotiates_like_a_cisco_device_expects() {
     peer.expect(&[IAC, SB, NAWS, 0, 80, 0, 24, IAC, SE]);
     peer.expect(b"\xff\xfa\x18\x00xterm-256color\xff\xf0");
     client.recorder.wait_text(WAIT, "Username: ");
+    // The device echoes, so the session shouldn't.
+    client.recorder.wait_event(WAIT, |e| *e == Event::RemoteEcho(true));
     // None of the negotiation reached the screen.
     assert_eq!(client.recorder.text(), "User Access Verification\r\n\r\nUsername: ");
 
@@ -133,6 +135,7 @@ fn raw_passes_bytes_through_untouched() {
 
     client.link.send(Command::Break);
     client.recorder.wait_event(WAIT, |e| *e == Event::Notice("Raw TCP sessions do not support break".into()));
+    assert!(!client.recorder.events().iter().any(|e| matches!(e, Event::RemoteEcho(_))), "raw never negotiates");
     assert!(!client.recorder.events().iter().any(|e| matches!(e, Event::Notice(n) if n.contains("keepalive"))));
 }
 

@@ -268,3 +268,75 @@ fn an_installed_copy_updates_itself_only_when_asked() {
     harness.run_ok();
     harness.get_by_label("Update to 99.0.0");
 }
+
+/// A telnet device that hasn't agreed to echo gets what's typed drawn
+/// locally, until it says it will. Backspace sends what the session asks.
+#[test]
+fn telnet_local_echo_follows_the_device() {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    fn wait(
+        harness: &mut Harness<'static, SnekkieApp>,
+        what: &str,
+        done: impl Fn(&Harness<'static, SnekkieApp>) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(harness) {
+            assert!(Instant::now() < deadline, "{what}; screen: {:?}", harness.state().active_screen_text());
+            harness.run_ok();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn screen(harness: &Harness<'static, SnekkieApp>) -> String {
+        harness.state().active_screen_text().unwrap_or_default().trim().to_string()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(&dir);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let profile = snekkie::profiles::Profile {
+        name: "old-box".into(),
+        kind: "telnet".into(),
+        host: "127.0.0.1".into(),
+        port: listener.local_addr().unwrap().port(),
+        backspace: "ctrl-h".into(),
+        ..Default::default()
+    };
+    let ctx = harness.ctx.clone();
+    harness.state_mut().open_session(&ctx, profile);
+    let (mut device, _) = listener.accept().unwrap();
+    device.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    let mut device_out = device.try_clone().unwrap();
+    wait(&mut harness, "never connected", |h| h.query_by_label_contains("[connected]").is_some());
+
+    let mut received = Vec::new();
+    let mut expect = |needle: &[u8]| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut buf = [0u8; 256];
+        while !received.windows(needle.len()).any(|w| w == needle) {
+            assert!(Instant::now() < deadline, "device never got {needle:?}; got {received:?}");
+            if let Ok(n) = device.read(&mut buf) {
+                received.extend_from_slice(&buf[..n]);
+            }
+        }
+    };
+
+    // The device hasn't agreed to echo: typing shows up anyway, and
+    // Backspace (sent as ^H) rubs out what it deletes.
+    harness.event(egui::Event::Text("sh".into()));
+    harness.key_press(egui::Key::Backspace);
+    harness.run_ok();
+    expect(b"sh\x08");
+    assert_eq!(screen(&harness), "s");
+
+    // Once it says it will echo, Snekkie stops drawing keystrokes itself.
+    device_out.write_all(b"\xff\xfb\x01|").unwrap();
+    wait(&mut harness, "device output never arrived", |h| screen(h) == "s|");
+    harness.event(egui::Event::Text("x".into()));
+    harness.run_ok();
+    expect(b"x");
+    harness.run_ok();
+    assert_eq!(screen(&harness), "s|", "typed text was drawn although the device echoes");
+}

@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config;
+use crate::terminal::keys::Backspace;
 
 /// Deserialize a field, falling back to its default if the value has the
 /// wrong type. sessions.json is a text file people edit by hand, and one bad
@@ -113,6 +114,54 @@ impl Auth {
     }
 }
 
+/// Whether Snekkie draws what you type itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalEcho {
+    /// Telnet: until the device says it will echo. Everything else: off,
+    /// since shells, network gear and console lines echo for themselves.
+    Auto,
+    On,
+    Off,
+}
+
+impl LocalEcho {
+    pub const ALL: [LocalEcho; 3] = [LocalEcho::Auto, LocalEcho::On, LocalEcho::Off];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LocalEcho::Auto => "auto",
+            LocalEcho::On => "on",
+            LocalEcho::Off => "off",
+        }
+    }
+
+    pub fn parse(s: &str) -> LocalEcho {
+        match s {
+            "on" => LocalEcho::On,
+            "off" => LocalEcho::Off,
+            _ => LocalEcho::Auto,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LocalEcho::Auto => "Auto",
+            LocalEcho::On => "On",
+            LocalEcho::Off => "Off",
+        }
+    }
+
+    /// Whether to echo locally, given the session type and whether a
+    /// telnet server has agreed to echo.
+    pub fn applies(self, kind: Kind, remote_echo: bool) -> bool {
+        match self {
+            LocalEcho::On => true,
+            LocalEcho::Off => false,
+            LocalEcho::Auto => kind == Kind::Telnet && !remote_echo,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Profile {
@@ -169,6 +218,12 @@ pub struct Profile {
     /// Empty = no logging.
     #[serde(deserialize_with = "lenient")]
     pub log_path: String,
+    /// "auto", "on" or "off"; see [`LocalEcho`].
+    #[serde(deserialize_with = "lenient")]
+    pub local_echo: String,
+    /// "del" or "ctrl-h"; see [`Backspace`].
+    #[serde(deserialize_with = "lenient")]
+    pub backspace: String,
     /// See `highlight::SYNTAX_LABELS`.
     #[serde(deserialize_with = "lenient")]
     pub device_syntax: String,
@@ -196,6 +251,8 @@ impl Default for Profile {
             font_family: String::new(),
             font_size: 11,
             log_path: String::new(),
+            local_echo: "auto".into(),
+            backspace: "del".into(),
             device_syntax: "none".into(),
         }
     }
@@ -212,6 +269,14 @@ impl Profile {
 
     pub fn auth(&self) -> Auth {
         Auth::parse(&self.auth)
+    }
+
+    pub fn local_echo(&self) -> LocalEcho {
+        LocalEcho::parse(&self.local_echo)
+    }
+
+    pub fn backspace(&self) -> Backspace {
+        Backspace::parse(&self.backspace)
     }
 
     /// Replace values a hand-edited file could have made unusable.
@@ -243,6 +308,12 @@ impl Profile {
         }
         if self.device_syntax.is_empty() {
             self.device_syntax = defaults.device_syntax;
+        }
+        if self.local_echo.is_empty() {
+            self.local_echo = defaults.local_echo;
+        }
+        if self.backspace.is_empty() {
+            self.backspace = defaults.backspace;
         }
         self
     }
@@ -423,6 +494,27 @@ mod tests {
     }
 
     #[test]
+    fn older_sessions_get_auto_echo_and_del() {
+        let (_dir, store) = store_with(PYTHON_SESSIONS);
+        let profile = store.get("console").unwrap();
+        assert_eq!(profile.local_echo(), LocalEcho::Auto);
+        assert_eq!(profile.backspace(), Backspace::Del);
+    }
+
+    #[test]
+    fn auto_echo_is_only_for_telnet_servers_that_do_not_echo() {
+        for kind in Kind::ALL {
+            assert!(LocalEcho::On.applies(kind, true));
+            assert!(!LocalEcho::Off.applies(kind, false));
+            assert_eq!(LocalEcho::Auto.applies(kind, false), kind == Kind::Telnet, "{kind:?}");
+            assert!(!LocalEcho::Auto.applies(kind, true));
+        }
+        for option in LocalEcho::ALL {
+            assert_eq!(LocalEcho::parse(option.as_str()), option);
+        }
+    }
+
+    #[test]
     fn garbage_file_loads_as_empty() {
         let (_dir, store) = store_with("{ not json");
         assert!(store.profiles.is_empty());
@@ -474,6 +566,8 @@ mod tests {
             "font_family",
             "font_size",
             "log_path",
+            "local_echo",
+            "backspace",
             "device_syntax",
         ] {
             assert!(session.get(key).is_some(), "missing {key}");

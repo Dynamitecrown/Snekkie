@@ -12,6 +12,7 @@ pub enum Event {
     Connected,
     Closed(Option<String>),
     Notice(String),
+    RemoteEcho(bool),
 }
 
 /// A Sink that records everything, with helpers to wait for it.
@@ -78,5 +79,8 @@ impl Sink for Recorder {
     }
     fn notice(&self, message: String) {
         self.push(|s| s.1.push(Event::Notice(message)));
+    }
+    fn remote_echo(&self, on: bool) {
+        self.push(|s| s.1.push(Event::RemoteEcho(on)));
     }
 }

@@ -6,9 +6,10 @@
 use egui::{ComboBox, DragValue, RichText, TextEdit, Ui};
 
 use super::style;
-use crate::profiles::{Auth, Kind, Profile, ProfileStore};
+use crate::profiles::{Auth, Kind, LocalEcho, Profile, ProfileStore};
 use crate::settings::AppSettings;
 use crate::terminal::highlight::{SYNTAX_LABELS, syntax_label};
+use crate::terminal::keys::Backspace;
 use crate::transport::serial::{self, BAUD_RATES, DATA_BITS, PARITIES, PortInfo, STOP_BITS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -467,6 +468,41 @@ impl Sidebar {
                 ui.add(text_field(&mut self.draft.log_path, "(no session logging)", width));
             })
             .then(|| actions.push(Action::BrowseLog));
+        });
+        row(ui, "Local echo", |ui| {
+            let mut echo = self.draft.local_echo();
+            ComboBox::from_id_salt("local_echo")
+                .width(ui.available_width())
+                .truncate()
+                .selected_text(echo.label())
+                .show_ui(ui, |ui| {
+                    for option in LocalEcho::ALL {
+                        ui.selectable_value(&mut echo, option, option.label());
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Show what you type, for devices that don't echo it back. Auto: on for telnet until \
+                     the device says it will echo; off for SSH, serial and raw TCP.",
+                );
+            self.draft.local_echo = echo.as_str().to_string();
+        });
+        row(ui, "Backspace", |ui| {
+            let mut backspace = self.draft.backspace();
+            ComboBox::from_id_salt("backspace")
+                .width(ui.available_width())
+                .truncate()
+                .selected_text(backspace.label())
+                .show_ui(ui, |ui| {
+                    for option in Backspace::ALL {
+                        ui.selectable_value(&mut backspace, option, option.label());
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "What the Backspace key sends. Try Ctrl+H if Backspace doesn't erase on an older device.",
+                );
+            self.draft.backspace = backspace.as_str().to_string();
         });
     }
 

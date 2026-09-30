@@ -70,6 +70,9 @@ pub trait Sink: Send + Sync + 'static {
     fn closed(&self, reason: Option<String>);
     /// A message worth showing the user without ending the session.
     fn notice(&self, message: String);
+    /// Whether the far end has agreed to echo what's typed. Only telnet
+    /// negotiates this.
+    fn remote_echo(&self, _on: bool) {}
 }
 
 /// The session's handle on a running transport.

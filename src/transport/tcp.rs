@@ -99,6 +99,7 @@ async fn run(
     }
     sink.connected();
 
+    let mut remote_echo = false;
     let mut buf = vec![0u8; 8192];
     loop {
         let outgoing = tokio::select! {
@@ -107,6 +108,10 @@ async fn run(
                 Ok(n) => match telnet.as_mut() {
                     Some(telnet) => {
                         let received = telnet.receive(&buf[..n]);
+                        if telnet.remote_echo() != remote_echo {
+                            remote_echo = telnet.remote_echo();
+                            sink.remote_echo(remote_echo);
+                        }
                         if !received.data.is_empty() {
                             sink.data(&received.data);
                         }

@@ -5,6 +5,45 @@
 
 use egui::{Key, Modifiers};
 
+/// What the Backspace key sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backspace {
+    /// DEL, PuTTY's default, which modern shells and IOS both expect.
+    #[default]
+    Del,
+    /// ^H, for older and embedded consoles that only erase on that.
+    CtrlH,
+}
+
+impl Backspace {
+    pub const ALL: [Backspace; 2] = [Backspace::Del, Backspace::CtrlH];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backspace::Del => "del",
+            Backspace::CtrlH => "ctrl-h",
+        }
+    }
+
+    pub fn parse(s: &str) -> Backspace {
+        if s == "ctrl-h" { Backspace::CtrlH } else { Backspace::Del }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Backspace::Del => "DEL (^?)",
+            Backspace::CtrlH => "Ctrl+H (^H)",
+        }
+    }
+
+    fn byte(self) -> u8 {
+        match self {
+            Backspace::Del => 0x7f,
+            Backspace::CtrlH => 0x08,
+        }
+    }
+}
+
 /// xterm modifier parameter: 1 + shift(1) + alt(2) + ctrl(4).
 fn modifier_code(mods: Modifiers) -> u8 {
     1 + u8::from(mods.shift) + 2 * u8::from(mods.alt) + 4 * u8::from(mods.ctrl)
@@ -102,7 +141,7 @@ fn control_byte(key: Key, shift: bool) -> Option<u8> {
 
 /// Bytes for a key press, or None if the key should be left to the text
 /// event that follows it (plain printable characters).
-pub fn encode_key(key: Key, mods: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
+pub fn encode_key(key: Key, mods: Modifiers, app_cursor: bool, backspace: Backspace) -> Option<Vec<u8>> {
     let mod_code = modifier_code(mods);
     let modded = mod_code > 1;
 
@@ -135,10 +174,8 @@ pub fn encode_key(key: Key, mods: Modifiers, app_cursor: bool) -> Option<Vec<u8>
         Key::Tab if mods.shift => return Some(b"\x1b[Z".to_vec()),
         Key::Tab => return Some(b"\t".to_vec()),
         Key::Escape => return Some(b"\x1b".to_vec()),
-        // PuTTY's default: Backspace sends DEL, which modern shells and IOS
-        // both expect.
-        Key::Backspace if mods.alt => return Some(b"\x1b\x7f".to_vec()),
-        Key::Backspace => return Some(b"\x7f".to_vec()),
+        Key::Backspace if mods.alt => return Some(vec![0x1b, backspace.byte()]),
+        Key::Backspace => return Some(vec![backspace.byte()]),
         _ => {}
     }
 
@@ -167,6 +204,44 @@ pub fn encode_paste(text: &str) -> Vec<u8> {
     text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
 }
 
+/// What to draw for bytes the user sent, when the far end won't echo them.
+///
+/// Text goes on screen as typed, Enter starts a new line and Backspace rubs
+/// out the character before the cursor. Cursor keys and other escape
+/// sequences are left out: drawing them would move the cursor about while
+/// the device stays where it was. So are other control characters.
+pub fn local_echo(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x1b => {
+                i += 1;
+                match bytes.get(i) {
+                    // CSI: parameters and intermediates, then a final byte.
+                    Some(b'[') => {
+                        i += 1;
+                        while bytes.get(i).is_some_and(|b| (0x20..0x40).contains(b)) {
+                            i += 1;
+                        }
+                    }
+                    // SS3 (application cursor keys, F1-F4): one more byte.
+                    Some(b'O') => i += 1,
+                    // Alt+key: the key itself.
+                    _ => {}
+                }
+            }
+            b'\r' => out.extend(b"\r\n"),
+            0x08 | 0x7f => out.extend(b"\x08 \x08"),
+            b'\t' => out.push(b'\t'),
+            byte if byte >= 0x20 => out.push(byte),
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,14 +253,18 @@ mod tests {
     }
 
     fn key(k: Key, m: Modifiers) -> Option<Vec<u8>> {
-        encode_key(k, m, false)
+        encode_key(k, m, false, Backspace::Del)
+    }
+
+    fn app_key(k: Key, m: Modifiers) -> Option<Vec<u8>> {
+        encode_key(k, m, true, Backspace::Del)
     }
 
     #[test]
     fn arrows_follow_application_cursor_mode() {
-        assert_eq!(encode_key(Key::ArrowUp, NONE, false).unwrap(), b"\x1b[A");
-        assert_eq!(encode_key(Key::ArrowUp, NONE, true).unwrap(), b"\x1bOA");
-        assert_eq!(encode_key(Key::Home, NONE, false).unwrap(), b"\x1b[H");
+        assert_eq!(key(Key::ArrowUp, NONE).unwrap(), b"\x1b[A");
+        assert_eq!(app_key(Key::ArrowUp, NONE).unwrap(), b"\x1bOA");
+        assert_eq!(key(Key::Home, NONE).unwrap(), b"\x1b[H");
     }
 
     #[test]
@@ -193,7 +272,7 @@ mod tests {
         assert_eq!(key(Key::ArrowLeft, ctrl()).unwrap(), b"\x1b[1;5D");
         assert_eq!(key(Key::ArrowRight, Modifiers::SHIFT).unwrap(), b"\x1b[1;2C");
         // Application mode doesn't apply once modifiers are involved.
-        assert_eq!(encode_key(Key::ArrowUp, Modifiers::ALT, true).unwrap(), b"\x1b[1;3A");
+        assert_eq!(app_key(Key::ArrowUp, Modifiers::ALT).unwrap(), b"\x1b[1;3A");
     }
 
     #[test]
@@ -213,6 +292,17 @@ mod tests {
         assert_eq!(key(Key::Tab, Modifiers::SHIFT).unwrap(), b"\x1b[Z");
         assert_eq!(key(Key::Backspace, NONE).unwrap(), b"\x7f");
         assert_eq!(key(Key::Escape, NONE).unwrap(), b"\x1b");
+    }
+
+    #[test]
+    fn backspace_can_send_ctrl_h() {
+        assert_eq!(encode_key(Key::Backspace, NONE, false, Backspace::CtrlH).unwrap(), [0x08]);
+        assert_eq!(encode_key(Key::Backspace, Modifiers::ALT, false, Backspace::CtrlH).unwrap(), [0x1b, 0x08]);
+        assert_eq!(key(Key::Backspace, Modifiers::ALT).unwrap(), [0x1b, 0x7f]);
+        for option in Backspace::ALL {
+            assert_eq!(Backspace::parse(option.as_str()), option);
+        }
+        assert_eq!(Backspace::parse(""), Backspace::Del);
     }
 
     #[test]
@@ -245,5 +335,24 @@ mod tests {
     #[test]
     fn paste_normalises_line_endings() {
         assert_eq!(encode_paste("a\r\nb\nc"), b"a\rb\rc");
+    }
+
+    #[test]
+    fn local_echo_draws_text_newlines_and_rubouts() {
+        assert_eq!(local_echo(b"show ver\r"), b"show ver\r\n");
+        assert_eq!(local_echo(b"ab\x7f"), b"ab\x08 \x08");
+        assert_eq!(local_echo(&[0x08]), b"\x08 \x08");
+        assert_eq!(local_echo("naïve\t".as_bytes()), "naïve\t".as_bytes());
+    }
+
+    #[test]
+    fn local_echo_leaves_out_keys_that_would_move_the_cursor() {
+        assert_eq!(local_echo(b"\x1b[A"), b"");
+        assert_eq!(local_echo(b"\x1bOA"), b"");
+        assert_eq!(local_echo(b"\x1b[1;5D"), b"");
+        assert_eq!(local_echo(b"\x1b[3~x"), b"x");
+        // Alt+b, then Ctrl+C.
+        assert_eq!(local_echo(b"a\x1bbc\x03"), b"ac");
+        assert_eq!(local_echo(b"\x1b"), b"");
     }
 }

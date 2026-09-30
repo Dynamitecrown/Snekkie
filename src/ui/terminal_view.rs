@@ -232,6 +232,7 @@ impl TerminalView {
     fn handle_keys(&mut self, ui: &mut Ui, session: &Session, now: f64, out: &mut ViewOutput) {
         let (events, mods_now) = ui.input(|i| (i.events.clone(), i.modifiers));
         let app_cursor = session.shared.emulator.lock().application_cursor_keys();
+        let backspace = session.profile.backspace();
         for event in events {
             match event {
                 Event::Text(text) => self.typed(session, keys::encode_text(&text, mods_now), now),
@@ -246,7 +247,7 @@ impl TerminalView {
                         };
                         continue;
                     }
-                    if let Some(bytes) = keys::encode_key(key, modifiers, app_cursor) {
+                    if let Some(bytes) = keys::encode_key(key, modifiers, app_cursor, backspace) {
                         self.typed(session, bytes, now);
                     }
                 }
