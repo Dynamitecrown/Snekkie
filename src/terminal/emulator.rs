@@ -258,10 +258,18 @@ impl Emulator {
     /// Python version copied it.
     pub fn selection_text(&self) -> Option<String> {
         let text = self.term.selection_to_string()?;
-        let trimmed: Vec<&str> = text.split('\n').map(str::trim_end).collect();
-        let text = trimmed.join("\n");
-        let text = text.trim_end_matches('\n').to_string();
+        let text = plain_text(&text);
         (!text.is_empty()).then_some(text)
+    }
+
+    /// All retained output, including scrollback, independent of the
+    /// current selection and scroll position. Soft-wrapped rows are joined
+    /// by the terminal engine, which also handles wide and combining glyphs.
+    pub fn all_text(&self) -> String {
+        let grid = self.term.grid();
+        let top = Point::new(grid.topmost_line(), Column(0));
+        let bottom = Point::new(grid.bottommost_line(), grid.last_column());
+        plain_text(&self.term.bounds_to_string(top, bottom))
     }
 
     /// Select the whole document, scrollback included.
@@ -306,6 +314,10 @@ impl Emulator {
     pub fn screen_text(&self) -> String {
         (0..self.lines()).map(|r| self.line_text(r)).collect::<Vec<_>>().join("\n")
     }
+}
+
+fn plain_text(text: &str) -> String {
+    text.split('\n').map(str::trim_end).collect::<Vec<_>>().join("\n").trim_end_matches('\n').to_string()
 }
 
 #[cfg(test)]
@@ -441,6 +453,27 @@ mod tests {
         assert_eq!(emu.selection_text().unwrap(), "one\ntwo\nthree");
         emu.clear_selection();
         assert!(emu.selection_text().is_none());
+    }
+
+    #[test]
+    fn all_text_includes_history_without_changing_selection_or_scroll() {
+        let (mut emu, sent) = emulator(8, 3, 100);
+        emu.feed("\x1b[31mabcdefghij\x1b[0m\r\n界e\u{301}\r\n\r\nlast   ".as_bytes());
+        emu.scroll_to(1);
+        let point = emu.viewport_to_point(0, 0);
+        emu.start_selection(point, Side::Left, true);
+        let selection = emu.selection_text();
+        assert_eq!(emu.all_text(), "abcdefghij\n界e\u{301}\n\nlast");
+        assert_eq!(emu.selection_text(), selection);
+        assert_eq!(emu.display_offset(), 1);
+        assert!(sent.lock().is_empty());
+
+        // An alternate screen exports only that screen, not hidden shell
+        // history, and the shell's history is still there after leaving it.
+        emu.feed(b"\x1b[?1049h\x1b[Heditor");
+        assert_eq!(emu.all_text(), "editor");
+        emu.feed(b"\x1b[?1049l");
+        assert_eq!(emu.all_text(), "abcdefghij\n界e\u{301}\n\nlast");
     }
 
     #[test]

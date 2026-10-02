@@ -7,11 +7,11 @@
 ; and are never touched by installing, upgrading or uninstalling.
 ;
 ; Build (from the repository root):
-;   makensis -DVERSION=2.4.0 -DEXE=target\release\snekkie.exe installer\snekkie.nsi
+;   makensis -DVERSION=2.4.1 -DEXE=target\release\snekkie.exe installer\snekkie.nsi
 ;
 ; Unattended use:
-;   Snekkie-Setup-2.4.0.exe /S            install or upgrade silently
-;   Snekkie-Setup-2.4.0.exe /S /D=C:\Dir  ...into a specific folder (first install)
+;   Snekkie-Setup-2.4.1.exe /S            install or upgrade silently
+;   Snekkie-Setup-2.4.1.exe /S /D=C:\Dir  ...into a specific folder (first install)
 ;   "%LOCALAPPDATA%\Programs\Snekkie\uninstall.exe" /S
 ;
 ; Snekkie's own "Update now" runs the new installer with /UPDATE and then

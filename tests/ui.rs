@@ -48,6 +48,245 @@ fn starts_empty() {
     assert!(harness.state().tab_titles().is_empty());
 }
 
+fn open_raw_tab(harness: &mut Harness<'static, SnekkieApp>, name: &str) -> std::net::TcpStream {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let ctx = harness.ctx.clone();
+    harness.state_mut().open_session(
+        &ctx,
+        snekkie::profiles::Profile {
+            name: name.into(),
+            kind: "raw".into(),
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            ..Default::default()
+        },
+    );
+    let (mut device, _) = listener.accept().unwrap();
+    let prompt = format!("{name}>");
+    device.write_all(prompt.as_bytes()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while harness.state().active_screen_text().is_none_or(|text| text.trim() != prompt) {
+        assert!(Instant::now() < deadline, "{name} never connected");
+        harness.run_ok();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    harness.run_ok();
+    device
+}
+
+#[test]
+fn terminal_context_menu_keeps_navigation_and_escape_off_the_wire_and_restores_typing() {
+    use std::io::Read;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(&dir);
+    let mut device = open_raw_tab(&mut harness, "switch");
+    device.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+    harness
+        .get_by_label("Terminal output")
+        .click_button_modifiers(egui::PointerButton::Secondary, egui::Modifiers::CTRL);
+    harness.run_ok();
+    harness.get_by_label("Copy all");
+    harness.key_press(egui::Key::ArrowDown);
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    assert!(harness.query_by_label("Copy all").is_none());
+    let error = device.read(&mut [0; 64]).unwrap_err();
+    assert!(matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+
+    harness.event(egui::Event::Text("show run".into()));
+    harness.run_ok();
+    device.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut bytes = [0; 8];
+    device.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"show run");
+
+    // Enter activates the focused Copy all item locally, rather than
+    // submitting the command currently being typed on the device.
+    harness
+        .get_by_label("Terminal output")
+        .click_button_modifiers(egui::PointerButton::Secondary, egui::Modifiers::CTRL);
+    harness.run_ok();
+    harness.key_press(egui::Key::Enter);
+    harness.run_ok();
+    assert!(harness.query_by_label("Copy all").is_none());
+    device.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+    let error = device.read(&mut [0; 64]).unwrap_err();
+    assert!(matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+    harness.event(egui::Event::Text("x".into()));
+    harness.run_ok();
+    device.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut byte = [0];
+    device.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"x");
+}
+
+#[test]
+fn new_connections_with_other_tabs_open_do_not_inherit_the_last_saved_session_name() {
+    use snekkie::profiles::{Profile, ProfileStore};
+    use std::net::TcpListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut store = ProfileStore::open(dir.path().join("sessions.json"));
+    store
+        .put(Profile {
+            name: "saved console".into(),
+            kind: "raw".into(),
+            host: "127.0.0.1".into(),
+            port: first_listener.local_addr().unwrap().port(),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut harness = harness(&dir);
+    let _existing = open_raw_tab(&mut harness, "already open");
+    harness.get_by_label("saved console").click();
+    harness.run_ok();
+    harness.get_by_label("Load").click();
+    harness.run_ok();
+    harness.get_by_label("Connect").click();
+    harness.run_ok();
+    let (_first, _) = first_listener.accept().unwrap();
+    assert_eq!(harness.state().tab_titles(), ["already open", "saved console"]);
+
+    // The same console server, but a different port and therefore a
+    // different console. Its tab must be named for that destination.
+    let port = second_listener.local_addr().unwrap().port();
+    harness.state_mut().sidebar_draft().port = port;
+    harness.run_ok();
+    harness.get_by_label("Connect").click();
+    harness.run_ok();
+    let (_second, _) = second_listener.accept().unwrap();
+    assert_eq!(harness.state().tab_titles(), ["already open", "saved console", &format!("127.0.0.1:{port}")]);
+
+    // Saving the edited form associates its new alias with the new
+    // destination, without changing earlier tabs or the original profile.
+    harness.get_by_label("Save…").click();
+    harness.run_ok();
+    harness
+        .get_all_by_value(&format!("127.0.0.1:{port}"))
+        .find(|node| node.accesskit_node().role() == Role::TextInput)
+        .unwrap()
+        .click();
+    harness.run_ok();
+    harness.key_press_modifiers(egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE }, egui::Key::A);
+    harness.event(egui::Event::Text("second console".into()));
+    harness.run_ok();
+    harness.get_by_label("OK").click();
+    harness.run_ok();
+    harness.get_by_label("Connect").click();
+    harness.run_ok();
+    let (_third, _) = second_listener.accept().unwrap();
+    assert_eq!(
+        harness.state().tab_titles(),
+        ["already open", "saved console", &format!("127.0.0.1:{port}"), "second console"]
+    );
+    let saved = ProfileStore::open(dir.path().join("sessions.json"));
+    assert_eq!(saved.get("saved console").unwrap().port, first_listener.local_addr().unwrap().port());
+    assert_eq!(saved.get("second console").unwrap().port, port);
+
+    harness.key_press_modifiers(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::N);
+    harness.run_ok();
+    assert_eq!(harness.state_mut().sidebar_draft().name, "New session");
+    assert_eq!(harness.state_mut().sidebar_draft().host, "");
+    assert!(harness.get_by_label("Load").accesskit_node().is_disabled());
+}
+
+#[test]
+fn tab_x_closes_a_disconnected_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(&dir);
+    let device = open_raw_tab(&mut harness, "switch");
+    drop(device);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while harness.state().tab_titles() != ["switch (closed)"] {
+        assert!(std::time::Instant::now() < deadline, "session did not disconnect");
+        harness.run_ok();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    harness.run_ok();
+    harness.get_by_label("×").click();
+    harness.run_ok();
+    assert!(harness.state().tab_titles().is_empty(), "the tab's X did not close it");
+    assert!(harness.state().dialog_texts().is_empty());
+}
+
+#[test]
+fn tab_x_confirms_the_correct_session_without_selecting_it() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(&dir);
+    let mut first = open_raw_tab(&mut harness, "first");
+    let mut second = open_raw_tab(&mut harness, "second");
+    harness.get_all_by_label("×").next().unwrap().click();
+    harness.run_ok();
+    assert_eq!(harness.state().dialog_texts(), ["“first” is still connected. Close it?"]);
+    harness.get_by_label("No").click();
+    harness.run_ok();
+    assert_eq!(harness.state().tab_titles(), ["first", "second"]);
+    assert_eq!(harness.state().active_screen_text().unwrap().trim(), "second>");
+
+    harness.get_all_by_label("×").next().unwrap().click();
+    harness.run_ok();
+    harness.get_by_label("Yes").click();
+    harness.run_ok();
+    assert_eq!(harness.state().tab_titles(), ["second"]);
+    first.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    assert_eq!(first.read(&mut [0; 1]).unwrap(), 0, "the closed session did not hang up");
+
+    harness.get_by_label("×").click();
+    harness.run_ok();
+    assert_eq!(harness.state().dialog_texts(), ["“second” is still connected. Close it?"]);
+    harness.get_by_label("Yes").click();
+    harness.run_ok();
+    assert!(harness.state().tab_titles().is_empty());
+    second.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    assert_eq!(second.read(&mut [0; 1]).unwrap(), 0);
+}
+
+#[test]
+fn tab_body_still_selects_drags_and_offers_other_close_gestures() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(&dir);
+    let _first = open_raw_tab(&mut harness, "first");
+    let _second = open_raw_tab(&mut harness, "second");
+    harness.get_by_label("first").click();
+    harness.run_ok();
+    assert_eq!(harness.state().active_screen_text().unwrap().trim(), "first>");
+
+    let from = harness.get_by_label("first").rect().center();
+    let to = harness.get_by_label("second").rect().center();
+    harness.hover_at(from);
+    harness.drag_at(from);
+    harness.run_ok();
+    harness.hover_at(to);
+    harness.run_ok();
+    harness.drop_at(to);
+    harness.run_ok();
+    assert_eq!(harness.state().tab_titles(), ["second", "first"]);
+    assert_eq!(harness.state().active_screen_text().unwrap().trim(), "first>");
+
+    harness.get_by_label("second").click_secondary();
+    harness.run_ok();
+    harness.get_by_label("Close").click();
+    harness.run_ok();
+    assert_eq!(harness.state().dialog_texts(), ["“second” is still connected. Close it?"]);
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    harness.get_by_label("second").click_button(egui::PointerButton::Middle);
+    harness.run_ok();
+    assert_eq!(harness.state().dialog_texts(), ["“second” is still connected. Close it?"]);
+    harness.get_by_label("Yes").click();
+    harness.run_ok();
+    assert_eq!(harness.state().tab_titles(), ["first"]);
+}
+
 #[test]
 fn open_top_menu_switches_on_hover_in_both_directions() {
     let dir = tempfile::tempdir().unwrap();
@@ -461,6 +700,114 @@ fn animations_ticked(harness: &Harness<'static, SnekkieApp>) -> bool {
 fn saved_settings(dir: &tempfile::TempDir) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(dir.path().join("settings.json")).ok()?;
     Some(serde_json::from_str(&text).unwrap())
+}
+
+fn edit_cursor_red(harness: &mut Harness<'static, SnekkieApp>, from: u8, to: u8) {
+    harness.get_by_role_and_label(Role::ColorWell, "Cursor").click();
+    harness.run_ok();
+    harness.get_by_value(&format!("R {from}")).click();
+    harness.run_ok();
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::A);
+    harness.run_ok();
+    harness.event(egui::Event::Text(to.to_string()));
+    harness.run_ok();
+    harness.key_press(egui::Key::Enter);
+    harness.run_ok();
+    harness.get_by_role_and_label(Role::Label, "Colour theme").click();
+    harness.run_ok();
+    harness.get_by_value("Custom");
+}
+
+fn save_theme_as(harness: &mut Harness<'static, SnekkieApp>, name: &str) {
+    harness.get_by_label("Save as…").click();
+    harness.run_ok();
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::A);
+    harness.run_ok();
+    harness.event(egui::Event::Text(name.into()));
+    harness.run_ok();
+    // The name dialog sits above Preferences, which also has an OK button.
+    harness.get_all_by_role_and_label(Role::Button, "OK").next_back().unwrap().click();
+    harness.run_ok();
+}
+
+#[test]
+fn selected_theme_colours_can_be_edited_and_saved_as_a_named_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(&dir);
+    open_preferences(&mut harness);
+    harness.get_by_value("Snekkie Dark").click();
+    harness.run_ok();
+    harness.get_by_label("Monokai").click();
+    harness.run_ok();
+    for colour in harness.get_all_by_role(Role::ColorWell) {
+        assert!(!colour.accesskit_node().is_disabled(), "the selected theme's colours should be editable");
+    }
+    edit_cursor_red(&mut harness, 166, 10);
+    for colour in ["#f8f8f2", "#272822", "#0ae22e", "#49483e"] {
+        harness.get_by_label(colour);
+    }
+    save_theme_as(&mut harness, "Monokai blue");
+    harness.get_by_value("Monokai blue");
+    harness.get_by_label("OK").click();
+    harness.run_ok();
+    let saved = saved_settings(&dir).unwrap();
+    assert_eq!(saved["theme"], "Monokai blue");
+    assert_eq!(saved["custom_cursor"], "#0ae22e");
+    assert_eq!(
+        saved["saved_themes"]["Monokai blue"],
+        serde_json::json!({
+            "fg": "#f8f8f2", "bg": "#272822", "cursor": "#0ae22e", "selection": "#49483e"
+        })
+    );
+
+    // A fresh app loads the named copy; selecting its base preset still
+    // shows the original palette, and selecting the copy restores the edits.
+    drop(harness);
+    let mut restarted = harness_sized(&dir, [1000.0, 640.0]);
+    open_preferences(&mut restarted);
+    restarted.get_by_value("Monokai blue").click();
+    restarted.run_ok();
+    restarted.get_by_label("Monokai").click();
+    restarted.run_ok();
+    restarted.get_by_label("#a6e22e");
+    restarted.get_by_value("Monokai").click();
+    restarted.run_ok();
+    restarted.get_by_label("Monokai blue").click();
+    restarted.run_ok();
+    restarted.get_by_label("#0ae22e");
+}
+
+#[test]
+fn editing_a_saved_theme_requires_replacement_confirmation_and_cancel_discards_edits() {
+    use snekkie::settings::{AppSettings, SettingsStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SettingsStore::new(dir.path().join("settings.json"));
+    let mut settings = AppSettings { theme: "Monokai".into(), ..Default::default() };
+    settings.saved_themes.insert("Original".into(), settings.colors().to_scheme());
+    settings.theme = "Original".into();
+    store.save(&settings).unwrap();
+    let mut harness = harness(&dir);
+    open_preferences(&mut harness);
+    edit_cursor_red(&mut harness, 166, 10);
+    save_theme_as(&mut harness, "Original");
+    assert_eq!(harness.state().dialog_texts(), ["Replace the saved theme “Original”?"]);
+    harness.get_by_label("No").click();
+    harness.run_ok();
+    harness.get_by_value("Custom");
+    assert_eq!(store.load(), settings);
+
+    save_theme_as(&mut harness, "Original");
+    harness.get_by_label("Yes").click();
+    harness.run_ok();
+    harness.get_by_value("Original");
+    harness.get_by_label("#0ae22e");
+    harness.get_by_label("Cancel").click();
+    harness.run_ok();
+    assert_eq!(store.load(), settings, "cancel saved the replacement or the draft colours");
+    open_preferences(&mut harness);
+    harness.get_by_value("Original");
+    harness.get_by_label("#a6e22e");
 }
 
 const TYPING: [&str; 5] = ["Cursor movement", "Cursor blink", "Typed characters", "Keystroke burst", "Screen shake"];

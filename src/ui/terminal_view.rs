@@ -13,8 +13,8 @@ use egui::emath::{Rot2, TSTransform};
 use egui::epaint::{RectShape, TextShape};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Color32, CornerRadius, CursorIcon, Event, EventFilter, FontId, Id, Key, MouseWheelUnit, Painter, Pos2, Rect, Sense,
-    Shape, Stroke, Ui, Vec2, pos2, vec2,
+    Color32, CornerRadius, CursorIcon, Event, EventFilter, FontId, Id, Key, MouseWheelUnit, Painter, Popup, Pos2, Rect,
+    Sense, SetOpenCommand, Shape, Stroke, Ui, Vec2, WidgetInfo, WidgetType, pos2, vec2,
 };
 use parking_lot::Mutex;
 
@@ -89,8 +89,32 @@ fn until_next_blink(now: f64, epoch: f64) -> f64 {
 pub struct ViewOutput {
     /// Text to put on the clipboard.
     pub copy: Option<String>,
-    /// The user asked to paste (right-click).
+    /// The user asked to paste (right-click or the context menu).
     pub paste_requested: bool,
+    /// A snapshot of output to save or append with the app's file dialog.
+    pub text_export: Option<TextExport>,
+}
+
+pub enum TextExport {
+    Save(String),
+    Append(String),
+}
+
+fn ctrl_secondary_click(ui: &Ui) -> bool {
+    ui.input(|i| {
+        // Ctrl may have been released in the same frame as the click.
+        // Use the modifier state attached to the mouse release itself.
+        i.events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                Event::PointerButton { button: egui::PointerButton::Secondary, pressed: false, modifiers, .. } => {
+                    Some(modifiers.ctrl)
+                }
+                _ => None,
+            })
+            .unwrap_or(i.modifiers.ctrl)
+    })
 }
 
 #[derive(Default)]
@@ -231,6 +255,7 @@ impl TerminalView {
         }
 
         let response = ui.interact(term_rect, id, Sense::click_and_drag());
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Other, true, "Terminal output"));
         if self.request_focus {
             self.request_focus = false;
             response.request_focus();
@@ -238,13 +263,17 @@ impl TerminalView {
         if response.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::Text);
         }
-        let focused = response.has_focus() && options.keyboard;
         let now = ui.input(|i| i.time);
         if response.gained_focus() {
             self.blink_epoch = now;
         }
 
         self.handle_mouse(ui, &response, session, &metrics, now, &mut out);
+        let menu_was_open = Popup::is_id_open(ui.ctx(), Popup::default_response_id(&response));
+        let menu_shown = self.context_menu(ui, &response, session, options.keyboard, &mut out);
+        // Menu navigation and dismissal must never go to the device, even
+        // on the frame that closes the popup and restores terminal focus.
+        let focused = response.has_focus() && options.keyboard && !menu_shown && !menu_was_open;
         if focused {
             // Keep Tab, arrows and Escape for the far end instead of letting
             // egui move focus with them.
@@ -270,6 +299,91 @@ impl TerminalView {
 
         self.schedule_repaint(ui.ctx(), &options.animations, blinking, now);
         out
+    }
+
+    fn context_menu(
+        &mut self,
+        ui: &Ui,
+        response: &egui::Response,
+        session: &Session,
+        keyboard: bool,
+        out: &mut ViewOutput,
+    ) -> bool {
+        let open = keyboard && response.secondary_clicked() && ctrl_secondary_click(ui);
+        let state = if open {
+            response.surrender_focus();
+            Some(SetOpenCommand::Bool(true))
+        } else if response.clicked() || !keyboard {
+            Some(SetOpenCommand::Bool(false))
+        } else {
+            None
+        };
+        let mut acted = false;
+        let shown = Popup::context_menu(response).open_memory(state).show(|ui| {
+            let selected = session.shared.emulator.lock().has_selection();
+            let copy = ui.add_enabled(selected, egui::Button::new("Copy"));
+            if open && selected {
+                copy.request_focus();
+            }
+            if copy.clicked() {
+                out.copy = session.shared.emulator.lock().selection_text();
+                acted = true;
+            }
+            let copy_all = ui.button("Copy all");
+            if open && !selected {
+                copy_all.request_focus();
+            }
+            if copy_all.clicked() {
+                out.copy = Some(session.shared.emulator.lock().all_text());
+                acted = true;
+            }
+            if ui.add_enabled(session.is_live(), egui::Button::new("Paste")).clicked() {
+                out.paste_requested = true;
+                acted = true;
+            }
+            if ui.button("Select all").clicked() {
+                session.shared.emulator.lock().select_all();
+                acted = true;
+            }
+            if ui.add_enabled(selected, egui::Button::new("Clear selection")).clicked() {
+                session.shared.emulator.lock().clear_selection();
+                acted = true;
+            }
+            ui.separator();
+            if ui.button("Save output to text file…").clicked() {
+                out.text_export = Some(TextExport::Save(session.shared.emulator.lock().all_text()));
+                acted = true;
+            }
+            if ui.add_enabled(selected, egui::Button::new("Save selection to text file…")).clicked() {
+                out.text_export = session.shared.emulator.lock().selection_text().map(TextExport::Save);
+                acted = true;
+            }
+            if ui
+                .button("Append to text file…")
+                .on_hover_text(
+                    "Append the selection, or all retained output if nothing is selected, to an existing file.",
+                )
+                .clicked()
+            {
+                let emu = session.shared.emulator.lock();
+                let text = if selected { emu.selection_text().unwrap_or_default() } else { emu.all_text() };
+                out.text_export = Some(TextExport::Append(text));
+                acted = true;
+            }
+            ui.separator();
+            let scrolled_back = session.shared.emulator.lock().display_offset() != 0;
+            if ui.add_enabled(scrolled_back, egui::Button::new("Scroll to bottom")).clicked() {
+                session.shared.emulator.lock().scroll_to_bottom();
+                acted = true;
+            }
+            if acted {
+                ui.close();
+            }
+        });
+        if shown.is_some() && (acted || ui.input(|i| i.key_pressed(Key::Escape))) {
+            self.focus();
+        }
+        shown.is_some()
     }
 
     /// Draw `emulator` in a `size` box with no scrollbar and no input, as if
@@ -463,8 +577,9 @@ impl TerminalView {
         }
 
         if response.secondary_clicked() {
-            // PuTTY habit: right-click pastes.
-            out.paste_requested = true;
+            // PuTTY habit: plain right-click pastes. Ctrl+right-click opens
+            // the context menu without sending anything to the device.
+            out.paste_requested = !ctrl_secondary_click(ui);
             return;
         }
 
@@ -1119,11 +1234,139 @@ fn paint_particle(painter: &Painter, d: &Metrics, particle: &ParticleLook, displ
 mod tests {
     use std::sync::Arc;
 
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::{NodeT, Queryable};
+
     use super::*;
     use crate::settings::{CursorBlink, NewText, Reveal, Scrolling};
 
     fn metrics() -> Metrics {
         Metrics { origin: pos2(10.0, 20.0), cell: vec2(8.0, 16.0), columns: 80, lines: 24 }
+    }
+
+    struct ContextMenuTest {
+        view: TerminalView,
+        session: Session,
+        requests: Vec<ViewOutput>,
+    }
+
+    fn context_harness() -> Harness<'static, ContextMenuTest> {
+        let state = ContextMenuTest {
+            view: TerminalView::default(),
+            session: Session::new(Default::default(), Theme::default(), || {}),
+            requests: Vec::new(),
+        };
+        let mut harness = Harness::builder().with_size([600.0, 400.0]).build_ui_state(
+            |ui, state: &mut ContextMenuTest| {
+                let options = ViewOptions { keyboard: true, ..view_options(Animations::default()) };
+                let out = state.view.show(ui, &state.session, &options);
+                if out.copy.is_some() || out.paste_requested || out.text_export.is_some() {
+                    state.requests.push(out);
+                }
+            },
+            state,
+        );
+        harness.run_ok();
+        let mut emu = harness.state().session.shared.emulator.lock();
+        let output: String = (0..80).map(|i| format!("line {i}\r\n")).collect();
+        emu.feed(output.as_bytes());
+        emu.feed("switch# café".as_bytes());
+        emu.scroll_to(5);
+        drop(emu);
+        harness.run_ok();
+        harness
+    }
+
+    fn open_context_menu(harness: &mut Harness<'_, ContextMenuTest>) {
+        harness
+            .get_by_label("Terminal output")
+            .click_button_modifiers(egui::PointerButton::Secondary, egui::Modifiers::CTRL);
+        harness.run_ok();
+        harness.get_by_label("Save output to text file…");
+    }
+
+    #[test]
+    fn ctrl_right_click_copies_and_exports_history_and_selection_without_pasting() {
+        let mut harness = context_harness();
+        let text = format!("{}switch# café", (0..80).map(|i| format!("line {i}\n")).collect::<String>());
+        open_context_menu(&mut harness);
+        assert!(harness.state().requests.is_empty(), "opening the menu also pasted");
+        assert!(harness.get_by_label("Copy").accesskit_node().is_disabled());
+        assert!(harness.get_by_label("Save selection to text file…").accesskit_node().is_disabled());
+        harness.get_by_label("Copy all").click();
+        harness.run_ok();
+        assert_eq!(harness.state().requests.last().unwrap().copy.as_deref(), Some(text.as_str()));
+        assert!(!harness.state().requests.last().unwrap().paste_requested);
+        assert_eq!(harness.state().session.shared.emulator.lock().display_offset(), 5);
+        assert!(!harness.state().session.shared.emulator.lock().has_selection());
+
+        open_context_menu(&mut harness);
+        harness.get_by_label("Save output to text file…").click();
+        harness.run_ok();
+        assert!(
+            matches!(harness.state().requests.last().unwrap().text_export.as_ref(), Some(TextExport::Save(saved)) if saved == &text)
+        );
+        // The export is a snapshot: subsequent device output cannot alter it.
+        harness.state().session.shared.emulator.lock().feed(b" new output");
+        assert!(
+            matches!(harness.state().requests.last().unwrap().text_export.as_ref(), Some(TextExport::Save(saved)) if saved == &text)
+        );
+
+        {
+            let mut emu = harness.state().session.shared.emulator.lock();
+            let point = emu.cursor();
+            emu.start_selection(point, Side::Left, true);
+        }
+        let selected = "switch# café new output";
+        open_context_menu(&mut harness);
+        harness.get_by_label("Copy").click();
+        harness.run_ok();
+        assert_eq!(harness.state().requests.last().unwrap().copy.as_deref(), Some(selected));
+        open_context_menu(&mut harness);
+        harness.get_by_label("Save selection to text file…").click();
+        harness.run_ok();
+        assert!(
+            matches!(harness.state().requests.last().unwrap().text_export.as_ref(), Some(TextExport::Save(saved)) if saved == selected)
+        );
+        open_context_menu(&mut harness);
+        harness.get_by_label("Append to text file…").click();
+        harness.run_ok();
+        assert!(
+            matches!(harness.state().requests.last().unwrap().text_export.as_ref(), Some(TextExport::Append(saved)) if saved == selected)
+        );
+        open_context_menu(&mut harness);
+        harness.get_by_label("Clear selection").click();
+        harness.run_ok();
+        assert!(!harness.state().session.shared.emulator.lock().has_selection());
+        open_context_menu(&mut harness);
+        harness.get_by_label("Append to text file…").click();
+        harness.run_ok();
+        assert!(
+            matches!(harness.state().requests.last().unwrap().text_export.as_ref(), Some(TextExport::Append(saved)) if saved == &(text.clone() + " new output"))
+        );
+        open_context_menu(&mut harness);
+        harness.get_by_label("Select all").click();
+        harness.run_ok();
+        assert_eq!(harness.state().session.shared.emulator.lock().selection_text().unwrap(), text + " new output");
+        open_context_menu(&mut harness);
+        harness.get_by_label("Scroll to bottom").click();
+        harness.run_ok();
+        assert_eq!(harness.state().session.shared.emulator.lock().display_offset(), 0);
+    }
+
+    #[test]
+    fn context_menu_paste_and_plain_right_click_request_paste() {
+        let mut harness = context_harness();
+        harness.get_by_label("Terminal output").click_secondary();
+        harness.run_ok();
+        assert!(harness.state().requests.last().unwrap().paste_requested);
+        assert!(harness.query_by_label("Save output to text file…").is_none());
+        harness.state_mut().requests.clear();
+        open_context_menu(&mut harness);
+        assert!(harness.state().requests.is_empty());
+        harness.get_by_label("Paste").click();
+        harness.run_ok();
+        assert!(harness.state().requests.last().unwrap().paste_requested);
     }
 
     #[test]

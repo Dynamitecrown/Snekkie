@@ -92,6 +92,9 @@ pub fn validate(profile: &Profile) -> Result<(), String> {
 pub struct Sidebar {
     /// The form's contents.
     pub draft: Profile,
+    /// The destination that the form's saved name belongs to. Editing a
+    /// host, protocol, network port or serial device starts a new name.
+    name_destination: Option<(Kind, String, u16)>,
     page: Page,
     ports: Vec<PortInfo>,
     /// Devices typed in via "Other…" this run.
@@ -111,6 +114,7 @@ impl Sidebar {
     pub fn with_port_lister(settings: &AppSettings, list_ports: fn() -> Vec<PortInfo>) -> Self {
         let mut sidebar = Sidebar {
             draft: Profile::default(),
+            name_destination: None,
             page: Page::Network,
             ports: Vec::new(),
             custom_devices: Vec::new(),
@@ -132,6 +136,7 @@ impl Sidebar {
             ..Profile::default()
         };
         self.load(profile);
+        self.selected_saved = None;
         self.focus_host = true;
     }
 
@@ -140,6 +145,12 @@ impl Sidebar {
         self.page = Page::for_kind(profile.kind());
         self.draft = profile;
         self.refresh_ports();
+        self.name_destination = Some(destination(&self.draft));
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        self.draft.name = name;
+        self.name_destination = Some(destination(&self.draft));
     }
 
     pub fn refresh_ports(&mut self) {
@@ -179,7 +190,10 @@ impl Sidebar {
     /// The profile to connect with: the form, named sensibly.
     pub fn collect(&self) -> Profile {
         let mut profile = self.draft.clone();
-        if profile.name.trim().is_empty() || profile.name == "New session" {
+        if profile.name.trim().is_empty()
+            || profile.name == "New session"
+            || self.name_destination.as_ref() != Some(&destination(&profile))
+        {
             let kind = profile.kind();
             let host = profile.host.trim();
             profile.name = match kind {
@@ -556,7 +570,7 @@ impl Sidebar {
                 self.load(profile.clone());
             }
             if ui.add(egui::Button::new("Save…").min_size([width, 0.0].into())).clicked() {
-                actions.push(Action::Save(self.draft.clone()));
+                actions.push(Action::Save(self.collect()));
             }
             if ui.add_enabled(selected.is_some(), egui::Button::new("Delete").min_size([width, 0.0].into())).clicked()
                 && let Some(name) = selected
@@ -564,6 +578,15 @@ impl Sidebar {
                 actions.push(Action::Delete(name));
             }
         });
+    }
+}
+
+fn destination(profile: &Profile) -> (Kind, String, u16) {
+    let kind = profile.kind();
+    if kind == Kind::Serial {
+        (kind, profile.device.trim().to_string(), 0)
+    } else {
+        (kind, profile.host.trim().to_string(), profile.port)
     }
 }
 
@@ -748,5 +771,34 @@ mod tests {
         assert_eq!(sidebar.collect().name, "cs1:2003");
         sidebar.set_kind(Kind::Raw);
         assert_eq!(sidebar.collect().name, "cs1:2003");
+    }
+
+    #[test]
+    fn changing_a_loaded_destination_does_not_reuse_its_saved_name() {
+        let mut sidebar = Sidebar::with_port_lister(&AppSettings::default(), two_cables);
+        sidebar.load(Profile { name: "core".into(), host: "10.0.0.1".into(), ..Default::default() });
+        sidebar.draft.font_size = 18;
+        sidebar.draft.username = "admin".into();
+        assert_eq!(sidebar.collect().name, "core", "settings changes should keep the saved alias");
+        sidebar.draft.host = " 10.0.0.2 ".into();
+        assert_eq!(sidebar.collect().name, "10.0.0.2");
+        sidebar.draft.host = "10.0.0.1".into();
+        assert_eq!(sidebar.collect().name, "core", "returning to the saved destination restores its name");
+        sidebar.draft.port = 2222;
+        assert_eq!(sidebar.collect().name, "10.0.0.1:2222");
+        sidebar.set_kind(Kind::Telnet);
+        sidebar.draft.port = 23;
+        assert_eq!(sidebar.collect().name, "10.0.0.1");
+
+        sidebar.load(Profile {
+            name: "console".into(),
+            kind: "serial".into(),
+            device: "COM3".into(),
+            ..Default::default()
+        });
+        sidebar.draft.baud = 115200;
+        assert_eq!(sidebar.collect().name, "console");
+        sidebar.set_device("COM10".into());
+        assert_eq!(sidebar.collect().name, "COM10");
     }
 }

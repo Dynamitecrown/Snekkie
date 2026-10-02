@@ -227,29 +227,35 @@ impl Preferences {
             ui.end_row();
         });
 
-        let custom = self.settings.theme == "Custom";
+        let mut colors = self.current_colors();
+        let mut colors_changed = false;
         ui.add_space(4.0);
-        ui.add_enabled_ui(custom, |ui| {
-            egui::CollapsingHeader::new("Custom colours").default_open(true).show(ui, |ui| {
-                egui::Grid::new("custom_colors").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                    for (label, color) in [
-                        ("Text", &mut self.custom.fg),
-                        ("Background", &mut self.custom.bg),
-                        ("Cursor", &mut self.custom.cursor),
-                        ("Selection", &mut self.custom.selection),
-                    ] {
-                        ui.label(label);
-                        color_button(ui, color);
-                        ui.end_row();
-                    }
-                });
-                if !custom {
-                    ui.label(
-                        RichText::new("Choose the Custom theme to edit these.").color(style::TEXT_SECONDARY).small(),
-                    );
+        egui::CollapsingHeader::new("Theme colours").default_open(true).show(ui, |ui| {
+            egui::Grid::new("custom_colors").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                for (label, color) in [
+                    ("Text", &mut colors.fg),
+                    ("Background", &mut colors.bg),
+                    ("Cursor", &mut colors.cursor),
+                    ("Selection", &mut colors.selection),
+                ] {
+                    let label_id = ui.label(label).id;
+                    colors_changed |= ui.horizontal(|ui| color_button(ui, color, label_id)).inner;
+                    ui.end_row();
                 }
             });
+            ui.label(
+                RichText::new("Adjust these colours, then use Save as… to name your theme.")
+                    .color(style::TEXT_SECONDARY)
+                    .small(),
+            );
         });
+        if colors_changed {
+            // Seed the Custom draft with the entire selected palette, including
+            // every colour the user left unchanged. Presets and saved themes
+            // keep their original colours until explicitly saved under a name.
+            self.custom = colors;
+            self.settings.theme = "Custom".into();
+        }
 
         ui.add_space(6.0);
         egui::Grid::new("prefs_defaults").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
@@ -366,12 +372,14 @@ fn style_row<K: AnimationKind>(ui: &mut Ui, label: &str, value: &mut K) {
     ui.end_row();
 }
 
-fn color_button(ui: &mut Ui, color: &mut Color32) {
+fn color_button(ui: &mut Ui, color: &mut Color32, label_id: egui::Id) -> bool {
     let mut rgb = [color.r(), color.g(), color.b()];
-    if ui.color_edit_button_srgb(&mut rgb).changed() {
+    let changed = ui.color_edit_button_srgb(&mut rgb).labelled_by(label_id).changed();
+    if changed {
         *color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
     }
     ui.label(RichText::new(settings::to_hex(*color)).monospace().color(style::TEXT_SECONDARY));
+    changed
 }
 
 #[cfg(test)]

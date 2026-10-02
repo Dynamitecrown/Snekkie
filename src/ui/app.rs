@@ -2,7 +2,8 @@
 //! them.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::{
@@ -15,7 +16,7 @@ use super::fonts::{self, Fonts};
 use super::preferences::{self, Preferences};
 use super::sidebar::{self, Sidebar};
 use super::style;
-use super::terminal_view::{TerminalView, ViewOptions};
+use super::terminal_view::{TerminalView, TextExport, ViewOptions};
 use super::updater::{self, Updater};
 use crate::profiles::{Auth, Kind, Profile, ProfileStore};
 use crate::session::{ConnectContext, NoticeLevel, Session, State};
@@ -38,6 +39,7 @@ Ctrl+Q          Quit
 
 Ctrl+Shift+C    Copy      (selecting also copies)
 Ctrl+Shift+V    Paste     (right-click also pastes)
+Ctrl+Right-click  Terminal context menu (copy, save text, selection)
 Shift+PgUp/Dn   Scroll back through history
 Ctrl+Shift+L    Clear screen and scrollback
 Ctrl+Shift+B    Send break (serial, telnet)
@@ -248,6 +250,18 @@ impl SnekkieApp {
             self.clipboard = arboard::Clipboard::new().ok();
         }
         self.clipboard.as_mut()?.get_text().ok()
+    }
+
+    fn finish_text_export(&mut self, ctx: &egui::Context, path: Option<PathBuf>, export: TextExport) {
+        let Some(path) = path else { return };
+        let (result, verb) = match export {
+            TextExport::Save(text) => (std::fs::write(&path, text), "Saved terminal text to"),
+            TextExport::Append(text) => (append_terminal_text(&path, &text), "Appended terminal text to"),
+        };
+        match result {
+            Ok(()) => self.flash(ctx, format!("{verb} {}", path.display())),
+            Err(e) => self.message("Save terminal output", format!("Could not save {}: {e}", path.display())),
+        }
     }
 
     fn host_key_asker(&self, ctx: &egui::Context) -> HostKeyAsker {
@@ -759,8 +773,7 @@ impl SnekkieApp {
             match action {
                 sidebar::Action::Connect(profile) => self.request_connect(&ctx, profile, Target::NewTab),
                 sidebar::Action::Save(profile) => {
-                    let suggested =
-                        if profile.name == "New session" { self.sidebar.collect().name } else { profile.name.clone() };
+                    let suggested = profile.name.clone();
                     self.input("Save session", "Name:", suggested, false, InputAction::SaveSession(Box::new(profile)));
                 }
                 sidebar::Action::Delete(name) => {
@@ -815,22 +828,34 @@ impl SnekkieApp {
                         State::Closed(_) => Color32::from_rgb(0xa0, 0x40, 0x40),
                     };
                     let id = tab.session.id;
-                    let inner = Frame::new().inner_margin(Margin::symmetric(10, 5)).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            let (dot_rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                            ui.painter().circle_filled(dot_rect.center(), 3.5, dot);
-                            ui.label(RichText::new(tab.session.title()).color(color));
-                            let close = ui.add(
-                                egui::Button::new(RichText::new("×").color(style::TEXT_SECONDARY)).frame(false).small(),
-                            );
-                            if close.on_hover_text("Close tab").clicked() {
-                                action = Some((id, TabAction::Close));
-                            }
-                        });
-                    });
-                    let rect = inner.response.rect;
-                    let response = ui.interact(rect, Id::new(("tab", id)), Sense::click_and_drag());
+                    // Register the tab behind its contents so the close button
+                    // receives clicks instead of the selection/drag area.
+                    let inner = ui.scope_builder(
+                        egui::UiBuilder::new().id(Id::new(("tab", id))).sense(Sense::click_and_drag()),
+                        |ui| {
+                            Frame::new().inner_margin(Margin::symmetric(10, 5)).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    let (dot_rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                                    ui.painter().circle_filled(dot_rect.center(), 3.5, dot);
+                                    ui.add(
+                                        egui::Label::new(RichText::new(tab.session.title()).color(color))
+                                            .selectable(false),
+                                    );
+                                    let close = ui.add(
+                                        egui::Button::new(RichText::new("×").color(style::TEXT_SECONDARY))
+                                            .frame(false)
+                                            .small(),
+                                    );
+                                    if close.on_hover_text("Close tab").clicked() {
+                                        action = Some((id, TabAction::Close));
+                                    }
+                                });
+                            });
+                        },
+                    );
+                    let response = inner.response;
+                    let rect = response.rect;
                     if selected {
                         ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(2.0, self.accent));
                     } else if response.hovered() {
@@ -980,6 +1005,16 @@ impl SnekkieApp {
             && let Some(text) = self.clipboard_text()
         {
             self.tabs[self.active].session.write(keys::encode_paste(&text));
+        }
+        if let Some(export) = out.text_export {
+            let picker = rfd::FileDialog::new().add_filter("Text files", &["txt"]);
+            let path = match &export {
+                TextExport::Save(_) => {
+                    picker.set_title("Save terminal output").set_file_name("terminal-output.txt").save_file()
+                }
+                TextExport::Append(_) => picker.set_title("Append terminal text to existing file").pick_file(),
+            };
+            self.finish_text_export(&ctx, path, export);
         }
     }
 
@@ -1166,7 +1201,7 @@ impl SnekkieApp {
                         return;
                     }
                     profile.name = name.to_string();
-                    self.sidebar.draft.name = profile.name.clone();
+                    self.sidebar.set_name(profile.name.clone());
                     if let Err(e) = self.store.put(*profile) {
                         self.message("Save session", format!("Could not save sessions: {e}"));
                     }
@@ -1349,6 +1384,24 @@ fn update_summary(release: &Release) -> String {
     format!("Snekkie {} is available. You have {}.", release.version, update::CURRENT_VERSION)
 }
 
+/// Preserve the existing file byte-for-byte, adding a separator only if
+/// needed. No create/truncate: append always targets an existing file.
+fn append_terminal_text(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new().read(true).append(true).open(path)?;
+    if text.is_empty() {
+        return Ok(());
+    }
+    if file.metadata()?.len() != 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
+    file.write_all(text.as_bytes())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabAction {
     Select,
@@ -1381,6 +1434,50 @@ impl eframe::App for SnekkieApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_export_writes_utf8_and_reports_errors_but_cancel_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = SnekkieApp::with_port_lister(paths, Vec::new);
+        let ctx = egui::Context::default();
+        app.finish_text_export(&ctx, None, TextExport::Save("cancelled".into()));
+        app.finish_text_export(&ctx, None, TextExport::Append("cancelled".into()));
+        assert!(app.flash.is_none() && app.dialogs.is_empty());
+        let path = dir.path().join("output.txt");
+        let text = "show run\ninterface GigabitEthernet0/1\n description café 界\n";
+        app.finish_text_export(&ctx, Some(path.clone()), TextExport::Save(text.into()));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), text);
+        assert!(app.flash.as_ref().unwrap().0.starts_with("Saved terminal text to "));
+        app.flash = None;
+        app.finish_text_export(&ctx, Some(dir.path().to_path_buf()), TextExport::Save(text.into()));
+        assert!(app.flash.is_none());
+        assert!(app.dialog_texts()[0].starts_with("Could not save "));
+    }
+
+    #[test]
+    fn text_append_preserves_the_file_and_separates_successive_captures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output.txt");
+        for (old, expected) in [
+            ("", "café 界"),
+            ("first", "first\ncafé 界"),
+            ("first\n", "first\ncafé 界"),
+            ("first\r\n", "first\r\ncafé 界"),
+        ] {
+            std::fs::write(&path, old).unwrap();
+            append_terminal_text(&path, "café 界").unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+            append_terminal_text(&path, "next capture").unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{expected}\nnext capture"));
+            append_terminal_text(&path, "").unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{expected}\nnext capture"));
+        }
+        let missing = dir.path().join("missing.txt");
+        assert!(append_terminal_text(&missing, "text").is_err());
+        assert!(!missing.exists());
+        assert!(append_terminal_text(dir.path(), "text").is_err());
+    }
 
     /// One frame of the whole app at `now`, as the window would draw it.
     fn draw(app: &mut SnekkieApp, ctx: &egui::Context, now: f64) {
