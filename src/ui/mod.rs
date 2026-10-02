@@ -1,5 +1,7 @@
 //! The egui front end.
 
+pub mod animation;
+pub mod animation_preview;
 pub mod app;
 pub mod fonts;
 pub mod preferences;

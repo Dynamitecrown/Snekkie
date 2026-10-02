@@ -130,6 +130,11 @@ pub struct AppSettings {
     /// Ask GitHub for a newer release each time Snekkie starts.
     #[serde(deserialize_with = "lenient")]
     pub check_for_updates: bool,
+    /// Automatically press Space at paging prompts during show commands.
+    #[serde(deserialize_with = "lenient")]
+    pub auto_paging: bool,
+    #[serde(deserialize_with = "lenient")]
+    pub animations: Animations,
 }
 
 impl Default for AppSettings {
@@ -146,6 +151,211 @@ impl Default for AppSettings {
             scrollback: 5000,
             show_sidebar: true,
             check_for_updates: true,
+            auto_paging: false,
+            animations: Animations::default(),
+        }
+    }
+}
+
+/// Declares one kind of animation: its styles, each with the name stored in
+/// settings.json, the label Preferences shows and a line of hover help. An
+/// unknown name in the file falls back to the default style.
+macro_rules! animation_kind {
+    (
+        $(#[$meta:meta])*
+        $name:ident, default $default:ident,
+        { $($variant:ident = $key:literal, $label:literal, $help:literal;)+ }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        pub enum $name {
+            $(#[serde(rename = $key)] $variant,)+
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                $name::$default
+            }
+        }
+
+        impl $name {
+            pub const ALL: &[$name] = &[$($name::$variant),+];
+
+            pub fn label(self) -> &'static str {
+                match self {
+                    $($name::$variant => $label,)+
+                }
+            }
+
+            pub fn help(self) -> &'static str {
+                match self {
+                    $($name::$variant => $help,)+
+                }
+            }
+        }
+    };
+}
+
+animation_kind! {
+    /// How the cursor gets from one cell to the next.
+    CursorMotion, default Glide, {
+        Off = "off", "Off", "The cursor jumps straight to its new cell.";
+        Glide = "glide", "Glide", "The cursor slides to its new cell and eases to a stop.";
+        Spring = "spring", "Spring", "The cursor springs to its new cell, overshooting a little before settling.";
+        Smear = "smear", "Smear", "The cursor stretches toward its new cell and its tail catches up.";
+        Ghost = "ghost", "Ghost", "The cursor jumps, leaving fading afterimages along the way it went.";
+    }
+}
+
+animation_kind! {
+    /// How the cursor blinks while the terminal has the keyboard.
+    CursorBlink, default Fade, {
+        Classic = "classic", "Classic", "The cursor switches on and off, as it does with animations off.";
+        Fade = "fade", "Fade", "The cursor fades out and back in.";
+        Pulse = "pulse", "Pulse", "The cursor dims and brightens without ever disappearing.";
+        Glow = "glow", "Glow", "The cursor stays on, with a soft halo that swells and fades around it.";
+    }
+}
+
+animation_kind! {
+    /// What a character you type does when it lands on the screen.
+    TypedText, default Pop, {
+        Off = "off", "Off", "Typed characters appear as they are.";
+        Pop = "pop", "Pop", "Each character pops in a little larger, in the cursor colour, then settles.";
+        Bounce = "bounce", "Bounce", "Each character drops into place with a small bounce.";
+        Flash = "flash", "Flash", "The cell behind each character flashes the cursor colour and fades.";
+        Fade = "fade", "Fade", "Each character fades in.";
+    }
+}
+
+animation_kind! {
+    /// Particles thrown off the cursor on each keystroke.
+    KeystrokeBurst, default Sparks, {
+        Off = "off", "Off", "Nothing comes off the cursor.";
+        Sparks = "sparks", "Sparks", "A spray of sparks in the cursor colour that fall away.";
+        Confetti = "confetti", "Confetti", "A pinch of colourful confetti that tumbles down.";
+        Embers = "embers", "Embers", "Warm embers that drift upward and die out.";
+        Bubbles = "bubbles", "Bubbles", "Small bubbles that float up and fade.";
+        Stars = "stars", "Stars", "A few twinkling stars that scatter outward.";
+        Ripple = "ripple", "Ripple", "A ring that spreads out from the cursor.";
+    }
+}
+
+animation_kind! {
+    /// A jolt of the whole terminal on each keystroke.
+    Shake, default Off, {
+        Off = "off", "Off", "The terminal stays still.";
+        Gentle = "gentle", "Gentle", "The terminal nudges a pixel or two with each keystroke.";
+        Strong = "strong", "Strong", "The terminal shakes with each keystroke.";
+    }
+}
+
+animation_kind! {
+    /// How characters arriving from the device appear.
+    NewText, default Fade, {
+        Off = "off", "Off", "New text appears as it is.";
+        Fade = "fade", "Fade", "New text fades in from the background.";
+        Rise = "rise", "Rise", "New text rises into place as it fades in.";
+        Drop = "drop", "Drop", "New text drops into place as it fades in.";
+        Zoom = "zoom", "Zoom", "New text grows from small to full size.";
+        Decode = "decode", "Decode", "New text flickers through random symbols before settling, like decrypting.";
+        Heat = "heat", "Heat", "New text arrives in the cursor colour and cools to its own colour.";
+    }
+}
+
+animation_kind! {
+    /// Whether output is held back to be drawn a piece at a time. Big bursts
+    /// always catch up quickly, so you're never left waiting.
+    Reveal, default Instant, {
+        Instant = "instant", "Instant", "Output is drawn the moment it arrives.";
+        Typewriter = "typewriter", "Typewriter", "Output is typed out a character at a time.";
+        Words = "words", "Word by word", "Output appears a word at a time.";
+        Lines = "lines", "Line by line", "Output appears a line at a time.";
+    }
+}
+
+animation_kind! {
+    /// How the screen moves when new lines push it up, or when you scroll.
+    Scrolling, default Smooth, {
+        Off = "off", "Off", "The screen jumps a whole line at a time.";
+        Smooth = "smooth", "Smooth", "The screen glides up and eases to a stop.";
+        Float = "float", "Float", "The screen drifts more slowly, easing in and out.";
+        Spring = "spring", "Spring", "The screen springs into place, overshooting a little.";
+    }
+}
+
+animation_kind! {
+    /// A mark on each line of fresh output, so it stands out as it arrives.
+    NewLines, default Glow, {
+        Off = "off", "Off", "New lines are not marked.";
+        Glow = "glow", "Glow", "New lines get a faint glow in the cursor colour that fades away.";
+        Flash = "flash", "Flash", "New lines flash briefly.";
+        Marker = "marker", "Marker", "A bar in the margin marks new lines, then fades.";
+        Underline = "underline", "Underline", "A line sweeps under new text, then fades.";
+        Shimmer = "shimmer", "Shimmer", "A band of light passes across new lines.";
+    }
+}
+
+pub const ANIMATION_SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.0;
+
+/// Terminal animations. Off unless turned on; each kind can then be turned
+/// off on its own or given another style.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Animations {
+    #[serde(deserialize_with = "lenient")]
+    pub enabled: bool,
+    /// Pace of every animation: 2.0 plays them twice as fast.
+    #[serde(deserialize_with = "lenient")]
+    pub speed: f32,
+    // Typing.
+    #[serde(deserialize_with = "lenient")]
+    pub cursor_motion: CursorMotion,
+    #[serde(deserialize_with = "lenient")]
+    pub cursor_blink: CursorBlink,
+    #[serde(deserialize_with = "lenient")]
+    pub typed_text: TypedText,
+    #[serde(deserialize_with = "lenient")]
+    pub keystroke_burst: KeystrokeBurst,
+    #[serde(deserialize_with = "lenient")]
+    pub shake: Shake,
+    // Output.
+    #[serde(deserialize_with = "lenient")]
+    pub new_text: NewText,
+    #[serde(deserialize_with = "lenient")]
+    pub reveal: Reveal,
+    #[serde(deserialize_with = "lenient")]
+    pub scrolling: Scrolling,
+    #[serde(deserialize_with = "lenient")]
+    pub new_lines: NewLines,
+}
+
+impl Default for Animations {
+    fn default() -> Self {
+        Animations {
+            enabled: false,
+            speed: 1.0,
+            cursor_motion: CursorMotion::default(),
+            cursor_blink: CursorBlink::default(),
+            typed_text: TypedText::default(),
+            keystroke_burst: KeystrokeBurst::default(),
+            shake: Shake::default(),
+            new_text: NewText::default(),
+            reveal: Reveal::default(),
+            scrolling: Scrolling::default(),
+            new_lines: NewLines::default(),
+        }
+    }
+}
+
+impl Animations {
+    /// The speed, kept within the range Preferences offers. A hand-edited
+    /// or unreadable value plays at normal speed.
+    pub fn pace(&self) -> f32 {
+        if self.speed.is_finite() && self.speed > 0.0 {
+            self.speed.clamp(*ANIMATION_SPEED_RANGE.start(), *ANIMATION_SPEED_RANGE.end())
+        } else {
+            1.0
         }
     }
 }
@@ -242,6 +452,7 @@ impl SettingsStore {
         if settings.theme.is_empty() {
             settings.theme = DEFAULT_THEME.into();
         }
+        settings.animations.speed = settings.animations.pace();
         settings
     }
 
@@ -320,6 +531,89 @@ mod tests {
         settings.set_custom_theme(theme);
         store.save(&settings).unwrap();
         assert_eq!(store.load().colors(), theme);
+    }
+
+    #[test]
+    fn animations_are_off_until_turned_on() {
+        let settings = load(r#"{"theme": "Monokai"}"#);
+        assert!(!settings.animations.enabled);
+        assert_eq!(settings.animations, Animations::default());
+        assert_eq!(settings.animations.speed, 1.0);
+    }
+
+    #[test]
+    fn automatic_paging_defaults_off_and_round_trips() {
+        for json in ["{}", r#"{"auto_paging": "yes"}"#, r#"{"auto_paging": null}"#] {
+            assert!(!load(json).auto_paging);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path().join("settings.json"));
+        let mut settings = AppSettings { auto_paging: true, ..AppSettings::default() };
+        store.save(&settings).unwrap();
+        assert!(store.load().auto_paging);
+        settings.auto_paging = false;
+        store.save(&settings).unwrap();
+        assert!(!store.load().auto_paging);
+    }
+
+    #[test]
+    fn animation_choices_round_trip_and_bad_ones_fall_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path().join("settings.json"));
+        let settings = AppSettings {
+            animations: Animations {
+                enabled: true,
+                speed: 1.5,
+                cursor_motion: CursorMotion::Smear,
+                reveal: Reveal::Typewriter,
+                new_lines: NewLines::Off,
+                ..Animations::default()
+            },
+            ..AppSettings::default()
+        };
+        store.save(&settings).unwrap();
+        let text = fs::read_to_string(&store.path).unwrap();
+        assert!(text.contains(r#""cursor_motion": "smear""#), "{text}");
+        assert_eq!(store.load(), settings);
+
+        let settings = load(
+            r#"{"animations": {"enabled": true, "speed": "fast", "cursor_motion": "warp",
+                "keystroke_burst": "confetti", "scrolling": 7}}"#,
+        );
+        let animations = settings.animations;
+        assert!(animations.enabled);
+        assert_eq!(animations.speed, 1.0);
+        assert_eq!(animations.cursor_motion, CursorMotion::default());
+        assert_eq!(animations.keystroke_burst, KeystrokeBurst::Confetti);
+        assert_eq!(animations.scrolling, Scrolling::default());
+
+        let animations = load(r#"{"animations": "yes please"}"#).animations;
+        assert_eq!(animations, Animations::default());
+    }
+
+    #[test]
+    fn animation_speed_stays_in_range() {
+        for (stored, expected) in [(0.0, 1.0), (-3.0, 1.0), (0.1, 0.5), (9.0, 2.0), (1.25, 1.25)] {
+            let animations = Animations { speed: stored, ..Animations::default() };
+            assert_eq!(animations.pace(), expected, "stored {stored}");
+        }
+        assert_eq!(Animations { speed: f32::NAN, ..Animations::default() }.pace(), 1.0);
+        assert_eq!(load(r#"{"animations": {"speed": 40}}"#).animations.speed, 2.0);
+    }
+
+    #[test]
+    fn every_animation_kind_lists_its_default() {
+        assert!(CursorMotion::ALL.contains(&CursorMotion::default()));
+        assert!(CursorBlink::ALL.contains(&CursorBlink::default()));
+        assert!(TypedText::ALL.contains(&TypedText::default()));
+        assert!(KeystrokeBurst::ALL.contains(&KeystrokeBurst::default()));
+        assert!(Shake::ALL.contains(&Shake::default()));
+        assert!(NewText::ALL.contains(&NewText::default()));
+        assert!(Reveal::ALL.contains(&Reveal::default()));
+        assert!(Scrolling::ALL.contains(&Scrolling::default()));
+        assert!(NewLines::ALL.contains(&NewLines::default()));
+        assert_eq!(Reveal::default(), Reveal::Instant);
+        assert_eq!(Shake::default(), Shake::Off);
     }
 
     #[test]

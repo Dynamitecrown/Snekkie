@@ -6,11 +6,14 @@ A clean, tabbed SSH and serial terminal — a lightweight, readable alternative 
 
 Version 2 is a ground-up rewrite in Rust of the original Python app. It installs with a normal Windows installer, upgrades in place, starts instantly, and needs nothing else on the machine.
 
+**New in 2.4.0:** Optional typing and output animations, automatic paging for all `show` commands, and hover switching between top menus. See the [complete 2.4.0 release notes](docs/releases/2.4.0.md).
+
 ---
 
 ## Features
 
 - **Integrated layout:** Permanent sidebar for quick-connect and saved sessions; no popup dialogs to get in the way.
+- **Menus:** Click a top menu, then hover over Session, Edit, Terminal, View, Settings or Help to switch without another click. Escape or clicking outside closes the menu.
 - **SSH:** Password (including keyboard-interactive, as most network gear uses), private key, and SSH agent (Pageant or the Windows OpenSSH agent) auth, with `known_hosts` verification. Older gear that only speaks SHA-1 key exchange, CBC ciphers or `ssh-rsa` host keys still connects; modern algorithms are always preferred.
 - **Telnet & raw TCP:** For older gear, lab consoles (GNS3, EVE-NG) and console servers. Telnet negotiates window size and terminal type, and sends break through to the device's console line; raw TCP passes bytes through untouched.
 - **Keepalives:** Idle SSH, telnet and raw sessions send a keepalive every 60 seconds (adjustable per session, or off) so firewalls don't drop them, and an SSH session whose server stops answering is closed with a clear reason instead of hanging.
@@ -18,7 +21,9 @@ Version 2 is a ground-up rewrite in Rust of the original Python app. It installs
 - **Tabs & profiles:** Multi-tab sessions (reconnect, duplicate, drag to reorder) and zero-secret JSON profiles. Connecting happens in the background, so a slow or dead host never freezes the window.
 - **VT100 / truecolor:** Full 24-bit colour, ANSI styles, cursor addressing, and smooth scrollback (works with `htop`, `nano`, `vim`). Terminal emulation is [alacritty_terminal](https://crates.io/crates/alacritty_terminal), the engine inside the Alacritty terminal.
 - **Terminal UX:** PuTTY-style copy-on-select / right-click paste, multi-screen drag selection, and raw byte session logging. Per session, local echo (automatic for telnet devices that don't echo) and a Backspace that sends DEL or Ctrl+H for older consoles.
+- **Automatic paging:** Off by default. Enable **Terminal → Auto-page show commands** or the checkbox in **Settings → Preferences** to advance all `show` commands (including `sh`/`sho` and `do show`) at Cisco IOS `--More--` and ASA `<--- More --->` prompts. Sends one Space per page across SSH, serial, telnet and raw TCP; `q`, Ctrl+C or turning the toggle off stops it. The choice is saved and applies to open and new tabs.
 - **Syntax highlighting:** Live keyword, IP and prompt colouring (e.g. Cisco IOS).
+- **Animations:** Off by default. Turn them on in **Settings → Preferences → Animations**, then pick a style for each kind, or Off, while a live preview plays: cursor movement (glide, spring, smear, ghost), cursor blink (fade, pulse, glow), typed characters (pop, bounce, flash, fade), keystroke bursts (sparks, confetti, embers, bubbles, stars, ripple) and screen shake as you type; new text (fade, rise, drop, zoom, decode, heat), typewriter, word or line reveal, scrolling (smooth, float, spring) and new-line marks (glow, flash, marker, underline, shimmer) as output arrives. One speed setting paces everything except the cursor blink. Full-screen apps such as `vim` and `htop` skip the output animations, and output is never held back more than half a second at normal speed (a second at the slowest).
 - **Updates:** Checks for a new release each time it starts, and shows **Update to x.y.z** in the menu bar when there is one. One click downloads it, checks it, installs it and restarts Snekkie.
 
 ---
@@ -61,8 +66,8 @@ Download `Snekkie-Setup-<version>.exe` and run it.
 - **Uninstalling:** from *Apps & features*. Saved sessions and settings (`%APPDATA%\snekkie`) are left in place, so reinstalling later picks up where you left off.
 - **Rolling out to several machines:** the installer runs unattended with `/S`:
   ```
-  Snekkie-Setup-2.3.0.exe /S                 install or upgrade silently
-  Snekkie-Setup-2.3.0.exe /S /D=C:\Tools\Snekkie   first install into a specific folder
+  Snekkie-Setup-2.4.0.exe /S                 install or upgrade silently
+  Snekkie-Setup-2.4.0.exe /S /D=C:\Tools\Snekkie   first install into a specific folder
   "%LOCALAPPDATA%\Programs\Snekkie\uninstall.exe" /S
   ```
   A silent upgrade exits with code 5 if Snekkie is running, and refuses to downgrade.
@@ -123,14 +128,14 @@ On Windows, `build-windows.bat` builds `target\release\snekkie.exe` and, if [NSI
 
 ### Releasing a new version
 
-1. Bump `version` in `Cargo.toml` and commit.
-2. Tag it and push the tag:
+1. Bump `version` in `Cargo.toml`, refresh `Cargo.lock` with Cargo, and write the complete release notes in `docs/releases/<version>.md`.
+2. Commit the changes, then tag and push them:
    ```bash
-   git tag -a v2.0.1 -m "Snekkie 2.0.1"
-   git push origin v2.0.1
+   git tag -a v2.4.0 -m "Snekkie 2.4.0"
+   git push --atomic origin main v2.4.0
    ```
 
-CI then tests everything, builds the Windows installer, portable exe and Linux tarball, and publishes them as a GitHub release. It refuses to build a tag that doesn't match `Cargo.toml`, so an installer can never report the wrong version. A tag with a suffix, such as `v2.1.0-beta.1`, is published as a pre-release, which is handy for trying a build with one user before everyone gets it.
+CI then tests everything, builds the Windows installer, portable exe and Linux tarball, and publishes them as a GitHub release with the version's release notes. If no notes file exists, it uses GitHub's generated notes. It refuses to build a tag that doesn't match `Cargo.toml`, so an installer can never report the wrong version. A tag with a suffix, such as `v2.1.0-beta.1`, is published as a pre-release, which is handy for trying a build with one user before everyone gets it.
 
 Once a full release is published, every copy of Snekkie offers it the next time it starts. The in-app update looks for the installer by its name, `Snekkie-Setup-<version>.exe`, so keep that name.
 

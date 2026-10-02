@@ -16,6 +16,7 @@ use crate::profiles::{Kind, Profile};
 use crate::settings::Theme;
 use crate::terminal::emulator::{Emulator, Responder};
 use crate::terminal::keys;
+use crate::terminal::paging::{AutoPager, PROMPT_WAIT};
 use crate::transport::ssh::{Credentials, HostKeyAsker};
 use crate::transport::{Command, Link, Sink, serial, ssh, tcp};
 
@@ -48,6 +49,7 @@ pub struct Shared {
     notices: Mutex<Vec<Notice>>,
     /// The far end has agreed to echo what's typed (telnet only).
     remote_echo: AtomicBool,
+    pager: Mutex<AutoPager>,
     /// Bumped on every (re)connect, so a worker from a previous connection
     /// can't write into the new one.
     generation: AtomicU64,
@@ -78,6 +80,8 @@ impl Shared {
 struct SessionSink {
     shared: Arc<Shared>,
     generation: u64,
+    link: Arc<Mutex<Option<Link>>>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl Sink for SessionSink {
@@ -91,6 +95,26 @@ impl Sink for SessionSink {
     fn data(&self, bytes: &[u8]) {
         if self.shared.is_current(self.generation) {
             self.shared.show(bytes);
+            let alt_screen = self.shared.emulator.lock().alt_screen();
+            let ticket = self.shared.pager.lock().received(bytes, alt_screen);
+            if let Some(ticket) = ticket {
+                let shared = self.shared.clone();
+                let link = self.link.clone();
+                let generation = self.generation;
+                self.runtime.spawn(async move {
+                    tokio::time::sleep(PROMPT_WAIT).await;
+                    let mut pager = shared.pager.lock();
+                    let link = link.lock();
+                    if shared.is_current(generation)
+                        && *shared.state.lock() == State::Connected
+                        && let Some(link) = link.as_ref()
+                        && pager.advance(ticket)
+                    {
+                        // A pager response isn't typing or local echo.
+                        link.write(vec![b' ']);
+                    }
+                });
+            }
         }
     }
 
@@ -98,6 +122,7 @@ impl Sink for SessionSink {
         if !self.shared.is_current(self.generation) {
             return;
         }
+        self.shared.pager.lock().reset();
         let mut state = self.shared.state.lock();
         if !matches!(*state, State::Closed(_)) {
             *state = State::Closed(reason);
@@ -158,6 +183,7 @@ impl Session {
             log: Mutex::new(None),
             notices: Mutex::new(Vec::new()),
             remote_echo: AtomicBool::new(false),
+            pager: Mutex::new(AutoPager::default()),
             generation: AtomicU64::new(0),
             repaint: Box::new(repaint),
         });
@@ -166,6 +192,7 @@ impl Session {
 
     /// Start (or restart) the connection.
     pub fn connect(&mut self, cx: ConnectContext<'_>) {
+        self.shared.pager.lock().reset();
         if let Some(old) = self.link.lock().take() {
             old.send(Command::Close);
         }
@@ -174,7 +201,12 @@ impl Session {
         self.shared.remote_echo.store(false, Ordering::SeqCst);
         self.open_log();
 
-        let sink: Arc<dyn Sink> = Arc::new(SessionSink { shared: self.shared.clone(), generation });
+        let sink: Arc<dyn Sink> = Arc::new(SessionSink {
+            shared: self.shared.clone(),
+            generation,
+            link: self.link.clone(),
+            runtime: cx.runtime.clone(),
+        });
         let size = {
             let emu = self.shared.emulator.lock();
             (emu.columns() as u16, emu.lines() as u16)
@@ -240,9 +272,16 @@ impl Session {
             return;
         }
         let echo = self.echoes_locally().then(|| keys::local_echo(&bytes));
+        let visible = {
+            let emu = self.shared.emulator.lock();
+            emu.cursor_line_text()
+        };
+        let mut pager = self.shared.pager.lock();
+        pager.sent(&bytes, &visible);
         if let Some(link) = self.link.lock().as_ref() {
             link.write(bytes);
         }
+        drop(pager);
         if let Some(echo) = echo.filter(|e| !e.is_empty()) {
             self.shared.show(&echo);
         }
@@ -250,6 +289,11 @@ impl Session {
 
     pub fn echoes_locally(&self) -> bool {
         self.profile.local_echo().applies(self.profile.kind(), self.shared.remote_echo.load(Ordering::SeqCst))
+    }
+
+    /// Applies immediately, including cancelling any scheduled pager reply.
+    pub fn set_auto_paging(&self, enabled: bool) {
+        self.shared.pager.lock().configure(enabled);
     }
 
     pub fn resize(&self, columns: usize, lines: usize) {
@@ -275,6 +319,7 @@ impl Session {
 
     /// Hang up. Safe to call more than once.
     pub fn shutdown(&self) {
+        self.shared.pager.lock().reset();
         if let Some(link) = self.link.lock().take() {
             link.send(Command::Close);
         }

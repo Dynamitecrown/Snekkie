@@ -4,3 +4,4 @@ pub mod colors;
 pub mod emulator;
 pub mod highlight;
 pub mod keys;
+pub mod paging;

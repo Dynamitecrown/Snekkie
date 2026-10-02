@@ -146,9 +146,39 @@ impl Emulator {
         self.term.mode().contains(TermMode::SHOW_CURSOR)
     }
 
+    /// A full-screen app (vim, nano, htop...) has the alternate screen up.
+    pub fn alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
     /// Cursor position on the live screen (not affected by scrollback).
     pub fn cursor(&self) -> Point {
         self.term.grid().cursor.point
+    }
+
+    /// The logical line being edited, including wrapped rows. Read the
+    /// live grid even if the user is looking back through the history.
+    pub fn cursor_line_text(&self) -> String {
+        use alacritty_terminal::term::cell::Flags;
+
+        let grid = self.term.grid();
+        let cursor = self.cursor().line;
+        let mut first = cursor;
+        // Device command lines are bounded; don't walk an entire history
+        // if a program has printed a very long wrapped line.
+        let limit = grid.topmost_line().max(cursor - (512 / self.columns() + 1) as i32);
+        while first > limit && grid[Line(first.0 - 1)][grid.last_column()].flags.contains(Flags::WRAPLINE) {
+            first -= 1;
+        }
+        (first.0..=cursor.0)
+            .flat_map(|row| (0..self.columns()).map(move |column| &grid[Line(row)][Column(column)]))
+            .filter(|cell| {
+                !cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN)
+            })
+            .map(|cell| cell.c)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
     }
 
     // -- scrollback -----------------------------------------------------
@@ -334,6 +364,29 @@ mod tests {
         assert!(emu.cursor_visible());
         emu.feed(b"\x1b[?25l");
         assert!(!emu.cursor_visible());
+    }
+
+    #[test]
+    fn alternate_screen_tracks_full_screen_apps() {
+        let (mut emu, _) = emulator(20, 4, 100);
+        assert!(!emu.alt_screen());
+        emu.feed(b"\x1b[?1049h");
+        assert!(emu.alt_screen());
+        emu.feed(b"\x1b[?1049l");
+        assert!(!emu.alt_screen());
+    }
+
+    #[test]
+    fn the_live_command_line_includes_wrapping_even_while_scrolled_back() {
+        let (mut emu, _) = emulator(20, 4, 100);
+        for i in 0..10 {
+            emu.feed(format!("old line {i}\r\n").as_bytes());
+        }
+        let command = "Switch#show running-config | include interface";
+        emu.feed(command.as_bytes());
+        assert_eq!(emu.cursor_line_text(), command);
+        emu.scroll_by(5);
+        assert_eq!(emu.cursor_line_text(), command);
     }
 
     fn fill(emu: &mut Emulator, count: usize) {

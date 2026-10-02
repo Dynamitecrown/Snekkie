@@ -97,6 +97,7 @@ enum Command {
     ResetTerminal,
     SendBreak,
     ToggleSidebar,
+    ToggleAutoPaging,
     Preferences,
     Shortcuts,
     CheckForUpdates,
@@ -388,6 +389,7 @@ impl SnekkieApp {
                     move || ctx.request_repaint()
                 };
                 let mut session = Session::new(pending.profile, self.settings.colors(), repaint);
+                session.set_auto_paging(self.settings.auto_paging);
                 session.connect(cx);
                 let mut view = TerminalView::default();
                 view.focus();
@@ -399,6 +401,9 @@ impl SnekkieApp {
                 let tab = &mut self.tabs[index];
                 tab.session.shutdown();
                 tab.session.shared.emulator.lock().reset();
+                // The view's animator and highlight cache still describe the old screen.
+                tab.view.clear_highlight_cache();
+                tab.view.reset_animations();
                 tab.session.connect(cx);
                 tab.view.focus();
                 self.active = index;
@@ -471,14 +476,16 @@ impl SnekkieApp {
                 }
             }
             Command::ClearScreen => {
-                if let Some(tab) = self.current() {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.session.shared.emulator.lock().clear();
+                    tab.view.reset_animations();
                 }
             }
             Command::ResetTerminal => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.session.shared.emulator.lock().reset();
                     tab.view.clear_highlight_cache();
+                    tab.view.reset_animations();
                 }
             }
             Command::SendBreak => {
@@ -488,6 +495,13 @@ impl SnekkieApp {
             }
             Command::ToggleSidebar => {
                 self.settings.show_sidebar = !self.settings.show_sidebar;
+                self.save_settings();
+            }
+            Command::ToggleAutoPaging => {
+                self.settings.auto_paging = !self.settings.auto_paging;
+                for tab in &self.tabs {
+                    tab.session.set_auto_paging(self.settings.auto_paging);
+                }
                 self.save_settings();
             }
             Command::Preferences => self.preferences = Some(Preferences::new(&self.settings)),
@@ -622,6 +636,19 @@ impl SnekkieApp {
         let saved: Vec<Profile> = self.store.profiles.clone();
         let mut open_saved: Option<Profile> = None;
         egui::MenuBar::new().ui(ui, |ui| {
+            let buttons = ["Session", "Edit", "Terminal", "View", "Settings", "Help"].map(|label| ui.button(label));
+            // Resolve hover switching before drawing any popup, so it works
+            // in either direction and only one menu is drawn per frame.
+            let menu_open = buttons
+                .iter()
+                .any(|button| egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(button)));
+            if menu_open && let Some(button) = buttons.iter().find(|button| button.hovered() && !button.clicked()) {
+                let id = egui::Popup::default_response_id(button);
+                if !egui::Popup::is_id_open(ui.ctx(), id) {
+                    egui::Popup::open_id(ui.ctx(), id);
+                }
+            }
+            let [session, edit, terminal, view, settings, help] = buttons;
             let mut item = |ui: &mut Ui, text: &str, shortcut: &str, command: Command| {
                 let mut button = egui::Button::new(text);
                 if !shortcut.is_empty() {
@@ -631,7 +658,7 @@ impl SnekkieApp {
                     commands.push(command);
                 }
             };
-            ui.menu_button("Session", |ui| {
+            egui::Popup::menu(&session).show(|ui| {
                 item(ui, "New session…", "Ctrl+Shift+N", Command::NewSession);
                 ui.menu_button("Open saved", |ui| {
                     if saved.is_empty() {
@@ -649,28 +676,35 @@ impl SnekkieApp {
                 item(ui, "Close tab", "Ctrl+W", Command::CloseTab);
                 item(ui, "Exit", "Ctrl+Q", Command::Quit);
             });
-            ui.menu_button("Edit", |ui| {
+            egui::Popup::menu(&edit).show(|ui| {
                 item(ui, "Copy", "Ctrl+Shift+C", Command::Copy);
                 item(ui, "Paste", "Ctrl+Shift+V", Command::Paste);
                 item(ui, "Select all", "Ctrl+Shift+A", Command::SelectAll);
             });
-            ui.menu_button("Terminal", |ui| {
+            egui::Popup::menu(&terminal).show(|ui| {
+                let label = if self.settings.auto_paging {
+                    "✔ Auto-page show commands"
+                } else {
+                    "   Auto-page show commands"
+                };
+                item(ui, label, "", Command::ToggleAutoPaging);
+                ui.separator();
                 item(ui, "Clear screen and scrollback", "Ctrl+Shift+L", Command::ClearScreen);
                 item(ui, "Reset terminal", "", Command::ResetTerminal);
                 ui.separator();
                 item(ui, "Send break", "Ctrl+Shift+B", Command::SendBreak);
             });
-            ui.menu_button("View", |ui| {
+            egui::Popup::menu(&view).show(|ui| {
                 let label = if self.settings.show_sidebar { "✔ Sidebar" } else { "   Sidebar" };
                 item(ui, label, "Ctrl+B", Command::ToggleSidebar);
                 ui.separator();
                 item(ui, "Next tab", "Ctrl+Tab", Command::NextTab);
                 item(ui, "Previous tab", "Ctrl+Shift+Tab", Command::PreviousTab);
             });
-            ui.menu_button("Settings", |ui| {
+            egui::Popup::menu(&settings).show(|ui| {
                 item(ui, "Preferences…", "Ctrl+,", Command::Preferences);
             });
-            ui.menu_button("Help", |ui| {
+            egui::Popup::menu(&help).show(|ui| {
                 item(ui, "Keyboard shortcuts", "", Command::Shortcuts);
                 item(ui, "Check for updates…", "", Command::CheckForUpdates);
                 item(ui, "About Snekkie", "", Command::About);
@@ -936,7 +970,8 @@ impl SnekkieApp {
             Fonts::font_ids(family.as_deref(), fonts::points_to_pixels(tab.session.profile.font_size));
         let syntax = tab.session.profile.device_syntax.clone();
         let keyboard = self.dialogs.is_empty() && self.preferences.is_none();
-        let options = ViewOptions { theme, syntax: &syntax, regular, bold, keyboard };
+        let animations = self.settings.animations;
+        let options = ViewOptions { theme, syntax: &syntax, regular, bold, keyboard, animations };
         let out = tab.view.show(ui, &tab.session, &options);
         if let Some(text) = out.copy {
             ctx.copy_text(text);
@@ -1169,7 +1204,7 @@ impl SnekkieApp {
         let monospace = self.fonts.monospace.clone();
         let mut outcome = preferences::Outcome::Open;
         let modal = egui::Modal::new(Id::new("preferences")).show(ctx, |ui| {
-            ui.set_width(460.0);
+            ui.set_width(preferences::WIDTH);
             outcome = prefs.ui(ui, &monospace);
         });
         if modal.should_close() && !blocked {
@@ -1180,6 +1215,9 @@ impl SnekkieApp {
             preferences::Outcome::Cancel => self.preferences = None,
             preferences::Outcome::Save(settings) => {
                 self.settings = AppSettings { show_sidebar: self.settings.show_sidebar, ..settings };
+                for tab in &self.tabs {
+                    tab.session.set_auto_paging(self.settings.auto_paging);
+                }
                 self.save_settings();
                 self.preferences = None;
             }
@@ -1337,5 +1375,114 @@ impl eframe::App for SnekkieApp {
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         style::BG_WINDOW.to_normalized_gamma_f32()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One frame of the whole app at `now`, as the window would draw it.
+    fn draw(app: &mut SnekkieApp, ctx: &egui::Context, now: f64) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1000.0, 640.0))),
+            time: Some(now),
+            predicted_dt: 0.0,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+        out.textures_delta.clear(); // there's no GPU to hand the font atlas to
+    }
+
+    /// Frames until `seconds` later, long enough for any animation to settle.
+    fn settle(app: &mut SnekkieApp, ctx: &egui::Context, now: &mut f64, seconds: f64) {
+        let until = *now + seconds;
+        while *now < until {
+            *now += 0.05;
+            draw(app, ctx, *now);
+        }
+    }
+
+    const ANIMATIONS_ON: &str = r#"{"animations": {"enabled": true}}"#;
+
+    /// An app started with `settings` as the text of settings.json, and one
+    /// tab. The session is on a serial port that isn't there, so it never
+    /// sends anything.
+    fn console_app(dir: &tempfile::TempDir, ctx: &egui::Context, settings: &str) -> SnekkieApp {
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        std::fs::write(&paths.settings, settings).unwrap();
+        let mut app = SnekkieApp::with_port_lister(paths, Vec::new);
+        let profile = Profile {
+            name: "console".into(),
+            kind: "serial".into(),
+            device: "no-such-port".into(),
+            ..Default::default()
+        };
+        app.open_session(ctx, profile);
+        app
+    }
+
+    /// An app with animations on and one tab that has been scrolled back
+    /// through a long history, everything drawn and still.
+    fn scrolled_back(dir: &tempfile::TempDir, ctx: &egui::Context) -> (SnekkieApp, f64) {
+        let mut app = console_app(dir, ctx, ANIMATIONS_ON);
+
+        let mut now = 1.0;
+        settle(&mut app, ctx, &mut now, 0.2);
+        let output: String = (0..200).map(|i| format!("line {i}\r\n")).collect();
+        app.tabs[0].session.shared.emulator.lock().feed(output.as_bytes());
+        settle(&mut app, ctx, &mut now, 2.0);
+        app.tabs[0].session.shared.emulator.lock().scroll_by(15);
+        settle(&mut app, ctx, &mut now, 2.0);
+
+        let tab = &app.tabs[0];
+        assert_eq!(tab.session.shared.emulator.lock().display_offset(), 15);
+        assert!(tab.view.scroll_offset(now).abs() < 1e-3, "still sliding before the test starts");
+        (app, now)
+    }
+
+    /// Whatever wipes the screen, the blank one that replaces it stays where
+    /// it is: the animator mustn't take the view jumping back from the
+    /// scrollback for the text scrolling.
+    #[test]
+    fn a_screen_wiped_while_scrolled_back_does_not_slide() {
+        for command in [Command::Reconnect, Command::ClearScreen, Command::ResetTerminal] {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = egui::Context::default();
+            let (mut app, mut now) = scrolled_back(&dir, &ctx);
+            app.run_command(&ctx, command);
+            now += 0.1;
+            draw(&mut app, &ctx, now);
+            let slide = app.tabs[0].view.scroll_offset(now);
+            assert!(slide.abs() < 1e-3, "{command:?} left the screen {slide} rows off");
+        }
+    }
+
+    /// Whether a screenful of output slides into place in the one tab of an
+    /// app started with `settings` as the text of settings.json.
+    fn output_slides(settings: &str) -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = console_app(&dir, &ctx, settings);
+        let mut now = 1.0;
+        settle(&mut app, &ctx, &mut now, 0.2);
+        let output: String = (0..60).map(|i| format!("line {i}\r\n")).collect();
+        // More than one go: the system fonts turn up from another thread at
+        // some point, which resizes the terminal and so starts its animations
+        // afresh, and output arriving in that very frame doesn't slide.
+        (0..20).any(|_| {
+            app.tabs[0].session.shared.emulator.lock().feed(output.as_bytes());
+            now += 0.3;
+            draw(&mut app, &ctx, now);
+            app.tabs[0].view.scroll_offset(now) > 0.0
+        })
+    }
+
+    /// Animations ticked in settings.json reach each tab's view: output
+    /// slides into place with them on, and never does with them off.
+    #[test]
+    fn a_tab_animates_only_when_the_saved_settings_have_animations_on() {
+        assert!(!output_slides("{}"));
+        assert!(output_slides(ANIMATIONS_ON));
     }
 }
