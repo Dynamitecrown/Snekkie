@@ -14,13 +14,16 @@ use parking_lot::Mutex;
 
 use super::fonts::{self, Fonts};
 use super::preferences::{self, Preferences};
+use super::profile_transfer::ProfileTransfer;
+use super::putty_import::PuttyImport;
 use super::sidebar::{self, Sidebar};
 use super::style;
 use super::terminal_view::{TerminalView, TextExport, ViewOptions};
 use super::updater::{self, Updater};
+use crate::network::{NetworkAccess, NetworkQuestion};
 use crate::profiles::{Auth, Kind, Profile, ProfileStore};
-use crate::session::{ConnectContext, NoticeLevel, Session, State};
-use crate::settings::{AppSettings, SettingsStore};
+use crate::session::{ConnectContext, LogStatus, NoticeLevel, Session, State};
+use crate::settings::{AppSettings, SettingsStore, Theme};
 use crate::terminal::keys;
 use crate::transport::serial::PortInfo;
 use crate::transport::ssh::{self, HostKeyAsker, HostKeyQuestion};
@@ -39,6 +42,7 @@ Ctrl+Q          Quit
 
 Ctrl+Shift+C    Copy      (selecting also copies)
 Ctrl+Shift+V    Paste     (right-click also pastes)
+Ctrl+F          Find in output (Enter: older, Shift+Enter: newer)
 Ctrl+Right-click  Terminal context menu (copy, save text, selection)
 Shift+PgUp/Dn   Scroll back through history
 Ctrl+Shift+L    Clear screen and scrollback
@@ -82,7 +86,12 @@ enum Dialog {
     Confirm { title: String, text: String, action: ConfirmAction },
     Input { title: String, label: String, text: String, secret: bool, action: InputAction, focus: bool },
     HostKey(Box<HostKeyQuestion>),
+    Network(Box<NetworkQuestion>),
     Update { release: Release, installable: bool },
+    Import(Box<PuttyImport>),
+    ProfileTransfer(Box<ProfileTransfer>),
+    TabColor { id: u64, color: Color32 },
+    ProfileColor { name: String, color: Color32, enabled: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,12 +104,16 @@ enum Command {
     Copy,
     Paste,
     SelectAll,
+    Find,
     ClearScreen,
     ResetTerminal,
     SendBreak,
     ToggleSidebar,
     ToggleAutoPaging,
     Preferences,
+    ImportPutty,
+    ImportProfiles,
+    ExportProfiles,
     Shortcuts,
     CheckForUpdates,
     ShowUpdate,
@@ -113,6 +126,9 @@ enum Command {
 struct Tab {
     session: Session,
     view: TerminalView,
+    color: Option<Color32>,
+    /// Clearing a color is an explicit override, distinct from using the default.
+    color_override: bool,
 }
 
 /// Where the app keeps its files; replaced in tests.
@@ -137,12 +153,16 @@ pub struct SnekkieApp {
     runtime: tokio::runtime::Runtime,
     fonts: Fonts,
     host_keys: Arc<Mutex<VecDeque<HostKeyQuestion>>>,
+    network_questions: Arc<Mutex<VecDeque<NetworkQuestion>>>,
+    network: NetworkAccess,
     dialogs: Vec<Dialog>,
     preferences: Option<Preferences>,
     flash: Option<(String, f64)>,
     clipboard: Option<arboard::Clipboard>,
+    folder_open: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     allow_close: bool,
     accent: Color32,
+    styled_theme: Option<Theme>,
     dragging_tab: Option<usize>,
     /// Whether the terminal had the keyboard when a dialog opened, so it
     /// can have it back when the dialog closes.
@@ -155,7 +175,7 @@ impl SnekkieApp {
         let mut app = Self::with_port_lister(paths, crate::transport::serial::list_ports);
         // Only the real app goes online by itself; tests build theirs
         // with_port_lister.
-        if app.settings.check_for_updates {
+        if app.settings.check_for_updates && !app.settings.offline_mode {
             app.updater.check_at_startup();
         }
         app
@@ -174,6 +194,8 @@ impl SnekkieApp {
             .build()
             .expect("could not start the network runtime");
         SnekkieApp {
+            network: NetworkAccess::new(settings.offline_mode, Arc::new(|_| {})),
+            network_questions: Arc::new(Mutex::new(VecDeque::new())),
             sidebar: Sidebar::with_port_lister(&settings, list_ports),
             store,
             settings_store,
@@ -187,10 +209,12 @@ impl SnekkieApp {
             preferences: None,
             flash: None,
             clipboard: None,
+            folder_open: None,
             allow_close: false,
             // Transparent never matches a theme, so the first frame applies
             // the style.
             accent: Color32::TRANSPARENT,
+            styled_theme: None,
             dragging_tab: None,
             terminal_had_focus: false,
             updater: Updater::new(),
@@ -289,6 +313,9 @@ impl SnekkieApp {
     // -- updating -------------------------------------------------------
 
     fn show_update(&mut self) {
+        if self.settings.offline_mode {
+            return;
+        }
         if let updater::Status::Available(release) = &self.updater.status {
             let installable = self.updater.can_install && release.installer.is_some();
             self.dialogs.push(Dialog::Update { release: release.clone(), installable });
@@ -314,6 +341,9 @@ impl SnekkieApp {
     }
 
     fn install_update(&mut self, ctx: &egui::Context) {
+        if self.settings.offline_mode {
+            return;
+        }
         let Some(installer) = self.updater.installer().cloned() else { return };
         match update::run_installer(&installer) {
             // The installer waits for this window to close.
@@ -323,6 +353,7 @@ impl SnekkieApp {
     }
 
     fn update_events(&mut self, ctx: &egui::Context) {
+        self.updater.set_offline(self.settings.offline_mode);
         for event in self.updater.poll(ctx) {
             match event {
                 updater::Event::UpToDate => self.message(
@@ -395,6 +426,14 @@ impl SnekkieApp {
             ask_host_key: self.host_key_asker(ctx),
             password,
             key_passphrase,
+            network: {
+                let queue = self.network_questions.clone();
+                let ctx = ctx.clone();
+                self.network.with_asker(Arc::new(move |question| {
+                    queue.lock().push_back(question);
+                    ctx.request_repaint();
+                }))
+            },
         };
         match pending.target {
             Target::NewTab => {
@@ -407,7 +446,8 @@ impl SnekkieApp {
                 session.connect(cx);
                 let mut view = TerminalView::default();
                 view.focus();
-                self.tabs.push(Tab { session, view });
+                let color = crate::settings::parse_hex(&session.profile.tab_color);
+                self.tabs.push(Tab { session, view, color, color_override: false });
                 self.active = self.tabs.len() - 1;
             }
             Target::Reconnect(id) => {
@@ -451,6 +491,12 @@ impl SnekkieApp {
     // -- commands -------------------------------------------------------
 
     fn run_command(&mut self, ctx: &egui::Context, command: Command) {
+        if self.settings.offline_mode
+            && matches!(command, Command::CheckForUpdates | Command::ShowUpdate | Command::InstallUpdate)
+        {
+            self.message("Offline mode", "Online updates are disabled. Turn off Offline mode under Settings → Preferences → General to check or download updates.");
+            return;
+        }
         match command {
             Command::NewSession => {
                 self.settings.show_sidebar = true;
@@ -489,6 +535,13 @@ impl SnekkieApp {
                     tab.session.shared.emulator.lock().select_all();
                 }
             }
+            Command::Find => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    // Selected text on one line is probably what to look for.
+                    let selected = tab.session.shared.emulator.lock().selection_text();
+                    tab.view.open_search(selected.filter(|t| !t.contains('\n') && t.chars().count() <= 200));
+                }
+            }
             Command::ClearScreen => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.session.shared.emulator.lock().clear();
@@ -519,6 +572,32 @@ impl SnekkieApp {
                 self.save_settings();
             }
             Command::Preferences => self.preferences = Some(Preferences::new(&self.settings)),
+            Command::ImportPutty => self.dialogs.push(Dialog::Import(Box::new(PuttyImport::new(&self.settings)))),
+            Command::ImportProfiles => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Import Snekkie profiles")
+                    .add_filter("Snekkie profiles (*.json)", &["json"])
+                    .pick_file()
+                {
+                    let result = std::fs::File::open(&path)
+                        .and_then(|file| {
+                            let mut bytes = Vec::new();
+                            file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+                            Ok(bytes)
+                        })
+                        .map_err(|e| format!("Could not read {}: {e}", path.display()))
+                        .and_then(|bytes| self.preview_profile_import(&bytes));
+                    if let Err(error) = result {
+                        self.message("Import profiles", error);
+                    }
+                }
+            }
+            Command::ExportProfiles => {
+                self.dialogs.push(Dialog::ProfileTransfer(Box::new(ProfileTransfer::export(
+                    &self.store.profiles,
+                    self.sidebar.selected_saved(),
+                ))));
+            }
             Command::CheckForUpdates => match self.updater.status {
                 updater::Status::Idle | updater::Status::Checking => {
                     self.flash(ctx, "Checking for updates…");
@@ -560,13 +639,14 @@ impl SnekkieApp {
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Command> {
         const CTRL: Modifiers = Modifiers::CTRL;
         const CTRL_SHIFT: Modifiers = Modifiers { ctrl: true, shift: true, ..Modifiers::NONE };
-        let table: [(Modifiers, Key, Command); 14] = [
+        let table: [(Modifiers, Key, Command); 15] = [
             (CTRL_SHIFT, Key::N, Command::NewSession),
             (CTRL_SHIFT, Key::D, Command::Duplicate),
             (CTRL_SHIFT, Key::R, Command::Reconnect),
             (CTRL, Key::W, Command::CloseTab),
             (CTRL, Key::Q, Command::Quit),
             (CTRL_SHIFT, Key::A, Command::SelectAll),
+            (CTRL, Key::F, Command::Find),
             (CTRL_SHIFT, Key::L, Command::ClearScreen),
             (CTRL_SHIFT, Key::B, Command::SendBreak),
             (CTRL, Key::B, Command::ToggleSidebar),
@@ -598,12 +678,30 @@ impl SnekkieApp {
 
     fn poll_background(&mut self, ctx: &egui::Context) {
         self.fonts.poll(ctx);
+        if let Some(receiver) = &self.folder_open {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.folder_open = None;
+                    if let Err(error) = result {
+                        self.message("Open log folder", error);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.folder_open = None;
+                    self.message("Open log folder", "The folder opener stopped unexpectedly.");
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         self.update_events(ctx);
         let questions: Vec<HostKeyQuestion> = self.host_keys.lock().drain(..).collect();
         self.dialogs.extend(questions.into_iter().map(|q| Dialog::HostKey(Box::new(q))));
         // A host key question whose connection gave up (tab closed, timed
         // out) has nobody left to answer.
         self.dialogs.retain(|d| !matches!(d, Dialog::HostKey(q) if q.reply.is_closed()));
+        let network_questions: Vec<_> = self.network_questions.lock().drain(..).collect();
+        self.dialogs.extend(network_questions.into_iter().map(|q| Dialog::Network(Box::new(q))));
+        self.dialogs.retain(|d| !matches!(d, Dialog::Network(q) if q.reply.is_closed()));
 
         let mut notices = Vec::new();
         for tab in &self.tabs {
@@ -618,14 +716,15 @@ impl SnekkieApp {
             }
         }
 
-        let accent = self.settings.colors().cursor;
-        if accent != self.accent {
+        let theme = self.settings.colors();
+        if self.styled_theme != Some(theme) {
             if self.accent == Color32::TRANSPARENT {
                 // Ctrl+minus and friends belong to the far end, not UI zoom.
                 ctx.options_mut(|o| o.zoom_with_keyboard = false);
             }
-            self.accent = accent;
-            style::apply(ctx, accent);
+            self.accent = theme.cursor;
+            self.styled_theme = Some(theme);
+            style::apply_theme(ctx, theme);
         }
     }
 
@@ -694,6 +793,8 @@ impl SnekkieApp {
                 item(ui, "Copy", "Ctrl+Shift+C", Command::Copy);
                 item(ui, "Paste", "Ctrl+Shift+V", Command::Paste);
                 item(ui, "Select all", "Ctrl+Shift+A", Command::SelectAll);
+                ui.separator();
+                item(ui, "Find…", "Ctrl+F", Command::Find);
             });
             egui::Popup::menu(&terminal).show(|ui| {
                 let label = if self.settings.auto_paging {
@@ -717,6 +818,12 @@ impl SnekkieApp {
             });
             egui::Popup::menu(&settings).show(|ui| {
                 item(ui, "Preferences…", "Ctrl+,", Command::Preferences);
+                ui.separator();
+                ui.menu_button("Import", |ui| {
+                    item(ui, "Snekkie profiles (.json)…", "", Command::ImportProfiles);
+                    item(ui, "PuTTY sessions…", "", Command::ImportPutty);
+                });
+                item(ui, "Export profiles…", "", Command::ExportProfiles);
             });
             egui::Popup::menu(&help).show(|ui| {
                 item(ui, "Keyboard shortcuts", "", Command::Shortcuts);
@@ -731,7 +838,7 @@ impl SnekkieApp {
                     }
                 }
                 updater::Status::Downloading { percent, .. } => {
-                    ui.label(RichText::new(format!("Downloading update… {percent}%")).color(style::TEXT_SECONDARY));
+                    ui.label(RichText::new(format!("Downloading update… {percent}%")).color(style::secondary(ui)));
                 }
                 updater::Status::Ready { release, .. } => {
                     let button = style::accent_pill("Restart to update", self.accent);
@@ -755,9 +862,37 @@ impl SnekkieApp {
         if self.flash.as_ref().is_some_and(|(_, until)| now >= *until) {
             self.flash = None;
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let text = self.current().map_or_else(|| "No session".to_string(), |t| t.session.status_text());
-            ui.label(RichText::new(text).color(style::TEXT_SECONDARY));
+            if self.settings.offline_mode {
+                ui.label(RichText::new("Offline mode").strong())
+                    .on_hover_text("Online updates are disabled; DNS and non-local connections require approval.");
+                ui.separator();
+            }
+            ui.label(RichText::new(text).color(style::secondary(ui)));
+            if let Some(tab) = self.current() {
+                ui.separator();
+                match tab.session.log_status() {
+                    LogStatus::Active => {
+                        ui.label("Logging").on_hover_text(&tab.session.profile.log_path);
+                    }
+                    LogStatus::Failed(error) => {
+                        ui.label(RichText::new("Logging failed").color(ui.visuals().error_fg_color))
+                            .on_hover_text(error);
+                    }
+                    LogStatus::Off => {
+                        ui.label(RichText::new("Logging off").color(style::secondary(ui)));
+                    }
+                }
+                let path = tab.session.profile.log_path.clone();
+                if !path.trim().is_empty()
+                    && ui
+                        .add_enabled(self.folder_open.is_none(), egui::Button::new("Open log folder").small())
+                        .clicked()
+                {
+                    self.request_open_log_folder(ui.ctx(), PathBuf::from(path.trim()));
+                }
+            }
             if let Some((flash, _)) = &self.flash {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new(flash).color(self.accent));
@@ -779,6 +914,23 @@ impl SnekkieApp {
                 sidebar::Action::Delete(name) => {
                     self.confirm("Delete session", format!("Delete “{name}”?"), ConfirmAction::DeleteSaved(name));
                 }
+                sidebar::Action::ToggleFavorite(name) => {
+                    if let Some(mut profile) = self.store.get(&name).cloned() {
+                        profile.favorite = !profile.favorite;
+                        self.save_profile_metadata(profile);
+                    }
+                }
+                sidebar::Action::ProfileColor(name) => {
+                    if let Some(profile) = self.store.get(&name) {
+                        self.dialogs.push(Dialog::ProfileColor {
+                            name,
+                            color: crate::settings::parse_hex(&profile.tab_color).unwrap_or(self.accent),
+                            enabled: !profile.tab_color.is_empty(),
+                        });
+                    }
+                }
+                sidebar::Action::ImportProfiles => self.run_command(&ctx, Command::ImportProfiles),
+                sidebar::Action::ExportProfiles => self.run_command(&ctx, Command::ExportProfiles),
                 sidebar::Action::OtherDevice => {
                     self.input(
                         "Serial port",
@@ -812,6 +964,60 @@ impl SnekkieApp {
         }
     }
 
+    /// Save a metadata edit atomically before updating the form or open tabs.
+    fn save_profile_metadata(&mut self, profile: Profile) {
+        let original = self.store.profiles.clone();
+        if let Err(error) = self.store.put(profile.clone()) {
+            self.store.profiles = original;
+            self.message("Save profile", format!("Could not save profile changes: {error}"));
+            return;
+        }
+        if self.sidebar.draft.name == profile.name && same_destination(&self.sidebar.draft, &profile) {
+            self.sidebar.draft.favorite = profile.favorite;
+            self.sidebar.draft.tab_color.clone_from(&profile.tab_color);
+        }
+        for tab in &mut self.tabs {
+            if tab.session.profile.name == profile.name && same_destination(&tab.session.profile, &profile) {
+                tab.session.profile.favorite = profile.favorite;
+                tab.session.profile.tab_color.clone_from(&profile.tab_color);
+                if !tab.color_override {
+                    tab.color = crate::settings::parse_hex(&profile.tab_color);
+                }
+            }
+        }
+    }
+
+    fn request_open_log_folder(&mut self, ctx: &egui::Context, path: PathBuf) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        match std::thread::Builder::new().name("Open log folder".into()).spawn(move || {
+            let result = open_log_folder(&path).map_err(|error| format!("Could not open the log folder: {error}"));
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        }) {
+            Ok(_) => self.folder_open = Some(receiver),
+            Err(error) => self.message("Open log folder", format!("Could not start the folder opener: {error}")),
+        }
+    }
+
+    fn finish_profile_export(&mut self, ctx: &egui::Context, path: Option<PathBuf>, profiles: &[Profile]) {
+        let Some(path) = path else { return };
+        let policy_path = self.settings_store.path.with_file_name("network.ini");
+        if [self.store.path.as_path(), self.settings_store.path.as_path(), policy_path.as_path()]
+            .into_iter()
+            .any(|store| same_file_path(&path, store))
+        {
+            self.message("Export profiles", "Choose a different file. Exporting over Snekkie's active profiles or preferences would replace saved data.");
+            return;
+        }
+        let result = crate::profiles::export_profiles(profiles)
+            .and_then(|text| crate::config::write_atomic(&path, &text).map_err(|e| e.to_string()));
+        match result {
+            Ok(()) => self.flash(ctx, format!("Exported {} profile(s) to {}", profiles.len(), path.display())),
+            Err(error) => self.message("Export profiles", format!("Could not export {}: {error}", path.display())),
+        }
+    }
+
     fn tab_strip(&mut self, ui: &mut Ui) -> Option<(u64, TabAction)> {
         let mut action = None;
         let mut rects = Vec::with_capacity(self.tabs.len());
@@ -821,7 +1027,7 @@ impl SnekkieApp {
                 for (index, tab) in self.tabs.iter().enumerate() {
                     let selected = index == self.active;
                     let state = tab.session.state();
-                    let color = if selected { style::TEXT_PRIMARY } else { style::TEXT_SECONDARY };
+                    let color = if selected { style::primary(ui) } else { style::secondary(ui) };
                     let dot = match state {
                         State::Connected => self.accent,
                         State::Connecting => Color32::from_rgb(0xd0, 0xa0, 0x30),
@@ -833,31 +1039,47 @@ impl SnekkieApp {
                     let inner = ui.scope_builder(
                         egui::UiBuilder::new().id(Id::new(("tab", id))).sense(Sense::click_and_drag()),
                         |ui| {
-                            Frame::new().inner_margin(Margin::symmetric(10, 5)).show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    let (dot_rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                                    ui.painter().circle_filled(dot_rect.center(), 3.5, dot);
-                                    ui.add(
-                                        egui::Label::new(RichText::new(tab.session.title()).color(color))
-                                            .selectable(false),
-                                    );
-                                    let close = ui.add(
-                                        egui::Button::new(RichText::new("×").color(style::TEXT_SECONDARY))
-                                            .frame(false)
-                                            .small(),
-                                    );
-                                    if close.on_hover_text("Close tab").clicked() {
-                                        action = Some((id, TabAction::Close));
-                                    }
+                            Frame::new()
+                                .fill(tab.color.map_or(Color32::TRANSPARENT, |c| {
+                                    c.gamma_multiply(if selected { 0.16 } else { 0.08 })
+                                }))
+                                .inner_margin(Margin::symmetric(10, 5))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        let (dot_rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                                        ui.painter().circle_filled(dot_rect.center(), 3.5, dot);
+                                        ui.add(
+                                            egui::Label::new(RichText::new(tab.session.title()).color(color))
+                                                .selectable(false),
+                                        );
+                                        let close = ui.add(
+                                            egui::Button::new(RichText::new("×").color(style::secondary(ui)))
+                                                .frame(false)
+                                                .small(),
+                                        );
+                                        if close.on_hover_text("Close tab").clicked() {
+                                            action = Some((id, TabAction::Close));
+                                        }
+                                    });
                                 });
-                            });
                         },
                     );
                     let response = inner.response;
                     let rect = response.rect;
+                    if let Some(color) = tab.color {
+                        let strip = egui::Rect::from_x_y_ranges(
+                            rect.left()..=rect.left() + 3.0,
+                            rect.top() + 2.0..=rect.bottom() - 2.0,
+                        );
+                        ui.painter().rect_filled(strip, 1.0, color);
+                    }
                     if selected {
-                        ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(2.0, self.accent));
+                        ui.painter().hline(
+                            rect.x_range(),
+                            rect.bottom() - 1.0,
+                            Stroke::new(2.0, tab.color.unwrap_or(self.accent)),
+                        );
                     } else if response.hovered() {
                         ui.painter().rect_filled(rect, 3.0, Color32::from_white_alpha(8));
                     }
@@ -879,6 +1101,39 @@ impl SnekkieApp {
                         if ui.button("Duplicate").clicked() {
                             action = Some((id, TabAction::Duplicate));
                         }
+                        ui.menu_button("Tab color", |ui| {
+                            for (name, color) in TAB_COLORS {
+                                if ui.add(egui::Button::new(name).fill(color.gamma_multiply(0.15))).clicked() {
+                                    action = Some((id, TabAction::Color(Some(color))));
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Custom color…").clicked() {
+                                action = Some((id, TabAction::CustomColor));
+                                ui.close();
+                            }
+                            if ui.button("Clear tab color").clicked() {
+                                action = Some((id, TabAction::Color(None)));
+                                ui.close();
+                            }
+                            if ui.button("Use profile color").clicked() {
+                                action = Some((id, TabAction::UseProfileColor));
+                                ui.close();
+                            }
+                            let saved = self
+                                .store
+                                .get(&tab.session.profile.name)
+                                .is_some_and(|p| same_destination(p, &tab.session.profile));
+                            if ui
+                                .add_enabled(saved, egui::Button::new("Save tab color as profile default"))
+                                .on_hover_text("Save this color for future tabs opened from the profile.")
+                                .clicked()
+                            {
+                                action = Some((id, TabAction::SaveProfileColor));
+                                ui.close();
+                            }
+                        });
                         ui.separator();
                         if ui.button("Close").clicked() {
                             action = Some((id, TabAction::Close));
@@ -923,7 +1178,7 @@ impl SnekkieApp {
                         RichText::new(
                             "No session open.\nFill in the form on the left and click Connect,\nor double-click a saved session.",
                         )
-                        .color(style::TEXT_SECONDARY),
+                        .color(style::secondary(ui)),
                     )
                     .selectable(false),
                 );
@@ -940,6 +1195,39 @@ impl SnekkieApp {
                     }
                 }
                 TabAction::Close => self.close_tab(id, false),
+                TabAction::Color(color) => {
+                    if let Some(index) = self.tab_index(id) {
+                        self.tabs[index].color = color;
+                        self.tabs[index].color_override = true;
+                    }
+                }
+                TabAction::UseProfileColor => {
+                    if let Some(index) = self.tab_index(id) {
+                        let tab = &mut self.tabs[index];
+                        tab.color = crate::settings::parse_hex(&tab.session.profile.tab_color);
+                        tab.color_override = false;
+                    }
+                }
+                TabAction::SaveProfileColor => {
+                    if let Some(index) = self.tab_index(id) {
+                        let tab = &self.tabs[index];
+                        if let Some(mut profile) = self
+                            .store
+                            .get(&tab.session.profile.name)
+                            .cloned()
+                            .filter(|p| same_destination(p, &tab.session.profile))
+                        {
+                            profile.tab_color = tab.color.map(crate::settings::to_hex).unwrap_or_default();
+                            self.save_profile_metadata(profile);
+                        }
+                    }
+                }
+                TabAction::CustomColor => {
+                    if let Some(index) = self.tab_index(id) {
+                        self.dialogs
+                            .push(Dialog::TabColor { id, color: self.tabs[index].color.unwrap_or(self.accent) });
+                    }
+                }
                 TabAction::Reconnect | TabAction::Duplicate => {
                     if let Some(index) = self.tab_index(id) {
                         let profile = self.tabs[index].session.profile.clone();
@@ -970,11 +1258,19 @@ impl SnekkieApp {
         };
         if let Some((fill, text, reconnect)) = banner {
             let mut clicked = false;
+            let theme = self.settings.colors();
+            let fill = if theme.effects.is_super() { theme.selection } else { fill };
             Frame::new().fill(fill).inner_margin(Margin::symmetric(8, 5)).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 egui::Sides::new().shrink_left().wrap().show(
                     ui,
-                    |ui| ui.label(RichText::new(text).color(Color32::from_rgb(0xee, 0xee, 0xee))),
+                    |ui| {
+                        ui.label(RichText::new(text).color(if theme.effects.is_super() {
+                            theme.fg
+                        } else {
+                            Color32::from_rgb(0xee, 0xee, 0xee)
+                        }))
+                    },
                     |ui| {
                         if reconnect {
                             clicked = ui.button("Reconnect").clicked();
@@ -994,10 +1290,24 @@ impl SnekkieApp {
         let (regular, bold) =
             Fonts::font_ids(family.as_deref(), fonts::points_to_pixels(tab.session.profile.font_size));
         let syntax = tab.session.profile.device_syntax.clone();
-        let keyboard = self.dialogs.is_empty() && self.preferences.is_none();
+        let keyboard = self.dialogs.is_empty()
+            && self.preferences.is_none()
+            && (!self.settings.show_sidebar || !self.sidebar.blocks_terminal_input());
         let animations = self.settings.animations;
-        let options = ViewOptions { theme, syntax: &syntax, regular, bold, keyboard, animations };
-        let out = tab.view.show(ui, &tab.session, &options);
+        let options = ViewOptions {
+            theme,
+            syntax: &syntax,
+            highlighting_intensity: self.settings.highlighting_intensity,
+            regular,
+            bold,
+            keyboard,
+            animations,
+        };
+        let out = if theme.effects.is_super() {
+            style::monitor(ui, theme, |ui| tab.view.show(ui, &tab.session, &options))
+        } else {
+            tab.view.show(ui, &tab.session, &options)
+        };
         if let Some(text) = out.copy {
             ctx.copy_text(text);
         }
@@ -1007,10 +1317,16 @@ impl SnekkieApp {
             self.tabs[self.active].session.write(keys::encode_paste(&text));
         }
         if let Some(export) = out.text_export {
-            let picker = rfd::FileDialog::new().add_filter("Text files", &["txt"]);
+            let picker = rfd::FileDialog::new()
+                .add_filter("Plain text (*.txt)", &["txt"])
+                .add_filter("Cisco configuration (*.cisco)", &["cisco"])
+                .add_filter("Markdown (*.md)", &["md"])
+                .add_filter("Configuration (*.cfg, *.conf)", &["cfg", "conf"])
+                .add_filter("Log files (*.log)", &["log"])
+                .add_filter("All files (*.*)", &["*"]);
             let path = match &export {
                 TextExport::Save(_) => {
-                    picker.set_title("Save terminal output").set_file_name("terminal-output.txt").save_file()
+                    picker.set_title("Save terminal output").set_file_name("terminal-output").save_file()
                 }
                 TextExport::Append(_) => picker.set_title("Append terminal text to existing file").pick_file(),
             };
@@ -1029,6 +1345,57 @@ impl SnekkieApp {
         let modal = egui::Modal::new(Id::new("dialog")).show(ctx, |ui| {
             ui.set_max_width(if matches!(dialog, Dialog::HostKey(_)) { 540.0 } else { 460.0 });
             match dialog {
+                Dialog::Import(import) => {
+                    ui.set_max_width(550.0);
+                    if let Some(import) = import.ui(ui) {
+                        if import {
+                            result = Some(DialogResult::Yes);
+                        } else {
+                            close = true;
+                        }
+                    }
+                }
+                Dialog::ProfileTransfer(transfer) => {
+                    if let Some(accepted) = transfer.ui(ui) {
+                        result = Some(if accepted { DialogResult::Yes } else { DialogResult::No });
+                    }
+                }
+                Dialog::ProfileColor { name, color, enabled } => {
+                    ui.heading("Default tab color");
+                    ui.label(name.as_str());
+                    ui.label("Use this color when opening the saved profile.");
+                    ui.checkbox(enabled, "Use default tab color");
+                    ui.add_enabled_ui(*enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.color_edit_button_srgba(color);
+                            ui.label(crate::settings::to_hex(*color));
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            result = Some(DialogResult::Yes);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            result = Some(DialogResult::No);
+                        }
+                    });
+                }
+                Dialog::TabColor { color, .. } => {
+                    ui.heading("Session tab color");
+                    ui.horizontal(|ui| {
+                        ui.label("Color");
+                        ui.color_edit_button_srgba(color);
+                        ui.label(crate::settings::to_hex(*color));
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() {
+                            result = Some(DialogResult::Yes);
+                        }
+                        if ui.button("Cancel").clicked() || escape {
+                            close = true;
+                        }
+                    });
+                }
                 Dialog::Message { title, text, monospace } => {
                     ui.heading(title.as_str());
                     ui.add_space(6.0);
@@ -1053,6 +1420,22 @@ impl SnekkieApp {
                             result = Some(DialogResult::Yes);
                         }
                         if ui.button("No").clicked() || escape {
+                            close = true;
+                        }
+                    });
+                }
+                Dialog::Network(question) => {
+                    ui.heading(if question.address.is_some() {
+                        "Allow public connection?"
+                    } else {
+                        "Allow DNS lookup?"
+                    });
+                    ui.add(egui::Label::new(question.text()).wrap());
+                    ui.horizontal(|ui| {
+                        if ui.button("Allow once").clicked() {
+                            result = Some(DialogResult::Yes);
+                        }
+                        if ui.button("Cancel").clicked() || escape {
                             close = true;
                         }
                     });
@@ -1090,10 +1473,10 @@ impl SnekkieApp {
                         .wrap(),
                     );
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Key type").color(style::TEXT_SECONDARY));
+                    ui.label(RichText::new("Key type").color(style::secondary(ui)));
                     ui.label(RichText::new(&question.key_type).monospace());
                     ui.add_space(4.0);
-                    ui.label(RichText::new("Fingerprint").color(style::TEXT_SECONDARY));
+                    ui.label(RichText::new("Fingerprint").color(style::secondary(ui)));
                     ui.add(egui::Label::new(RichText::new(&question.fingerprint).monospace()).wrap());
                     ui.add_space(4.0);
                     ui.add(
@@ -1124,7 +1507,7 @@ impl SnekkieApp {
                         "This copy of Snekkie wasn't installed with the installer, so it can't update \
                          itself. Download the new version from its release page."
                     };
-                    ui.add(egui::Label::new(RichText::new(how).color(style::TEXT_SECONDARY)).wrap());
+                    ui.add(egui::Label::new(RichText::new(how).color(style::secondary(ui))).wrap());
                     if *installable {
                         ui.add_space(4.0);
                         ui.hyperlink_to(format!("What's new in {}", release.version), &release.page);
@@ -1160,7 +1543,55 @@ impl SnekkieApp {
 
     fn finish_dialog(&mut self, ctx: &egui::Context, dialog: Dialog, result: DialogResult) {
         match (dialog, result) {
+            (Dialog::ProfileTransfer(transfer), DialogResult::Yes) => {
+                let selected = transfer.profiles();
+                if transfer.is_export() {
+                    let path = rfd::FileDialog::new()
+                        .set_title("Export Snekkie profiles")
+                        .set_file_name("snekkie-profiles.json")
+                        .add_filter("Snekkie profiles (*.json)", &["json"])
+                        .save_file();
+                    self.finish_profile_export(ctx, path, &selected);
+                } else {
+                    let original = self.store.profiles.clone();
+                    self.store.profiles = crate::profiles::merge_import(&original, selected.iter().cloned());
+                    self.store.profiles.sort_by_key(|p| p.name.to_lowercase());
+                    if let Err(error) = self.store.save() {
+                        self.store.profiles = original;
+                        self.message("Import profiles", format!("Could not save imported profiles: {error}"));
+                    } else {
+                        self.flash(ctx, format!("Imported {} profile(s).", selected.len()));
+                    }
+                }
+            }
+            (Dialog::ProfileColor { name, color, enabled }, DialogResult::Yes) => {
+                if let Some(mut profile) = self.store.get(&name).cloned() {
+                    profile.tab_color = if enabled { crate::settings::to_hex(color) } else { String::new() };
+                    self.save_profile_metadata(profile);
+                }
+            }
+            (Dialog::Import(import), DialogResult::Yes) => {
+                let selected = import.profiles();
+                let count = selected.len();
+                let original = self.store.profiles.clone();
+                self.store.profiles = crate::putty::merge(&original, selected);
+                if let Err(e) = self.store.save() {
+                    self.store.profiles = original;
+                    self.message("Import PuTTY sessions", format!("Could not save imported sessions: {e}"));
+                } else {
+                    self.flash(ctx, format!("Imported {count} PuTTY session(s)."));
+                }
+            }
+            (Dialog::TabColor { id, color }, DialogResult::Yes) => {
+                if let Some(index) = self.tab_index(id) {
+                    self.tabs[index].color = Some(color);
+                    self.tabs[index].color_override = true;
+                }
+            }
             (Dialog::HostKey(question), result) => {
+                let _ = question.reply.send(result == DialogResult::Yes);
+            }
+            (Dialog::Network(question), result) => {
                 let _ = question.reply.send(result == DialogResult::Yes);
             }
             (Dialog::Confirm { action, .. }, DialogResult::Yes) => match action {
@@ -1236,6 +1667,7 @@ impl SnekkieApp {
 
     fn preferences_ui(&mut self, ctx: &egui::Context, blocked: bool) {
         let Some(prefs) = self.preferences.as_mut() else { return };
+        prefs.update_busy = self.updater.busy();
         let monospace = self.fonts.monospace.clone();
         let mut outcome = preferences::Outcome::Open;
         let modal = egui::Modal::new(Id::new("preferences")).show(ctx, |ui| {
@@ -1249,7 +1681,18 @@ impl SnekkieApp {
             preferences::Outcome::Open => {}
             preferences::Outcome::Cancel => self.preferences = None,
             preferences::Outcome::Save(settings) => {
+                let enabling_offline = settings.offline_mode && !self.settings.offline_mode;
                 self.settings = AppSettings { show_sidebar: self.settings.show_sidebar, ..settings };
+                self.network.set_offline(self.settings.offline_mode);
+                self.updater.set_offline(self.settings.offline_mode);
+                if enabling_offline {
+                    for tab in &self.tabs {
+                        if tab.session.profile.kind() != Kind::Serial {
+                            tab.session.shutdown();
+                        }
+                    }
+                    self.dialogs.retain(|d| !matches!(d, Dialog::Update { .. }));
+                }
                 for tab in &self.tabs {
                     tab.session.set_auto_paging(self.settings.auto_paging);
                 }
@@ -1284,14 +1727,14 @@ impl SnekkieApp {
         let mut commands = if modal_open { Vec::new() } else { self.shortcuts(&ctx) };
 
         egui::Panel::top("menu")
-            .frame(Frame::new().fill(style::BG_WINDOW).inner_margin(Margin::symmetric(6, 3)))
+            .frame(Frame::new().fill(ui.visuals().panel_fill).inner_margin(Margin::symmetric(6, 3)))
             .show(ui, |ui| commands.extend(self.menu_bar(ui)));
         egui::Panel::bottom("status")
             .frame(
                 Frame::new()
-                    .fill(style::BG_WINDOW)
+                    .fill(ui.visuals().panel_fill)
                     .inner_margin(Margin::symmetric(8, 3))
-                    .stroke(Stroke::new(1.0, style::BORDER)),
+                    .stroke(Stroke::new(1.0, style::border(ui))),
             )
             .show(ui, |ui| self.status_bar(ui));
         if self.settings.show_sidebar {
@@ -1299,11 +1742,16 @@ impl SnekkieApp {
                 .resizable(true)
                 .default_size(320.0)
                 .size_range(280.0..=460.0)
-                .frame(Frame::new().fill(style::BG_PANEL).inner_margin(Margin::same(10)))
+                .frame(Frame::new().fill(ui.visuals().window_fill).inner_margin(Margin::same(10)))
                 .show(ui, |ui| self.sidebar_ui(ui));
         }
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(style::BG_WINDOW).inner_margin(Margin { left: 2, right: 0, top: 2, bottom: 0 }))
+            .frame(Frame::new().fill(ui.visuals().panel_fill).inner_margin(Margin {
+                left: 2,
+                right: 0,
+                top: 2,
+                bottom: 0,
+            }))
             .show(ui, |ui| self.central(ui));
 
         for command in commands {
@@ -1347,7 +1795,18 @@ impl SnekkieApp {
                 Dialog::Message { text, .. } | Dialog::Confirm { text, .. } => text.clone(),
                 Dialog::Input { label, .. } => label.clone(),
                 Dialog::HostKey(q) => q.fingerprint.clone(),
+                Dialog::Network(q) => q.text(),
                 Dialog::Update { release, .. } => update_summary(release),
+                Dialog::Import(_) => "Import PuTTY sessions".into(),
+                Dialog::ProfileTransfer(transfer) => {
+                    if transfer.is_export() {
+                        "Export profiles".into()
+                    } else {
+                        "Import profiles".into()
+                    }
+                }
+                Dialog::TabColor { .. } => "Session tab color".into(),
+                Dialog::ProfileColor { name, .. } => format!("Default tab color for {name}"),
             })
             .collect()
     }
@@ -1370,6 +1829,27 @@ impl SnekkieApp {
     }
 
     #[doc(hidden)]
+    pub fn preview_putty_export(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let batch = crate::putty::parse_export(bytes, &self.settings)?;
+        let mut import = PuttyImport::new(&self.settings);
+        import.set_batch(batch);
+        self.dialogs.push(Dialog::Import(Box::new(import)));
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn preview_profile_import(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let batch = crate::profiles::parse_import(bytes)?;
+        self.dialogs.push(Dialog::ProfileTransfer(Box::new(ProfileTransfer::import(batch, &self.store.profiles))));
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn tab_colors(&self) -> Vec<(String, Option<Color32>)> {
+        self.tabs.iter().map(|t| (t.session.title(), t.color)).collect()
+    }
+
+    #[doc(hidden)]
     pub fn set_form_kind(&mut self, kind: Kind) {
         self.sidebar.set_kind(kind);
     }
@@ -1377,6 +1857,18 @@ impl SnekkieApp {
     #[doc(hidden)]
     pub fn active_screen_text(&self) -> Option<String> {
         self.current().map(|t| t.session.shared.emulator.lock().screen_text())
+    }
+
+    /// The current tab's find bar: its status text, if it's open.
+    #[doc(hidden)]
+    pub fn active_search_status(&self) -> Option<String> {
+        self.current().filter(|t| t.view.search().is_open()).map(|t| t.view.search().status())
+    }
+
+    /// How far the current tab is scrolled back from the live screen.
+    #[doc(hidden)]
+    pub fn active_display_offset(&self) -> Option<usize> {
+        self.current().map(|t| t.session.shared.emulator.lock().display_offset())
     }
 }
 
@@ -1408,7 +1900,87 @@ enum TabAction {
     Close,
     Reconnect,
     Duplicate,
+    Color(Option<Color32>),
+    CustomColor,
+    UseProfileColor,
+    SaveProfileColor,
 }
+
+fn same_destination(a: &Profile, b: &Profile) -> bool {
+    a.kind() == b.kind()
+        && if a.kind() == Kind::Serial {
+            a.device.trim() == b.device.trim()
+        } else {
+            a.host.trim() == b.host.trim() && a.port == b.port
+        }
+}
+
+fn log_folder(path: &Path) -> std::io::Result<PathBuf> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let folder = parent.canonicalize()?;
+    if !folder.is_dir() {
+        return Err(std::io::Error::other("The log folder is not a directory."));
+    }
+    Ok(folder)
+}
+
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    fn resolved(path: &Path) -> std::io::Result<PathBuf> {
+        path.canonicalize().or_else(|_| {
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            let Some(name) = path.file_name() else { return Err(std::io::Error::other("Missing file name")) };
+            Ok(parent.canonicalize()?.join(name))
+        })
+    }
+    match (resolved(a), resolved(b)) {
+        (Ok(a), Ok(b)) => {
+            #[cfg(windows)]
+            {
+                a.as_os_str().to_string_lossy().eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+            }
+            #[cfg(not(windows))]
+            {
+                a == b
+            }
+        }
+        _ => false,
+    }
+}
+
+fn open_log_folder(path: &Path) -> std::io::Result<()> {
+    let folder = log_folder(path)?;
+    #[cfg(windows)]
+    let mut command = std::process::Command::new("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+    let output = command.arg(folder).output()?;
+    // Explorer can return a nonzero exit when an existing shell opens the
+    // folder. Other platforms report launcher failures through the exit code.
+    #[cfg(not(windows))]
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::other(format!("Folder opener exited with {}: {}", output.status, message.trim())));
+    }
+    #[cfg(windows)]
+    let _ = output;
+    Ok(())
+}
+
+const TAB_COLORS: [(&str, Color32); 8] = [
+    ("Red", Color32::from_rgb(238, 87, 87)),
+    ("Orange", Color32::from_rgb(243, 160, 61)),
+    ("Yellow", Color32::from_rgb(227, 202, 70)),
+    ("Green", Color32::from_rgb(98, 190, 109)),
+    ("Blue", Color32::from_rgb(80, 156, 231)),
+    ("Purple", Color32::from_rgb(177, 116, 231)),
+    ("Pink", Color32::from_rgb(223, 122, 173)),
+    ("Gray", Color32::from_rgb(148, 157, 164)),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DialogResult {
@@ -1426,14 +1998,103 @@ impl eframe::App for SnekkieApp {
         self.shutdown();
     }
 
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        style::BG_WINDOW.to_normalized_gamma_f32()
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_metadata_updates_matching_sessions_and_rolls_back_on_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = SnekkieApp::with_port_lister(paths, Vec::new);
+        let profile = Profile { name: "Saved".into(), host: "192.0.2.1".into(), ..Default::default() };
+        app.store.put(profile.clone()).unwrap();
+        app.sidebar.load(profile.clone());
+        for (host, color_override) in [("192.0.2.1", false), ("192.0.2.1", true), ("192.0.2.2", false)] {
+            let session = Session::new(Profile { host: host.into(), ..profile.clone() }, app.settings.colors(), || {});
+            app.tabs.push(Tab { session, view: TerminalView::default(), color: None, color_override });
+        }
+        let updated = Profile { favorite: true, tab_color: "#abcdef".into(), ..profile };
+        app.save_profile_metadata(updated.clone());
+        assert_eq!(ProfileStore::open(app.store.path.clone()).get("Saved"), Some(&updated));
+        assert!(app.sidebar.draft.favorite);
+        assert_eq!(app.tabs[0].color, crate::settings::parse_hex("#abcdef"));
+        assert_eq!(app.tabs[1].color, None, "explicit clear stays an override");
+        assert_eq!(app.tabs[2].session.profile.tab_color, "", "same name at another destination is unrelated");
+        app.store.path = dir.path().join("blocked");
+        std::fs::create_dir(&app.store.path).unwrap();
+        app.save_profile_metadata(Profile { favorite: false, tab_color: "#123456".into(), ..updated.clone() });
+        assert_eq!(app.store.get("Saved"), Some(&updated));
+        assert!(app.sidebar.draft.favorite);
+        assert_eq!(app.tabs[0].color, crate::settings::parse_hex("#abcdef"));
+        assert!(app.dialog_texts()[0].contains("Could not save profile changes"));
+    }
+
+    #[test]
+    fn profile_export_protects_live_stores_and_handles_cancel_or_write_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = SnekkieApp::with_port_lister(paths, Vec::new);
+        let profiles = [
+            Profile { name: "Alpha".into(), host: "192.0.2.1".into(), ..Default::default() },
+            Profile { name: "Beta".into(), host: "192.0.2.2".into(), ..Default::default() },
+        ];
+        for profile in &profiles {
+            app.store.put(profile.clone()).unwrap();
+        }
+        let original = std::fs::read(&app.store.path).unwrap();
+        let ctx = egui::Context::default();
+        app.finish_profile_export(&ctx, None, &profiles[..1]);
+        assert!(app.flash.is_none() && app.dialogs.is_empty());
+        for path in [app.store.path.clone(), app.settings_store.path.clone(), dir.path().join("network.ini")] {
+            app.finish_profile_export(&ctx, Some(path), &profiles[..1]);
+            assert!(app.dialog_texts().last().unwrap().contains("Choose a different file"));
+            app.dialogs.clear();
+        }
+        assert_eq!(std::fs::read(&app.store.path).unwrap(), original);
+        let export = dir.path().join("export.json");
+        app.finish_profile_export(&ctx, Some(export.clone()), &profiles[..1]);
+        let batch = crate::profiles::parse_import(&std::fs::read(export).unwrap()).unwrap();
+        assert_eq!(batch.profiles, profiles[..1]);
+        app.finish_profile_export(&ctx, Some(dir.path().to_path_buf()), &profiles);
+        assert!(app.dialog_texts().last().unwrap().contains("Could not export"));
+    }
+
+    #[test]
+    fn profile_import_write_failure_preserves_the_original_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = SnekkieApp::with_port_lister(paths, Vec::new);
+        let original = Profile { name: "Alpha".into(), host: "192.0.2.1".into(), ..Default::default() };
+        app.store.put(original.clone()).unwrap();
+        let incoming = crate::profiles::ProfileImport {
+            profiles: vec![Profile { host: "192.0.2.2".into(), ..original.clone() }],
+            warnings: Vec::new(),
+        };
+        let transfer = ProfileTransfer::import(incoming, &app.store.profiles);
+        app.store.path = dir.path().join("blocked");
+        std::fs::create_dir(&app.store.path).unwrap();
+        app.finish_dialog(&egui::Context::default(), Dialog::ProfileTransfer(Box::new(transfer)), DialogResult::Yes);
+        assert_eq!(app.store.profiles, [original]);
+        assert!(app.tabs.is_empty());
+        assert!(app.dialog_texts()[0].contains("Could not save imported profiles"));
+    }
+
+    #[test]
+    fn log_folder_resolves_the_parent_and_reports_missing_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(log_folder(&dir.path().join("device.log")).unwrap(), dir.path().canonicalize().unwrap());
+        assert!(log_folder(&dir.path().join("missing").join("device.log")).is_err());
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert!(log_folder(&file.join("device.log")).is_err());
+        assert!(same_file_path(&file, &dir.path().join(".").join("file")));
+    }
 
     #[test]
     fn text_export_writes_utf8_and_reports_errors_but_cancel_does_nothing() {

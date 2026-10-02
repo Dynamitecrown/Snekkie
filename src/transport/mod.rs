@@ -25,18 +25,41 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 pub const TERM: &str = "xterm-256color";
 
 /// Open a TCP connection, giving up after [`CONNECT_TIMEOUT`].
-pub async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
-    let target = (host.trim_start_matches('[').trim_end_matches(']'), port);
-    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => return Err(format!("Could not connect to {host}: {e}")),
-        Err(_) => return Err(format!("Could not connect to {host}: timed out")),
+pub async fn connect_tcp(host: &str, port: u16, access: &crate::network::NetworkAccess) -> Result<TcpStream, String> {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    let addresses: Vec<std::net::SocketAddr> = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        vec![(ip, port).into()]
+    } else if host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.") {
+        vec![(std::net::Ipv4Addr::LOCALHOST, port).into(), (std::net::Ipv6Addr::LOCALHOST, port).into()]
+    } else {
+        access.approve_lookup(host, port).await?;
+        match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+            Ok(Ok(addresses)) => addresses.collect(),
+            Ok(Err(e)) => return Err(format!("Could not resolve {host}: {e}")),
+            Err(_) => return Err(format!("Could not resolve {host}: timed out")),
+        }
     };
-    // Without this, Nagle's algorithm sits on the one-byte packets an
-    // interactive session sends per keystroke: the classic "typing feels
-    // laggy" complaint.
-    let _ = stream.set_nodelay(true);
-    Ok(stream)
+    let mut last_error = "no addresses were found".to_string();
+    for address in addresses {
+        access.approve_address(host, address).await?;
+        let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                last_error = e.to_string();
+                continue;
+            }
+            Err(_) => {
+                last_error = "timed out".into();
+                continue;
+            }
+        };
+        // Without this, Nagle's algorithm sits on the one-byte packets an
+        // interactive session sends per keystroke: the classic "typing feels
+        // laggy" complaint.
+        let _ = stream.set_nodelay(true);
+        return Ok(stream);
+    }
+    Err(format!("Could not connect to {host}: {last_error}"))
 }
 
 /// The keepalive interval a profile asks for, if any.

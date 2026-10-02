@@ -53,6 +53,7 @@ pub struct Updater {
     /// The user asked for the check under way, so its outcome is reported
     /// whatever it is. A check at startup keeps quiet unless it finds one.
     asked: bool,
+    offline: bool,
     tx: Sender<Message>,
     rx: Receiver<Message>,
 }
@@ -71,6 +72,7 @@ impl Updater {
             can_install: update::installed_here(),
             check_on_start: false,
             asked: false,
+            offline: false,
             tx,
             rx,
         }
@@ -78,11 +80,28 @@ impl Updater {
 
     /// Check quietly as soon as the window is up.
     pub fn check_at_startup(&mut self) {
-        self.check_on_start = true;
+        self.check_on_start = !self.offline;
+    }
+
+    pub fn busy(&self) -> bool {
+        matches!(self.status, Status::Checking | Status::Downloading { .. })
+    }
+
+    pub fn set_offline(&mut self, offline: bool) {
+        self.offline = offline;
+        if offline {
+            self.check_on_start = false;
+            if !self.busy() {
+                self.status = Status::Idle;
+            }
+        }
     }
 
     /// Ask GitHub for the latest release. `asked` if the user asked.
     pub fn check(&mut self, ctx: &egui::Context, asked: bool) {
+        if self.offline {
+            return;
+        }
         match self.status {
             Status::Idle => {}
             // Already on it; just make sure the answer gets reported.
@@ -105,6 +124,9 @@ impl Updater {
 
     /// Start downloading the installer for the available release.
     pub fn download(&mut self, ctx: &egui::Context) {
+        if self.offline {
+            return;
+        }
         let Status::Available(release) = &self.status else { return };
         let Some(asset) = release.installer.clone() else { return };
         self.status = Status::Downloading { release: release.clone(), percent: 0 };
@@ -139,6 +161,10 @@ impl Updater {
         }
         let mut events = Vec::new();
         while let Ok(message) = self.rx.try_recv() {
+            if self.offline {
+                self.status = Status::Idle;
+                continue;
+            }
             match message {
                 Message::Checked(result) => {
                     let asked = std::mem::take(&mut self.asked);
@@ -183,4 +209,33 @@ impl Updater {
 fn spawn(name: &str, work: impl FnOnce() + Send + 'static) {
     // Without a thread there's no update, which is no reason to stop.
     let _ = std::thread::Builder::new().name(name.into()).spawn(work);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn offline_mode_blocks_startup_manual_checks_and_downloads() {
+        let ctx = egui::Context::default();
+        let mut updater = Updater::new();
+        updater.set_offline(true);
+        updater.check_at_startup();
+        updater.check(&ctx, true);
+        assert_eq!(updater.status, Status::Idle);
+        assert!(updater.poll(&ctx).is_empty());
+        updater.status = Status::Available(Release {
+            version: "99.0.0".into(),
+            page: "https://example.invalid".into(),
+            installer: Some(crate::update::Asset {
+                name: "test.exe".into(),
+                url: "https://example.invalid".into(),
+                size: 1,
+                sha256: None,
+            }),
+        });
+        updater.download(&ctx);
+        assert!(matches!(updater.status, Status::Available(_)));
+        updater.set_offline(true);
+        assert_eq!(updater.status, Status::Idle);
+    }
 }

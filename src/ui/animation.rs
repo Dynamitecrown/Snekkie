@@ -118,7 +118,7 @@ pub struct CellLook {
     pub offset_y: f32,
     /// Glyph scale about the cell's centre.
     pub scale: f32,
-    /// 0..1: mix the foreground toward the accent (cursor) colour.
+    /// 0..1: mix the foreground toward the accent (cursor) color.
     pub accent: f32,
     /// Draw this instead of the real character (Decode).
     pub glyph: Option<char>,
@@ -177,6 +177,8 @@ impl LineMark {
                 let half = SHIMMER_WIDTH / 2.0;
                 (0.3, start as f32 - half + (width + 2.0 * half) * t)
             }
+            NewLines::Laser => (1.0 - t, start as f32 + width * ease_out_cubic(t)),
+            NewLines::Radar => (0.6 * (1.0 - t), width.min(12.0) * ease_out_quad(t)),
         };
         LineMark { style, t, start, end, alpha, reach }
     }
@@ -210,8 +212,8 @@ impl CursorLook {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ParticleColour {
-    /// The theme's cursor colour.
+pub enum ParticleColor {
+    /// The theme's cursor color.
     Accent,
     Fixed(Color32),
 }
@@ -228,6 +230,13 @@ pub enum ParticleShape {
     },
     /// An outline circle.
     Ring,
+    Beam {
+        angle: f32,
+        length: f32,
+    },
+    Bolt {
+        angle: f32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -236,7 +245,7 @@ pub struct ParticleLook {
     pub pos: (f32, f32),
     /// Radius (half the side, for a square), in cell heights.
     pub size: f32,
-    pub colour: ParticleColour,
+    pub color: ParticleColor,
     pub alpha: f32,
     pub shape: ParticleShape,
 }
@@ -1052,11 +1061,15 @@ impl Animator {
             KeystrokeBurst::Bubbles => self.rng.between(3, 5),
             KeystrokeBurst::Stars => self.rng.between(4, 6),
             KeystrokeBurst::Ripple => 1,
+            KeystrokeBurst::Explosion => 18,
+            KeystrokeBurst::Lasers => 4,
+            KeystrokeBurst::Lightning => 3,
+            KeystrokeBurst::Portal => 9,
         };
         let pace = self.pace as f32;
-        let first_colour = self.rng.between(0, CONFETTI.len() - 1);
+        let first_color = self.rng.between(0, CONFETTI.len() - 1);
         for i in 0..count {
-            let particle = Particle::new(style, i, count, first_colour, now, pace, centre, &mut self.rng);
+            let particle = Particle::new(style, i, count, first_color, now, pace, centre, &mut self.rng);
             self.particles_until = self.particles_until.max(now + f64::from(particle.life / pace));
             self.particles.push_back(particle);
         }
@@ -1192,6 +1205,8 @@ fn typed_duration(style: TypedText) -> f32 {
         TypedText::Bounce => 0.28,
         TypedText::Flash => 0.30,
         TypedText::Fade => 0.14,
+        TypedText::Stamp => 0.24,
+        TypedText::Laser => 0.28,
     }
 }
 
@@ -1203,6 +1218,8 @@ fn new_text_duration(style: NewText) -> f32 {
         NewText::Zoom => 0.20,
         NewText::Decode => 0.30,
         NewText::Heat => 0.5,
+        NewText::Hologram => 0.32,
+        NewText::Matrix => 0.38,
     }
 }
 
@@ -1214,6 +1231,8 @@ fn line_duration(style: NewLines) -> f32 {
         NewLines::Marker => 1.0,
         NewLines::Underline => 0.6,
         NewLines::Shimmer => 0.5,
+        NewLines::Laser => 0.55,
+        NewLines::Radar => 0.65,
     }
 }
 
@@ -1243,6 +1262,18 @@ fn typed_look(style: TypedText, age: f32) -> Option<CellLook> {
         TypedText::Bounce => CellLook { offset_y: in_steps(bounce(t)), alpha: (t / 0.15).min(1.0), ..CellLook::PLAIN },
         TypedText::Flash => CellLook { flash: 0.55 * (1.0 - smoothstep(t)), ..CellLook::PLAIN },
         TypedText::Fade => CellLook { alpha: ease_out_quad(t), ..CellLook::PLAIN },
+        TypedText::Stamp => CellLook {
+            scale: 1.0 + 0.55 * (1.0 - ease_out_cubic(t)),
+            offset_y: in_steps(-0.45 * (1.0 - ease_out_cubic(t))),
+            alpha: (t / 0.1).min(1.0),
+            ..CellLook::PLAIN
+        },
+        TypedText::Laser => CellLook {
+            accent: 1.0 - smoothstep(t),
+            flash: 0.35 * (1.0 - t).powi(2),
+            alpha: (t / 0.12).min(1.0),
+            ..CellLook::PLAIN
+        },
     };
     Some(look)
 }
@@ -1262,10 +1293,10 @@ fn output_look(style: NewText, age: f32, seed: u32) -> Option<CellLook> {
         NewText::Rise => CellLook { alpha, offset_y: in_steps(0.35 * away), ..CellLook::PLAIN },
         NewText::Drop => CellLook { alpha, offset_y: in_steps(-0.35 * away), ..CellLook::PLAIN },
         NewText::Zoom => CellLook { alpha, scale: 1.0 - 0.6 * away, ..CellLook::PLAIN },
-        NewText::Decode => {
+        NewText::Decode | NewText::Matrix => {
             // Cells settle at slightly different moments, like they're being
             // cracked one by one. The tint goes by age alone, so cells shown
-            // together share a colour (and a run of text), and it's gone
+            // together share a color (and a run of text), and it's gone
             // before the first of them settles.
             let first = 0.7 * duration;
             let settle = first + 0.3 * duration * (seed & 0xffff) as f32 / 65535.0;
@@ -1273,14 +1304,21 @@ fn output_look(style: NewText, age: f32, seed: u32) -> Option<CellLook> {
                 return None;
             }
             let tick = (age / DECODE_TICK) as u64;
-            let pick = scramble(u64::from(seed) << 32 | tick) % DECODE_GLYPHS.len() as u64;
+            let glyphs = if style == NewText::Matrix { &['0', '1'][..] } else { DECODE_GLYPHS };
+            let pick = scramble(u64::from(seed) << 32 | tick) % glyphs.len() as u64;
             CellLook {
-                glyph: Some(DECODE_GLYPHS[pick as usize]),
+                glyph: Some(glyphs[pick as usize]),
                 accent: 0.4 * (1.0 - age / first).max(0.0),
                 ..CellLook::PLAIN
             }
         }
         NewText::Heat => CellLook { accent: 1.0 - smoothstep(t), ..CellLook::PLAIN },
+        NewText::Hologram => CellLook {
+            alpha: (alpha * (0.88 + 0.12 * (t * TAU * 3.0).sin())).clamp(0.0, 1.0),
+            accent: 0.6 * (1.0 - t),
+            offset_y: in_steps(0.08 * (t * TAU * 2.0).sin() * (1.0 - t)),
+            ..CellLook::PLAIN
+        },
     };
     Some(look)
 }
@@ -1674,7 +1712,7 @@ struct Particle {
     /// Rows per second down, cell heights per second right.
     velocity: (f32, f32),
     size: f32,
-    colour: ParticleColour,
+    color: ParticleColor,
     angle: f32,
     spin: f32,
     phase: f32,
@@ -1686,7 +1724,7 @@ impl Particle {
         kind: KeystrokeBurst,
         i: usize,
         count: usize,
-        first_colour: usize,
+        first_color: usize,
         born: f64,
         pace: f32,
         origin: (f32, f32),
@@ -1700,7 +1738,7 @@ impl Particle {
             origin,
             velocity: (0.0, 0.0),
             size: 0.1,
-            colour: ParticleColour::Accent,
+            color: ParticleColor::Accent,
             angle: rng.range(0.0, TAU),
             spin: 0.0,
             phase: rng.range(0.0, TAU),
@@ -1719,7 +1757,7 @@ impl Particle {
                 life: rng.range(0.7, 0.9),
                 velocity: throw(-FRAC_PI_2 + rng.range(-1.0, 1.0), rng.range(4.0, 7.0)),
                 size: rng.range(0.09, 0.13),
-                colour: ParticleColour::Fixed(CONFETTI[(first_colour + i) % CONFETTI.len()]),
+                color: ParticleColor::Fixed(CONFETTI[(first_color + i) % CONFETTI.len()]),
                 spin: rng.range(5.0, 12.0) * if rng.unit() < 0.5 { -1.0 } else { 1.0 },
                 ..base
             },
@@ -1727,7 +1765,7 @@ impl Particle {
                 life: rng.range(0.6, 0.8),
                 velocity: (-rng.range(1.5, 3.0), rng.range(-0.4, 0.4)),
                 size: rng.range(0.07, 0.11),
-                colour: ParticleColour::Fixed(EMBERS[i % EMBERS.len()]),
+                color: ParticleColor::Fixed(EMBERS[i % EMBERS.len()]),
                 ..base
             },
             KeystrokeBurst::Bubbles => Particle {
@@ -1742,6 +1780,30 @@ impl Particle {
                 velocity: throw(TAU * (i as f32 + rng.range(-0.25, 0.25)) / count as f32, rng.range(2.5, 4.5)),
                 size: rng.range(0.2, 0.28),
                 spin: rng.range(2.0, 4.0),
+                ..base
+            },
+            KeystrokeBurst::Explosion => Particle {
+                life: 0.55,
+                velocity: if i == 0 { (0.0, 0.0) } else { throw(TAU * i as f32 / count as f32, rng.range(6.0, 12.0)) },
+                size: if i == 0 { 2.6 } else { rng.range(0.08, 0.16) },
+                color: ParticleColor::Fixed(EMBERS[i % EMBERS.len()]),
+                phase: if i == 0 { -1.0 } else { base.phase },
+                ..base
+            },
+            KeystrokeBurst::Lasers => Particle {
+                life: 0.38,
+                velocity: throw(TAU * i as f32 / count as f32, 13.0),
+                angle: TAU * i as f32 / count as f32,
+                size: 0.07,
+                ..base
+            },
+            KeystrokeBurst::Lightning => {
+                Particle { life: 0.3, angle: TAU * i as f32 / count as f32 + base.angle, size: 1.6, ..base }
+            }
+            KeystrokeBurst::Portal => Particle {
+                life: 0.65,
+                size: if i == 0 { 1.5 } else { 0.12 },
+                phase: if i == 0 { -1.0 } else { TAU * i as f32 / count as f32 },
                 ..base
             },
         }
@@ -1798,11 +1860,35 @@ impl Particle {
                 (1.0 - u) * (0.65 + 0.35 * (TAU * 9.0 * age + self.phase).sin()),
                 ParticleShape::Star { angle: self.angle + self.spin * age },
             ),
+            KeystrokeBurst::Explosion if self.phase < 0.0 => {
+                (0.0, 0.0, self.size * ease_out_cubic(u), (1.0 - u).powi(2), ParticleShape::Ring)
+            }
+            KeystrokeBurst::Explosion => {
+                (drift(vy, 4.0, 5.0, age), drift(vx, 0.0, 5.0, age), self.size * (1.0 - u), 1.0 - u, ParticleShape::Dot)
+            }
+            KeystrokeBurst::Lasers => {
+                (vy * age, vx * age, self.size, 1.0 - u, ParticleShape::Beam { angle: self.angle, length: 1.3 })
+            }
+            KeystrokeBurst::Lightning => (
+                0.0,
+                0.0,
+                self.size * ease_out_quad(u),
+                (1.0 - u) * (0.8 + 0.2 * (age * 40.0).sin()),
+                ParticleShape::Bolt { angle: self.angle },
+            ),
+            KeystrokeBurst::Portal if self.phase < 0.0 => {
+                (0.0, 0.0, self.size * (std::f32::consts::PI * u).sin(), 0.7 * (1.0 - u), ParticleShape::Ring)
+            }
+            KeystrokeBurst::Portal => {
+                let radius = 1.5 * (std::f32::consts::PI * u).sin();
+                let angle = self.phase + age * 9.0;
+                (radius * angle.sin(), radius * angle.cos(), self.size, 1.0 - u, ParticleShape::Star { angle })
+            }
         };
         Some(ParticleLook {
             pos: (self.origin.0 + dy, self.origin.1 + dx * ASPECT),
             size,
-            colour: self.colour,
+            color: self.color,
             alpha: alpha.clamp(0.0, 1.0),
             shape,
         })
@@ -2458,6 +2544,32 @@ mod tests {
     }
 
     #[test]
+    fn creative_bursts_are_bounded_finite_and_finish_without_changing_output() {
+        for style in
+            [KeystrokeBurst::Explosion, KeystrokeBurst::Lasers, KeystrokeBurst::Lightning, KeystrokeBurst::Portal]
+        {
+            let mut rng = Rng(1234);
+            for i in 0..18 {
+                let particle = Particle::new(style, i, 18, 0, 1.0, 1.0, (5.0, 5.0), &mut rng);
+                for age in [0.001, 0.05, 0.2] {
+                    let look = particle.look(1.0 + age).unwrap();
+                    assert!(look.pos.0.is_finite() && look.pos.1.is_finite());
+                    assert!(look.size.is_finite() && look.size >= 0.0);
+                    assert!((0.0..=1.0).contains(&look.alpha));
+                }
+                assert!(particle.look(2.0).is_none());
+            }
+        }
+        for style in [NewText::Matrix, NewText::Hologram] {
+            assert!(output_look(style, 0.01, 123).is_some());
+            assert!(output_look(style, 1.0, 123).is_none());
+        }
+        for age in [0.01, 0.05, 0.1] {
+            assert!(matches!(output_look(NewText::Matrix, age, 123).unwrap().glyph, Some('0' | '1')));
+        }
+    }
+
+    #[test]
     fn every_burst_looks_like_itself() {
         let burst = |style: KeystrokeBurst| {
             let settings = Animations { keystroke_burst: style, ..on() };
@@ -2470,27 +2582,27 @@ mod tests {
 
         let sparks: Vec<_> = burst(KeystrokeBurst::Sparks).particles(1.05).collect();
         assert!((6..=9).contains(&sparks.len()));
-        assert!(sparks.iter().all(|p| p.shape == ParticleShape::Dot && p.colour == ParticleColour::Accent));
+        assert!(sparks.iter().all(|p| p.shape == ParticleShape::Dot && p.color == ParticleColor::Accent));
 
         let anim = burst(KeystrokeBurst::Confetti);
         let confetti: Vec<_> = anim.particles(1.5).collect();
         assert!((6..=8).contains(&confetti.len()));
         assert!(confetti.iter().all(|p| matches!(p.shape, ParticleShape::Square { .. })));
-        let colours: HashSet<_> = confetti
+        let colors: HashSet<_> = confetti
             .iter()
-            .map(|p| match p.colour {
-                ParticleColour::Fixed(c) if CONFETTI.contains(&c) => c,
+            .map(|p| match p.color {
+                ParticleColor::Fixed(c) if CONFETTI.contains(&c) => c,
                 other => panic!("{other:?}"),
             })
             .collect();
-        assert_eq!(colours.len(), CONFETTI.len());
+        assert_eq!(colors.len(), CONFETTI.len());
         // Thrown up, then falling.
         let later: Vec<_> = anim.particles(1.55).collect();
         assert!(confetti.iter().zip(&later).all(|(a, b)| b.pos.0 > a.pos.0));
 
         let embers: Vec<_> = burst(KeystrokeBurst::Embers).particles(1.3).collect();
         assert!((5..=7).contains(&embers.len()));
-        assert!(embers.iter().all(|p| matches!(p.colour, ParticleColour::Fixed(c) if EMBERS.contains(&c))));
+        assert!(embers.iter().all(|p| matches!(p.color, ParticleColor::Fixed(c) if EMBERS.contains(&c))));
         assert!(embers.iter().all(|p| p.shape == ParticleShape::Dot && p.pos.0 < centre.0 - 0.3));
 
         let anim = burst(KeystrokeBurst::Bubbles);

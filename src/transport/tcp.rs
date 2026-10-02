@@ -24,9 +24,19 @@ pub fn description(profile: &Profile) -> String {
 /// Start connecting in the background. Everything after this is reported
 /// through the sink.
 pub fn start(runtime: &tokio::runtime::Handle, profile: Profile, size: (u16, u16), sink: Arc<dyn Sink>) -> Link {
+    start_with_access(runtime, profile, size, sink, crate::network::NetworkAccess::default())
+}
+
+pub fn start_with_access(
+    runtime: &tokio::runtime::Handle,
+    profile: Profile,
+    size: (u16, u16),
+    sink: Arc<dyn Sink>,
+    access: crate::network::NetworkAccess,
+) -> Link {
     let (link, commands) = Link::new();
     runtime.spawn(async move {
-        let reason = run(profile, size, sink.clone(), commands).await;
+        let reason = run(profile, size, sink.clone(), commands, access).await;
         sink.closed(reason);
     });
     link
@@ -53,12 +63,13 @@ async fn run(
     mut size: (u16, u16),
     sink: Arc<dyn Sink>,
     mut commands: UnboundedReceiver<Command>,
+    access: crate::network::NetworkAccess,
 ) -> Option<String> {
     let host = profile.host.trim().to_string();
     // Keep an eye on the command queue while connecting, so closing the tab
     // cancels a slow connect and a resize during it isn't lost.
     let stream = {
-        let connecting = connect_tcp(&host, profile.port);
+        let connecting = connect_tcp(&host, profile.port, &access);
         tokio::pin!(connecting);
         loop {
             tokio::select! {

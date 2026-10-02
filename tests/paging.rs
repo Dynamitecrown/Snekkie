@@ -44,6 +44,7 @@ impl Console {
             ask_host_key: Arc::new(|_| {}),
             password: String::new(),
             key_passphrase: String::new(),
+            network: Default::default(),
         });
         let (mut peer, _) = listener.accept().unwrap();
         peer.set_read_timeout(Some(WAIT)).unwrap();

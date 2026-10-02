@@ -19,8 +19,9 @@ use egui::{
 use parking_lot::Mutex;
 
 use super::animation::{
-    self, Animator, CellLook, CursorLook, LineMark, ParticleColour, ParticleLook, ParticleShape, Snapshot,
+    self, Animator, CellLook, CursorLook, LineMark, ParticleColor, ParticleLook, ParticleShape, Snapshot,
 };
+use super::search::{self, BarAction, SearchBar};
 use crate::session::Session;
 use crate::settings::{Animations, NewLines, Theme};
 use crate::terminal::colors;
@@ -45,7 +46,7 @@ const AUTOSCROLL_MAX_LINES: i32 = 12;
 /// Lines the wheel scrolls per notch, the way every other app does.
 const WHEEL_LINES: f32 = 3.0;
 
-/// Colour mixes in a fade are rounded to this many steps, so cells a moment
+/// Color mixes in a fade are rounded to this many steps, so cells a moment
 /// apart in a typewriter reveal still share a run of text rather than each
 /// being laid out on its own. Too fine a difference to see.
 const MIX_STEPS: f32 = 32.0;
@@ -61,6 +62,7 @@ const MAX_SCALED: usize = 1500;
 pub struct ViewOptions<'a> {
     pub theme: Theme,
     pub syntax: &'a str,
+    pub highlighting_intensity: u8,
     pub regular: FontId,
     pub bold: FontId,
     /// False while a dialog is up: its Enter or Escape must not also reach
@@ -125,6 +127,7 @@ pub struct TerminalView {
     /// When the cursor last restarted its blink (keypress or focus).
     blink_epoch: f64,
     highlight_cache: HashMap<String, Vec<Span>>,
+    highlight_settings: Option<(String, u8)>,
     scrollbar_grab: Option<f32>,
     request_focus: bool,
     animator: Animator,
@@ -135,6 +138,8 @@ pub struct TerminalView {
     /// The live screen as handed to the animator; kept to save allocating
     /// it every frame.
     screen: Vec<char>,
+    /// The find bar (Ctrl+F) and its matches.
+    search: SearchBar,
 }
 
 #[derive(Clone, Copy)]
@@ -220,6 +225,16 @@ impl TerminalView {
         self.request_focus = true;
     }
 
+    /// Show the find bar with the keyboard in it. `prefill` becomes what's
+    /// looked for.
+    pub fn open_search(&mut self, prefill: Option<String>) {
+        self.search.open(prefill);
+    }
+
+    pub fn search(&self) -> &SearchBar {
+        &self.search
+    }
+
     pub fn clear_highlight_cache(&mut self) {
         self.highlight_cache.clear();
     }
@@ -269,8 +284,22 @@ impl TerminalView {
         }
 
         self.handle_mouse(ui, &response, session, &metrics, now, &mut out);
+        self.search.work(ui.ctx(), &session.shared.emulator, metrics.lines);
         let menu_was_open = Popup::is_id_open(ui.ctx(), Popup::default_response_id(&response));
         let menu_shown = self.context_menu(ui, &response, session, options.keyboard, &mut out);
+        // Escape closes search from any of its controls, even after clicking
+        // back into the terminal. Consume it before terminal input is encoded.
+        // A context menu keeps its own Escape dismissal first.
+        if self.search.is_open()
+            && options.keyboard
+            && !menu_shown
+            && !menu_was_open
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape))
+        {
+            self.search.close();
+            self.request_focus = true;
+            ui.ctx().request_repaint();
+        }
         // Menu navigation and dismissal must never go to the device, even
         // on the frame that closes the popup and restores terminal focus.
         let focused = response.has_focus() && options.keyboard && !menu_shown && !menu_was_open;
@@ -296,6 +325,30 @@ impl TerminalView {
         let area = Rect::from_min_max(full.min, pos2(term_rect.max.x, full.max.y));
         self.paint(ui, area, &session.shared.emulator, options, &metrics, blinking, cursor_on, now);
         self.scrollbar(ui, id, bar_rect, session, metrics.lines);
+
+        // Over the text, and registered after the terminal so its clicks
+        // land on the bar rather than starting a selection underneath.
+        if self.search.is_open() {
+            let current = self.search.current().map(|found| {
+                let offset = session.shared.emulator.lock().display_offset() as i32;
+                Rect::from_min_max(
+                    pos2(term_rect.left(), metrics.origin.y + (found.start.line.0 + offset) as f32 * metrics.cell.y),
+                    pos2(term_rect.right(), metrics.origin.y + (found.end.line.0 + offset + 1) as f32 * metrics.cell.y),
+                )
+            });
+            match self.search.ui(ui, term_rect, id, options.keyboard, current) {
+                BarAction::Step(direction) => {
+                    self.search.step(&session.shared.emulator, direction, metrics.lines);
+                    ui.ctx().request_repaint();
+                }
+                BarAction::Close => {
+                    self.search.close();
+                    self.request_focus = true;
+                    ui.ctx().request_repaint();
+                }
+                BarAction::None => {}
+            }
+        }
 
         self.schedule_repaint(ui.ctx(), &options.animations, blinking, now);
         out
@@ -429,8 +482,14 @@ impl TerminalView {
             emu.set_cell_size(metrics.cell.x, metrics.cell.y);
             emu.resize(metrics.columns, metrics.lines)
         };
-        if resized {
+        let intensity = highlight::normalize_intensity(options.highlighting_intensity);
+        let highlighting_changed = self.highlight_settings.as_ref().map(|(syntax, level)| (syntax.as_str(), *level))
+            != Some((options.syntax, intensity));
+        if resized || highlighting_changed {
             self.highlight_cache.clear();
+        }
+        if highlighting_changed {
+            self.highlight_settings = Some((options.syntax.to_string(), intensity));
         }
         self.start_frame(ui.ctx().cumulative_pass_nr(), &options.animations, resized);
         (metrics, resized)
@@ -662,9 +721,21 @@ impl TerminalView {
         cursor_on: bool,
         now: f64,
     ) {
-        let painter = ui.painter().clone();
+        let painter = ui.painter().with_clip_rect(area);
         let theme = options.theme;
         painter.rect_filled(area, 0.0, theme.bg);
+        if theme.effects.appearance() == crate::settings::AppAppearance::Blueprint {
+            let grid_color = theme.fg.gamma_multiply(0.07);
+            let step = (m.cell.y * 2.0).max(24.0);
+            for column in 0..=(area.width() / step) as usize {
+                let x = area.left() + column as f32 * step;
+                painter.line_segment([pos2(x, area.top()), pos2(x, area.bottom())], Stroke::new(0.5, grid_color));
+            }
+            for row in 0..=(area.height() / step) as usize {
+                let y = area.top() + row as f32 * step;
+                painter.line_segment([pos2(area.left(), y), pos2(area.right(), y)], Stroke::new(0.5, grid_color));
+            }
+        }
 
         let emu = emulator.lock();
         // The animator compares the live screen with last frame's under the
@@ -684,7 +755,7 @@ impl TerminalView {
         let offset = grid.display_offset();
         let overrides = term.colors();
         let selection = term.selection.as_ref().and_then(|s| s.to_range(term));
-        let highlighting = options.syntax != "none";
+        let highlighting = options.syntax != "none" && !theme.effects.monochrome;
         let columns = m.columns.min(grid.columns());
         let lines = m.lines.min(grid.screen_lines());
         // With this many glyphs zooming at once they fade in at their own size.
@@ -702,8 +773,14 @@ impl TerminalView {
             None => (0.0, *m, painter),
         };
 
+        let rows = drawn_rows(scroll, lines, offset, grid.history_size());
+        let marks = (!rows.is_empty())
+            .then(|| self.search.marks(&emu, Line(rows.start - offset as i32), Line(rows.end - 1 - offset as i32)))
+            .flatten();
+        let (match_bg, current_bg, current_fg) = search::colors(&theme);
+
         let mut jobs: Vec<(Pos2, LayoutJob, Option<TSTransform>)> = Vec::new();
-        for row in drawn_rows(scroll, lines, offset, grid.history_size()) {
+        for row in rows {
             let line = Line(row - offset as i32);
             let cells = &grid[line];
             // Only the live screen (lines 0 and down) animates.
@@ -712,12 +789,13 @@ impl TerminalView {
 
             let spans = if highlighting {
                 let text: String = (0..columns).map(|c| cells[Column(c)].c).collect();
-                highlight_cached(&mut self.highlight_cache, &text, options.syntax)
+                highlight_cached(&mut self.highlight_cache, &text, options.syntax, options.highlighting_intensity)
             } else {
                 Vec::new()
             };
-            let syntax_color =
-                |column: usize| spans.iter().find(|s| s.start <= column && column < s.end).map(|s| s.category.color());
+            let syntax_color = |column: usize| {
+                spans.iter().find(|s| s.start <= column && column < s.end).map(|s| s.category.color_on(theme.bg))
+            };
 
             let mut runs: Vec<Run> = Vec::new();
             let mut bg_run: Option<(usize, usize, Color32)> = None;
@@ -739,10 +817,18 @@ impl TerminalView {
                 let width = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
                 let (mut fg, mut bg) = colors::cell_colors(cell, &theme, overrides);
                 let selected = selection.is_some_and(|s| s.contains(Point::new(line, Column(column))));
+                let found = marks.and_then(|m| m.at(line, column));
                 if selected {
                     bg = theme.selection;
-                } else if let Some(color) = syntax_color(column) {
-                    fg = color;
+                } else if found == Some(true) {
+                    (bg, fg) = (current_bg, current_fg);
+                } else {
+                    if found.is_some() {
+                        bg = match_bg;
+                    }
+                    if let Some(color) = syntax_color(column) {
+                        fg = color;
+                    }
                 }
                 let look = live.and_then(|(a, live)| a.cell(now, live, column));
                 if look.is_some_and(|l| l.hidden) && !selected {
@@ -766,7 +852,7 @@ impl TerminalView {
                     if look.flash > 0.0 {
                         flashes.push((column, width, look.flash));
                     }
-                    fg = animated_colour(fg, bg, theme.cursor, &look);
+                    fg = animated_color(fg, bg, theme.cursor, &look);
                     ch = look.glyph.unwrap_or(ch);
                     (offset_y, scale) = (look.offset_y, if keep_size { 1.0 } else { look.scale });
                 }
@@ -780,7 +866,7 @@ impl TerminalView {
                 // changing size grows about its own centre, so it's alone too.
                 let simple = ch.is_ascii() && width == 1 && scale == 1.0;
                 // While text fades or moves, a plain blank joins the run it
-                // follows whatever its colour: it draws nothing, and splitting
+                // follows whatever its color: it draws nothing, and splitting
                 // there would lay out every word on its own.
                 let blank = anim.is_some() && ch == ' ' && !underline && !strike;
                 let extend = simple
@@ -871,14 +957,11 @@ impl TerminalView {
 
         for (pos, job, motion) in jobs {
             let galley = ui.fonts_mut(|f| f.layout_job(job));
-            match motion {
-                None => painter.galley(pos, galley, theme.fg),
-                Some(transform) => {
-                    let mut text = TextShape::new(pos, galley, theme.fg);
-                    text.transform(transform);
-                    painter.add(text);
-                }
+            let mut text = TextShape::new(pos, galley, theme.fg);
+            if let Some(transform) = motion {
+                text.transform(transform);
             }
+            paint_terminal_text(&painter, text, theme.effects.crt);
         }
 
         if let Some(cursor) = &animated_cursor {
@@ -888,6 +971,9 @@ impl TerminalView {
             let column = point.column.0;
             if row < m.lines && column < m.columns {
                 let rect = m.cell_rect(row, column, if wide { 2 } else { 1 });
+                if theme.effects.crt && (!focused || cursor_on) {
+                    paint_crt_cursor_glow(&painter, rect, theme.cursor);
+                }
                 if !focused {
                     painter.rect_stroke(
                         rect.shrink(0.5),
@@ -908,9 +994,15 @@ impl TerminalView {
         // Last, over everything, but still inside the terminal.
         if let Some(anim) = anim {
             let painter = ui.painter().with_clip_rect(area);
-            for particle in anim.particles(now) {
+            for mut particle in anim.particles(now) {
+                if theme.effects.monochrome {
+                    particle.color = ParticleColor::Accent;
+                }
                 paint_particle(&painter, &d, &particle, offset, theme.cursor);
             }
+        }
+        if theme.effects.crt {
+            paint_crt_scanlines(&ui.painter().with_clip_rect(area), area);
         }
     }
 
@@ -929,6 +1021,9 @@ impl TerminalView {
         let rect = |(row, column): (f32, f32)| d.rect_at(row, column, cursor.width);
         let head = rect(cursor.look.pos);
         if !focused {
+            if theme.effects.crt {
+                paint_crt_cursor_glow(painter, head, theme.cursor);
+            }
             painter.rect_stroke(
                 head.shrink(0.5),
                 CornerRadius::ZERO,
@@ -952,6 +1047,9 @@ impl TerminalView {
         if level <= 0.0 {
             return;
         }
+        if theme.effects.crt {
+            paint_crt_cursor_glow(painter, head, theme.cursor.gamma_multiply(level));
+        }
         let fill = theme.cursor.gamma_multiply(level);
         match cursor.look.tail {
             Some(tail) => {
@@ -969,7 +1067,7 @@ impl TerminalView {
 
     fn scrollbar(&mut self, ui: &mut Ui, id: Id, rect: Rect, session: &Session, lines: usize) {
         let painter = ui.painter();
-        painter.rect_filled(rect, 0.0, crate::ui::style::BG_WINDOW);
+        painter.rect_filled(rect, 0.0, ui.visuals().panel_fill);
 
         let (history, offset) = {
             let emu = session.shared.emulator.lock();
@@ -1016,22 +1114,63 @@ impl TerminalView {
         }
 
         let color = if response.dragged() || response.hovered() {
-            crate::ui::style::lighter(crate::ui::style::BORDER, 2.2)
+            crate::ui::style::lighter(crate::ui::style::border(ui), 2.2)
         } else {
-            crate::ui::style::lighter(crate::ui::style::BORDER, 1.5)
+            crate::ui::style::lighter(crate::ui::style::border(ui), 1.5)
         };
         ui.painter().rect_filled(thumb, 4.0, color);
     }
 }
 
-fn highlight_cached(cache: &mut HashMap<String, Vec<Span>>, text: &str, syntax: &str) -> Vec<Span> {
+/// Reuse the laid-out glyphs for a small static halo, leaving the centre
+/// crisp. Keeping each run's colors and opacity also preserves reverse
+/// video and text animations without extra font layouts.
+fn paint_terminal_text(painter: &Painter, text: TextShape, crt: bool) {
+    if crt {
+        let radius = 1.5 / painter.ctx().pixels_per_point();
+        for offset in [vec2(-radius, 0.0), vec2(radius, 0.0), vec2(0.0, -radius), vec2(0.0, radius)] {
+            let mut glow = text.clone();
+            glow.pos += offset;
+            glow.opacity_factor *= 0.18;
+            painter.add(glow);
+        }
+    }
+    painter.add(text);
+}
+
+fn paint_crt_cursor_glow(painter: &Painter, rect: Rect, color: Color32) {
+    let pixel = 1.0 / painter.ctx().pixels_per_point();
+    let glow = RectShape::filled(rect.expand(pixel), CornerRadius::ZERO, color.gamma_multiply(0.25));
+    painter.add(glow.with_blur_width(4.0 * pixel));
+}
+
+/// One mesh for the whole screen, aligned to physical pixels and clipped
+/// to this terminal. No timer: the scanlines never move or flicker.
+fn paint_crt_scanlines(painter: &Painter, area: Rect) {
+    let area = area.intersect(painter.clip_rect());
+    if !area.is_positive() {
+        return;
+    }
+    let scale = painter.ctx().pixels_per_point();
+    let pixel = 1.0 / scale;
+    let mut mesh = egui::Mesh::default();
+    let mut y = (area.top() * scale / 3.0).ceil() * 3.0 / scale;
+    while y < area.bottom() {
+        let line = Rect::from_min_max(pos2(area.left(), y), pos2(area.right(), (y + pixel).min(area.bottom())));
+        mesh.add_colored_rect(line, Color32::from_black_alpha(24));
+        y += 3.0 * pixel;
+    }
+    painter.add(mesh);
+}
+
+fn highlight_cached(cache: &mut HashMap<String, Vec<Span>>, text: &str, syntax: &str, intensity: u8) -> Vec<Span> {
     if let Some(spans) = cache.get(text) {
         return spans.clone();
     }
     if cache.len() >= HIGHLIGHT_CACHE_MAX {
         cache.clear(); // cheaper than tracking an LRU for this
     }
-    let spans = highlight::highlight_line(text, syntax);
+    let spans = highlight::highlight_line(text, syntax, intensity);
     cache.insert(text.to_string(), spans.clone());
     spans
 }
@@ -1085,10 +1224,10 @@ fn drawn_rows(scroll: f32, lines: usize, display_offset: usize, history: usize) 
     first.max(oldest)..end.min(past_newest)
 }
 
-/// A glyph's colour partway through an animation: `accent` of the way to
-/// the accent colour, then faded toward its cell's background by
+/// A glyph's color partway through an animation: `accent` of the way to
+/// the accent color, then faded toward its cell's background by
 /// `1 - alpha`.
-fn animated_colour(fg: Color32, bg: Color32, accent: Color32, look: &CellLook) -> Color32 {
+fn animated_color(fg: Color32, bg: Color32, accent: Color32, look: &CellLook) -> Color32 {
     let step = |t: f32| (t.clamp(0.0, 1.0) * MIX_STEPS).round() / MIX_STEPS;
     fg.lerp_to_gamma(accent, step(look.accent)).lerp_to_gamma(bg, step(1.0 - look.alpha))
 }
@@ -1185,6 +1324,24 @@ fn paint_line_mark(painter: &Painter, d: &Metrics, row: f32, mark: &LineMark, th
                 }
             }
         }
+        NewLines::Laser => {
+            let head = span(mark.reach, mark.reach + 0.15);
+            let from = head.center() - vec2(d.cell.x * 2.0, 0.0);
+            for (width, alpha) in [(6.0, 0.12), (3.0, 0.3), (1.0, 1.0)] {
+                painter.line_segment(
+                    [from, head.center()],
+                    Stroke::new(width, theme.cursor.gamma_multiply(mark.alpha * alpha)),
+                );
+            }
+        }
+        NewLines::Radar => {
+            let centre = span(start, end).center();
+            painter.circle_stroke(
+                centre,
+                mark.reach * d.cell.x,
+                Stroke::new(1.5, theme.cursor.gamma_multiply(mark.alpha)),
+            );
+        }
     }
 }
 
@@ -1197,9 +1354,9 @@ fn paint_particle(painter: &Painter, d: &Metrics, particle: &ParticleLook, displ
     if radius <= 0.0 || particle.alpha <= 0.0 {
         return;
     }
-    let colour = match particle.colour {
-        ParticleColour::Accent => accent,
-        ParticleColour::Fixed(colour) => colour,
+    let color = match particle.color {
+        ParticleColor::Accent => accent,
+        ParticleColor::Fixed(color) => color,
     }
     .gamma_multiply(particle.alpha);
     // Corners clockwise on screen, turned by `angle` about the centre.
@@ -1209,23 +1366,40 @@ fn paint_particle(painter: &Painter, d: &Metrics, particle: &ParticleLook, displ
     };
     match particle.shape {
         ParticleShape::Dot => {
-            painter.circle_filled(centre, radius, colour);
+            painter.circle_filled(centre, radius, color);
         }
         ParticleShape::Square { angle } => {
             let r = radius;
             let corners = turned(angle, [vec2(-r, -r), vec2(r, -r), vec2(r, r), vec2(-r, r)]);
-            painter.add(Shape::convex_polygon(corners, colour, Stroke::NONE));
+            painter.add(Shape::convex_polygon(corners, color, Stroke::NONE));
         }
         ParticleShape::Star { angle } => {
             // Two slim crossed diamonds make the four points.
             let (long, thin) = (radius, 0.3 * radius);
             for arm in [angle, angle + FRAC_PI_2] {
                 let corners = turned(arm, [vec2(long, 0.0), vec2(0.0, thin), vec2(-long, 0.0), vec2(0.0, -thin)]);
-                painter.add(Shape::convex_polygon(corners, colour, Stroke::NONE));
+                painter.add(Shape::convex_polygon(corners, color, Stroke::NONE));
             }
         }
         ParticleShape::Ring => {
-            painter.circle_stroke(centre, radius, Stroke::new((0.12 * radius).clamp(1.0, 1.5), colour));
+            painter.circle_stroke(centre, radius, Stroke::new((0.12 * radius).clamp(1.0, 1.5), color));
+        }
+        ParticleShape::Beam { angle, length } => {
+            let direction = Rot2::from_angle(angle) * vec2(length * d.cell.y, 0.0);
+            for (width, alpha) in [(radius * 5.0, 0.15), (radius * 2.0, 0.5), (radius, 1.0)] {
+                painter.line_segment(
+                    [centre - direction, centre],
+                    Stroke::new(width.max(1.0), color.gamma_multiply(alpha)),
+                );
+            }
+        }
+        ParticleShape::Bolt { angle } => {
+            let rotation = Rot2::from_angle(angle);
+            let points =
+                [vec2(0.0, 0.0), vec2(0.35, -0.2), vec2(0.3, 0.25), vec2(0.7, 0.08), vec2(0.65, 0.35), vec2(1.0, 0.0)]
+                    .map(|p| centre + rotation * p * radius);
+            painter.add(Shape::line(points.to_vec(), Stroke::new(5.0, color.gamma_multiply(0.18))));
+            painter.add(Shape::line(points.to_vec(), Stroke::new(1.2, color)));
         }
     }
 }
@@ -1431,20 +1605,20 @@ mod tests {
     }
 
     #[test]
-    fn animated_colours_mix_toward_the_accent_and_fade_into_the_cell() {
+    fn animated_colors_mix_toward_the_accent_and_fade_into_the_cell() {
         let (fg, bg, accent) = (Color32::from_rgb(200, 200, 200), Color32::from_rgb(20, 20, 20), Color32::GREEN);
-        let colour = |alpha: f32, accent_t: f32| {
-            animated_colour(fg, bg, accent, &CellLook { alpha, accent: accent_t, ..CellLook::PLAIN })
+        let color = |alpha: f32, accent_t: f32| {
+            animated_color(fg, bg, accent, &CellLook { alpha, accent: accent_t, ..CellLook::PLAIN })
         };
-        assert_eq!(colour(1.0, 0.0), fg);
-        assert_eq!(colour(0.0, 0.0), bg);
-        assert_eq!(colour(1.0, 1.0), accent);
-        assert_eq!(colour(0.0, 1.0), bg);
-        let half = colour(0.5, 0.0);
+        assert_eq!(color(1.0, 0.0), fg);
+        assert_eq!(color(0.0, 0.0), bg);
+        assert_eq!(color(1.0, 1.0), accent);
+        assert_eq!(color(0.0, 1.0), bg);
+        let half = color(0.5, 0.0);
         assert!(half.r() > bg.r() && half.r() < fg.r());
-        // Nearly the same point in a fade: the same colour, so one run of text.
-        assert_eq!(colour(0.501, 0.0), colour(0.505, 0.0));
-        assert_eq!(colour(0.999, 0.0), fg);
+        // Nearly the same point in a fade: the same color, so one run of text.
+        assert_eq!(color(0.501, 0.0), color(0.505, 0.0));
+        assert_eq!(color(0.999, 0.0), fg);
     }
 
     #[test]
@@ -1616,6 +1790,7 @@ mod tests {
         ViewOptions {
             theme: Theme::default(),
             syntax: "none",
+            highlighting_intensity: highlight::DEFAULT_INTENSITY,
             regular: FontId::monospace(14.0),
             bold: FontId::monospace(14.0),
             keyboard: false,
@@ -1649,6 +1824,113 @@ mod tests {
 
     fn texts(out: &egui::FullOutput) -> usize {
         out.shapes.iter().filter(|s| matches!(s.shape, Shape::Text(_))).count()
+    }
+
+    #[test]
+    fn changing_intensity_or_vendor_recolors_existing_output() {
+        let ctx = egui::Context::default();
+        let emu = emulator(60, 5, 100);
+        emu.lock().feed(b"show 192.0.2.1 mlag\x1b[?25l");
+        let mut view = TerminalView::default();
+        let mut options = view_options(Animations::default());
+        options.syntax = "arista_eos";
+        options.highlighting_intensity = 1;
+        let size = vec2(600.0, 200.0);
+        let _ = draw(&ctx, &mut view, &emu, &options, 1.0, size);
+        let essential: Vec<_> = view.highlight_cache.values().flatten().cloned().collect();
+        assert!(essential.iter().all(|s| s.category == highlight::Category::Value));
+        options.highlighting_intensity = 4;
+        let _ = draw(&ctx, &mut view, &emu, &options, 1.1, size);
+        assert!(
+            view.highlight_cache
+                .values()
+                .flatten()
+                .any(|s| s.start == 15 && s.category == highlight::Category::Keyword)
+        );
+        options.syntax = "juniper_junos";
+        let _ = draw(&ctx, &mut view, &emu, &options, 1.2, size);
+        assert!(!view.highlight_cache.values().flatten().any(|s| s.start == 15));
+        options.highlighting_intensity = 1;
+        let _ = draw(&ctx, &mut view, &emu, &options, 1.3, size);
+        assert_eq!(view.highlight_cache.values().flatten().cloned().collect::<Vec<_>>(), essential);
+        assert!(emu.lock().screen_text().starts_with("show 192.0.2.1 mlag"));
+    }
+
+    #[test]
+    fn monochrome_output_also_suppresses_syntax_colors() {
+        let ctx = egui::Context::default();
+        let emu = emulator(60, 5, 100);
+        emu.lock().feed(b"\x1b[31mSwitch# show ip interface brief\x1b[0m\r\nVlan1 10.0.0.1 up\x1b[?25l");
+        let mut view = TerminalView::default();
+        let mut options = view_options(Animations::default());
+        options.theme = crate::settings::AppSettings::default().theme_named("Monochrome Green");
+        options.syntax = "cisco_ios";
+        let out = draw(&ctx, &mut view, &emu, &options, 1.0, vec2(600.0, 200.0));
+        let runs: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                Shape::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(!runs.is_empty());
+        for run in runs {
+            assert!(run.galley.job.sections.iter().all(|s| s.format.color == options.theme.fg));
+        }
+        assert!(view.highlight_cache.is_empty());
+        // The theme changes only rendering; copy/export still reads the same text.
+        assert!(emu.lock().screen_text().contains("Vlan1 10.0.0.1 up"));
+    }
+
+    #[test]
+    fn crt_glow_reuses_glyphs_and_scanlines_stay_clipped_without_animation() {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(2.0);
+        let emu = emulator(40, 5, 100);
+        emu.lock().feed(b"Switch# show run\x1b[?25l");
+        let mut view = TerminalView::default();
+        let mut options = view_options(Animations::default());
+        options.theme = crate::settings::AppSettings::default().theme_named("CRT");
+        let size = vec2(400.0, 200.0);
+        for i in 0..3 {
+            let _ = draw(&ctx, &mut view, &emu, &options, 10.0 + f64::from(i) * 0.01, size);
+        }
+        let out = draw(&ctx, &mut view, &emu, &options, 10.1, size);
+        let runs: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                Shape::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs.len(), 5, "one text run with four glow copies");
+        assert_eq!(runs.last().unwrap().opacity_factor, 1.0);
+        for glow in &runs[..4] {
+            assert!(std::sync::Arc::ptr_eq(&glow.galley, &runs[4].galley));
+            assert_eq!(glow.opacity_factor, 0.18);
+        }
+        let (clipped, mesh) = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                Shape::Mesh(m) if m.vertices.iter().all(|v| v.color == Color32::from_black_alpha(24)) => {
+                    Some((s.clip_rect, m))
+                }
+                _ => None,
+            })
+            .expect("CRT scanlines are missing");
+        assert!(!mesh.vertices.is_empty());
+        assert!(mesh.vertices.iter().all(|v| clipped.contains(v.pos)));
+        let pixel = 1.0 / ctx.pixels_per_point();
+        for line in mesh.vertices.as_chunks::<4>().0 {
+            let top = line.iter().map(|v| v.pos.y).fold(f32::INFINITY, f32::min);
+            let bottom = line.iter().map(|v| v.pos.y).fold(f32::NEG_INFINITY, f32::max);
+            assert!((bottom - top - pixel).abs() < 1e-5);
+        }
+        assert!((repaint_delay(&out).as_secs_f64() - until_next_blink(10.1, 0.0)).abs() < 1e-6);
+        assert!(view.screen.is_empty(), "CRT should not turn on the animator");
     }
 
     #[test]

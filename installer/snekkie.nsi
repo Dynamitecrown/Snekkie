@@ -4,14 +4,15 @@
 ; administrator rights. Running a newer installer over an existing install
 ; upgrades it in place: same folder, same shortcuts, one entry in
 ; Apps & features. Saved sessions and settings live in %APPDATA%\snekkie
-; and are never touched by installing, upgrading or uninstalling.
+; are kept during upgrades. Network privacy choices are stored separately
+; in %APPDATA%\snekkie\network.ini and can be changed in Preferences.
 ;
 ; Build (from the repository root):
-;   makensis -DVERSION=2.4.1 -DEXE=target\release\snekkie.exe installer\snekkie.nsi
+;   makensis -DVERSION=2.5.0 -DEXE=target\release\snekkie.exe installer\snekkie.nsi
 ;
 ; Unattended use:
-;   Snekkie-Setup-2.4.1.exe /S            install or upgrade silently
-;   Snekkie-Setup-2.4.1.exe /S /D=C:\Dir  ...into a specific folder (first install)
+;   Snekkie-Setup-2.5.0.exe /S            install or upgrade silently
+;   Snekkie-Setup-2.5.0.exe /S /D=C:\Dir  ...into a specific folder (first install)
 ;   "%LOCALAPPDATA%\Programs\Snekkie\uninstall.exe" /S
 ;
 ; Snekkie's own "Update now" runs the new installer with /UPDATE and then
@@ -72,11 +73,18 @@ VIAddVersionKey "CompanyName" "${PUBLISHER}"
 !include "LogicLib.nsh"
 !include "WordFunc.nsh"
 !include "FileFunc.nsh"
+!include "nsDialogs.nsh"
 
 Var InstalledVersion
 Var IsUpgrade
 Var IsUpdate
 Var WelcomeText
+Var OfflineMode
+Var CheckUpdates
+Var NetworkChoiceChanged
+Var NetworkPage
+Var OfflineCheckbox
+Var UpdatesCheckbox
 
 !define MUI_ICON "..\assets\icon.ico"
 !define MUI_UNICON "..\assets\icon.ico"
@@ -98,6 +106,7 @@ Var WelcomeText
 ; An upgrade goes where the existing install is, so don't offer a choice.
 !define MUI_PAGE_CUSTOMFUNCTION_PRE SkipOnUpgrade
 !insertmacro MUI_PAGE_DIRECTORY
+Page custom NetworkOptionsCreate NetworkOptionsLeave
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_FINISHPAGE_RUN "$INSTDIR\snekkie.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Start ${APP_NAME}"
@@ -159,8 +168,44 @@ FunctionEnd
 Function .onInit
   StrCpy $IsUpgrade 0
   StrCpy $IsUpdate 0
+  StrCpy $OfflineMode 0
+  StrCpy $CheckUpdates 1
+  StrCpy $NetworkChoiceChanged 0
+  ${If} ${FileExists} "$APPDATA\snekkie\network.ini"
+    ReadINIStr $OfflineMode "$APPDATA\snekkie\network.ini" "Network" "OfflineMode"
+    ReadINIStr $CheckUpdates "$APPDATA\snekkie\network.ini" "Network" "CheckForUpdates"
+    ; A damaged policy fails closed, as it does in the application.
+    ${If} $OfflineMode != 0
+      StrCpy $OfflineMode 1
+      StrCpy $CheckUpdates 0
+    ${EndIf}
+    ${If} $CheckUpdates != 1
+      StrCpy $CheckUpdates 0
+    ${EndIf}
+  ${EndIf}
+  ${GetParameters} $0
+  ClearErrors
+  ${GetOptions} $0 "/OFFLINE" $1
+  ${IfNot} ${Errors}
+    StrCpy $OfflineMode 1
+    StrCpy $CheckUpdates 0
+    StrCpy $NetworkChoiceChanged 1
+  ${EndIf}
+  ClearErrors
+  ${GetOptions} $0 "/ONLINE" $1
+  ${IfNot} ${Errors}
+    StrCpy $OfflineMode 0
+    StrCpy $NetworkChoiceChanged 1
+  ${EndIf}
+  ClearErrors
+  ${GetOptions} $0 "/NOUPDATES" $1
+  ${IfNot} ${Errors}
+    StrCpy $CheckUpdates 0
+    StrCpy $NetworkChoiceChanged 1
+  ${EndIf}
   ReadRegStr $InstalledVersion HKCU "${UNINSTALL_KEY}" "DisplayVersion"
   ${If} $InstalledVersion == ""
+    StrCpy $NetworkChoiceChanged 1
     StrCpy $WelcomeText "Setup will install ${APP_NAME} ${VERSION} on your computer.$\r$\n$\r$\nNo administrator rights are needed. Click Next to continue."
     Return
   ${EndIf}
@@ -195,6 +240,58 @@ Function .onInit
   ${EndIf}
 FunctionEnd
 
+Function NetworkOptionsCreate
+  ${If} $IsUpdate == 1
+    Abort
+  ${EndIf}
+  !insertmacro MUI_HEADER_TEXT "Network privacy" "Choose how Snekkie uses online services."
+  nsDialogs::Create 1018
+  Pop $NetworkPage
+  ${If} $NetworkPage == error
+    Abort
+  ${EndIf}
+  ${NSD_CreateCheckbox} 0 4u 100% 16u "Enable offline mode"
+  Pop $OfflineCheckbox
+  ${NSD_SetState} $OfflineCheckbox $OfflineMode
+  ${NSD_OnClick} $OfflineCheckbox NetworkOfflineChanged
+  ${NSD_CreateLabel} 10u 25u 95% 48u "Disable online update checks and downloads. Ask before every public IP connection and before resolving a hostname. Serial, localhost and private IP connections stay available."
+  Pop $0
+  ${NSD_CreateCheckbox} 0 80u 100% 16u "Check for updates when Snekkie starts"
+  Pop $UpdatesCheckbox
+  ${NSD_SetState} $UpdatesCheckbox $CheckUpdates
+  ${NSD_OnClick} $UpdatesCheckbox NetworkUpdatesChanged
+  ${If} $OfflineMode == 1
+    EnableWindow $UpdatesCheckbox 0
+  ${EndIf}
+  ${NSD_CreateLabel} 0 108u 100% 38u "You can change these choices later in Settings > Preferences > General. Existing sessions, themes and passwords are not changed. In-app upgrades keep your privacy choices."
+  Pop $0
+  nsDialogs::Show
+FunctionEnd
+
+Function NetworkOfflineChanged
+  Pop $0
+  StrCpy $NetworkChoiceChanged 1
+  ${NSD_GetState} $OfflineCheckbox $OfflineMode
+  ${If} $OfflineMode == 1
+    StrCpy $CheckUpdates 0
+    ${NSD_Uncheck} $UpdatesCheckbox
+    EnableWindow $UpdatesCheckbox 0
+  ${Else}
+    EnableWindow $UpdatesCheckbox 1
+  ${EndIf}
+FunctionEnd
+
+Function NetworkUpdatesChanged
+  Pop $0
+  StrCpy $NetworkChoiceChanged 1
+  ${NSD_GetState} $UpdatesCheckbox $CheckUpdates
+FunctionEnd
+
+Function NetworkOptionsLeave
+  ${NSD_GetState} $OfflineCheckbox $OfflineMode
+  ${NSD_GetState} $UpdatesCheckbox $CheckUpdates
+FunctionEnd
+
 Function SkipOnUpgrade
   ${If} $IsUpgrade == 1
     Abort
@@ -224,6 +321,20 @@ Section "Install"
   ${EndIf}
   Call WaitForAppToClose
 
+  ${If} $NetworkChoiceChanged == 1
+    ${If} $OfflineMode == 1
+      StrCpy $CheckUpdates 0
+    ${EndIf}
+    CreateDirectory "$APPDATA\snekkie"
+    ClearErrors
+    WriteINIStr "$APPDATA\snekkie\network.ini" "Network" "OfflineMode" "$OfflineMode"
+    WriteINIStr "$APPDATA\snekkie\network.ini" "Network" "CheckForUpdates" "$CheckUpdates"
+    ${If} ${Errors}
+      SetErrorLevel 6
+      MessageBox MB_OK|MB_ICONSTOP "Could not save network privacy choices. Setup cannot continue safely." /SD IDOK
+      Abort
+    ${EndIf}
+  ${EndIf}
   SetOutPath "$INSTDIR"
   SetOverwrite on
   File "/oname=snekkie.exe" "${EXE}"

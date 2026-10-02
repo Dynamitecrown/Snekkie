@@ -97,8 +97,16 @@ fn script() -> Vec<(f64, Step)> {
 fn draw(ui: &mut Ui, view: &mut TerminalView, emulator: &Mutex<Emulator>, theme: Theme, animations: Animations) {
     let font = TextStyle::Monospace.resolve(ui.style());
     let row = ui.fonts_mut(|f| f.row_height(&font)).ceil();
-    let options = ViewOptions { theme, syntax: "none", regular: font.clone(), bold: font, keyboard: false, animations };
-    egui::Frame::new().stroke(Stroke::new(1.0, style::BORDER)).show(ui, |ui| {
+    let options = ViewOptions {
+        theme,
+        syntax: "none",
+        highlighting_intensity: crate::terminal::highlight::DEFAULT_INTENSITY,
+        regular: font.clone(),
+        bold: font,
+        keyboard: false,
+        animations,
+    };
+    egui::Frame::new().stroke(Stroke::new(1.0, style::border(ui))).show(ui, |ui| {
         let size = vec2(ui.available_width(), ROWS as f32 * row + 2.0 * MARGIN);
         view.show_demo(ui, size, emulator, &options);
     });
@@ -241,14 +249,14 @@ mod tests {
         out
     }
 
-    /// The pieces of text a frame drew: what, where, how big, what colours.
+    /// The pieces of text a frame drew: what, where, how big, what colors.
     fn drawn_text(out: &egui::FullOutput) -> Vec<String> {
         out.shapes
             .iter()
             .filter_map(|clipped| match &clipped.shape {
                 egui::Shape::Text(text) => {
-                    let colours: Vec<_> = text.galley.job.sections.iter().map(|s| s.format.color).collect();
-                    Some(format!("{:?} at {:?}, {:?}, {colours:?}", text.galley.text(), text.pos, text.galley.rect))
+                    let colors: Vec<_> = text.galley.job.sections.iter().map(|s| s.format.color).collect();
+                    Some(format!("{:?} at {:?}, {:?}, {colors:?}", text.galley.text(), text.pos, text.galley.rect))
                 }
                 _ => None,
             })

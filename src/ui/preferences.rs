@@ -1,4 +1,4 @@
-//! Preferences dialog: colour theme and defaults for new sessions on one
+//! Preferences dialog: color theme and defaults for new sessions on one
 //! page, animations on the other.
 
 use std::collections::BTreeMap;
@@ -6,11 +6,14 @@ use std::collections::BTreeMap;
 use egui::{Color32, DragValue, RichText, Slider, Stroke, Ui};
 
 use super::animation_preview::AnimationPreview;
+use super::syntax_preview::SyntaxPreview;
+use super::theme_preview::ThemePreview;
 use super::{sidebar, style};
 use crate::settings::{
     self, ANIMATION_SPEED_RANGE, AppSettings, CursorBlink, CursorMotion, KeystrokeBurst, NewLines, NewText, Reveal,
     Scheme, Scrolling, Shake, Theme, TypedText,
 };
+use crate::terminal::highlight;
 
 /// Width of the dialog, the same on both pages so it doesn't jump about
 /// when you switch: room for two groups of animation styles side by side,
@@ -34,6 +37,7 @@ const MIN_PAGE_HEIGHT: f32 = 60.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     General,
+    Highlighting,
     Animations,
 }
 
@@ -43,7 +47,7 @@ pub enum Outcome {
     Open,
     Cancel,
     Save(AppSettings),
-    /// Ask for a name to save the current colours under.
+    /// Ask for a name to save the current colors under.
     AskThemeName {
         suggested: String,
     },
@@ -59,6 +63,10 @@ pub struct Preferences {
     /// The tallest a page has been, in points.
     page_height: f32,
     preview: AnimationPreview,
+    theme_preview: ThemePreview,
+    syntax_preview: SyntaxPreview,
+    preview_syntax: String,
+    pub update_busy: bool,
 }
 
 impl Preferences {
@@ -70,6 +78,10 @@ impl Preferences {
             page: Page::General,
             page_height: 0.0,
             preview: AnimationPreview::default(),
+            theme_preview: ThemePreview::default(),
+            syntax_preview: SyntaxPreview::default(),
+            preview_syntax: "cisco_ios".into(),
+            update_busy: false,
         }
     }
 
@@ -80,7 +92,7 @@ impl Preferences {
         s
     }
 
-    /// Colours currently on screen.
+    /// Colors currently on screen.
     pub fn current_colors(&self) -> Theme {
         self.working().theme_named(&self.settings.theme)
     }
@@ -90,7 +102,7 @@ impl Preferences {
         self.saved_themes.contains_key(name)
     }
 
-    /// Store the colours on screen under a name. Built-in names are refused.
+    /// Store the colors on screen under a name. Built-in names are refused.
     pub fn save_theme(&mut self, name: &str) -> Result<(), String> {
         let name = name.trim();
         if name.is_empty() {
@@ -134,6 +146,7 @@ impl Preferences {
                 let top = ui.cursor().min.y;
                 match page {
                     Page::General => self.general_page(ui, monospace_fonts, &mut outcome),
+                    Page::Highlighting => self.highlighting_page(ui),
                     Page::Animations => self.animations_page(ui),
                 }
                 // Each page takes the height of the tallest seen, so once
@@ -165,7 +178,9 @@ impl Preferences {
         // underline, so it's laid down first and filled in after.
         let rule = ui.painter().add(egui::Shape::Noop);
         let tabs = ui.horizontal(|ui| {
-            for (page, label) in [(Page::General, "General"), (Page::Animations, "Animations")] {
+            for (page, label) in
+                [(Page::General, "General"), (Page::Highlighting, "Highlighting"), (Page::Animations, "Animations")]
+            {
                 if style::tab_button(ui, label, self.page == page, true, accent).clicked() && self.page != page {
                     self.page = page;
                     // A dialog is centred by its size last frame; draw again
@@ -176,22 +191,23 @@ impl Preferences {
             }
         });
         let y = tabs.response.rect.bottom();
-        ui.painter().set(rule, egui::Shape::hline(ui.max_rect().x_range(), y, Stroke::new(1.0, style::BORDER)));
+        ui.painter().set(rule, egui::Shape::hline(ui.max_rect().x_range(), y, Stroke::new(1.0, style::border(ui))));
     }
 
     fn general_page(&mut self, ui: &mut Ui, monospace_fonts: &[String], outcome: &mut Outcome) {
         egui::Grid::new("prefs_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label("Colour theme");
+            ui.label("Color theme");
             ui.horizontal(|ui| {
                 let names = self.working().theme_names();
-                egui::ComboBox::from_id_salt("theme").width(180.0).selected_text(self.settings.theme.clone()).show_ui(
-                    ui,
-                    |ui| {
+                egui::ComboBox::from_id_salt("theme")
+                    .width(180.0)
+                    .height(320.0)
+                    .selected_text(self.settings.theme.clone())
+                    .show_ui(ui, |ui| {
                         for name in names {
                             ui.selectable_value(&mut self.settings.theme, name.clone(), name);
                         }
-                    },
-                );
+                    });
                 if ui.button("Save as…").clicked() {
                     let current = &self.settings.theme;
                     let suggested = if settings::is_builtin(current) || current == "Custom" {
@@ -210,27 +226,14 @@ impl Preferences {
 
             ui.label("Preview");
             let colors = self.current_colors();
-            egui::Frame::new().fill(colors.bg).stroke(egui::Stroke::new(1.0, style::BORDER)).inner_margin(8.0).show(
-                ui,
-                |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        ui.label(RichText::new("user@host:~$ ls -la").monospace().color(colors.fg));
-                        ui.label(RichText::new(" ").monospace().background_color(colors.cursor));
-                        ui.label(RichText::new("   ").monospace());
-                        ui.label(
-                            RichText::new("selected").monospace().color(colors.fg).background_color(colors.selection),
-                        );
-                    });
-                },
-            );
+            self.theme_preview.ui(ui, colors);
             ui.end_row();
         });
 
         let mut colors = self.current_colors();
         let mut colors_changed = false;
         ui.add_space(4.0);
-        egui::CollapsingHeader::new("Theme colours").default_open(true).show(ui, |ui| {
+        egui::CollapsingHeader::new("Theme colors").default_open(true).show(ui, |ui| {
             egui::Grid::new("custom_colors").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 for (label, color) in [
                     ("Text", &mut colors.fg),
@@ -243,16 +246,35 @@ impl Preferences {
                     ui.end_row();
                 }
             });
+            colors_changed |= ui.checkbox(&mut colors.effects.monochrome, "Monochrome output")
+                .on_hover_text("Use the theme's text and background colors for all output, including device colors and syntax highlighting.")
+                .changed();
+            colors_changed |= ui.checkbox(&mut colors.effects.crt, "CRT glow and scanlines")
+                .on_hover_text("Static glow and subtle scanlines inside the terminal. Works with animations off.")
+                .changed();
+            let mut appearance = colors.effects.appearance();
+            let original_appearance = appearance;
+            ui.horizontal(|ui| {
+                ui.label("App appearance");
+                egui::ComboBox::from_id_salt("app_appearance").selected_text(appearance.label()).show_ui(ui, |ui| {
+                    for option in crate::settings::AppAppearance::ALL { ui.selectable_value(&mut appearance, option, option.label()); }
+                });
+            });
+            if appearance != original_appearance {
+                colors.effects.retro_ui = false;
+                colors.effects.appearance = appearance;
+                colors_changed = true;
+            }
             ui.label(
-                RichText::new("Adjust these colours, then use Save as… to name your theme.")
-                    .color(style::TEXT_SECONDARY)
+                RichText::new("Adjust these colors, then use Save as… to name your theme.")
+                    .color(style::secondary(ui))
                     .small(),
             );
         });
         if colors_changed {
             // Seed the Custom draft with the entire selected palette, including
-            // every colour the user left unchanged. Presets and saved themes
-            // keep their original colours until explicitly saved under a name.
+            // every color the user left unchanged. Presets and saved themes
+            // keep their original colors until explicitly saved under a name.
             self.custom = colors;
             self.settings.theme = "Custom".into();
         }
@@ -272,21 +294,78 @@ impl Preferences {
             ui.end_row();
         });
         ui.label(
-            RichText::new("Font settings apply to sessions opened from now on.").color(style::TEXT_SECONDARY).small(),
+            RichText::new("Font settings apply to sessions opened from now on.").color(style::secondary(ui)).small(),
         );
 
         ui.add_space(6.0);
         ui.checkbox(&mut self.settings.auto_paging, "Automatically page through show commands").on_hover_text(
             "Press Space at Cisco More prompts during show commands. Off by default. q or Ctrl+C stops it.",
         );
-        ui.checkbox(&mut self.settings.check_for_updates, "Check for updates when Snekkie starts");
+        ui.add_space(10.0);
+        style::section_heading(ui, "Network privacy");
+        ui.add_enabled(!self.update_busy, egui::Checkbox::new(&mut self.settings.offline_mode, "Offline mode"));
+        if self.update_busy {
+            ui.label(
+                RichText::new("Wait for the current update check or download to finish before changing offline mode.")
+                    .small(),
+            );
+        }
+        if self.settings.offline_mode {
+            self.settings.check_for_updates = false;
+        }
+        ui.label(RichText::new("Offline mode disables update checks and downloads. It asks before DNS lookups and every connection outside private/local IP ranges. Serial and local IP connections work directly. Enabling it closes open network sessions.").small());
+        ui.add_enabled(
+            !self.settings.offline_mode,
+            egui::Checkbox::new(&mut self.settings.check_for_updates, "Check for updates when Snekkie starts"),
+        );
+    }
+
+    fn highlighting_page(&mut self, ui: &mut Ui) {
+        ui.label("Syntax highlighting intensity");
+        ui.horizontal(|ui| {
+            ui.label("Less");
+            ui.add(
+                Slider::new(&mut self.settings.highlighting_intensity, highlight::INTENSITY_RANGE)
+                    .step_by(1.0)
+                    .text("Intensity"),
+            );
+            ui.label("More");
+        });
+        ui.label(RichText::new(highlight::intensity_label(self.settings.highlighting_intensity)).strong());
+        ui.label(highlight::intensity_help(self.settings.highlighting_intensity));
+        ui.label(
+            RichText::new("Applies to all open and new sessions. Choose each session's vendor in the Device menu.")
+                .small(),
+        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label("Preview device");
+            egui::ComboBox::from_id_salt("highlight_preview_device")
+                .selected_text(highlight::syntax_label(&self.preview_syntax))
+                .height(280.0)
+                .show_ui(ui, |ui| {
+                    for (key, label) in highlight::syntax_options() {
+                        ui.selectable_value(&mut self.preview_syntax, key.to_string(), label);
+                    }
+                });
+        });
+        let theme = self.current_colors();
+        if theme.effects.monochrome {
+            ui.label(
+                RichText::new(
+                    "This theme uses monochrome output. Turn it off under Theme colors to see syntax colors.",
+                )
+                .small(),
+            );
+        }
+        self.syntax_preview.ui(ui, theme, &self.preview_syntax, self.settings.highlighting_intensity);
     }
 
     fn animations_page(&mut self, ui: &mut Ui) {
         let animations = &mut self.settings.animations;
         ui.checkbox(&mut animations.enabled, "Animations");
         ui.label(
-            RichText::new("Off by default. Pick a style for each kind, or Off.").color(style::TEXT_SECONDARY).small(),
+            RichText::new("Off by default. Pick a style for each kind, or Off.").color(style::secondary(ui)).small(),
         );
         ui.add_space(6.0);
 
@@ -295,10 +374,10 @@ impl Preferences {
             ui.horizontal(|ui| {
                 ui.label("Speed");
                 ui.add_space(4.0);
-                ui.label(RichText::new("Slower").color(style::TEXT_SECONDARY).small());
+                ui.label(RichText::new("Slower").color(style::secondary(ui)).small());
                 ui.add(Slider::new(&mut animations.speed, ANIMATION_SPEED_RANGE).step_by(0.1).show_value(false))
                     .on_hover_text("How fast every animation plays. The cursor keeps blinking at its usual rate.");
-                ui.label(RichText::new("Faster").color(style::TEXT_SECONDARY).small());
+                ui.label(RichText::new("Faster").color(style::secondary(ui)).small());
                 ui.add_space(4.0);
                 ui.label(format!("{:.1}×", animations.speed));
             });
@@ -378,7 +457,7 @@ fn color_button(ui: &mut Ui, color: &mut Color32, label_id: egui::Id) -> bool {
     if changed {
         *color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
     }
-    ui.label(RichText::new(settings::to_hex(*color)).monospace().color(style::TEXT_SECONDARY));
+    ui.label(RichText::new(settings::to_hex(*color)).monospace().color(style::secondary(ui)));
     changed
 }
 
@@ -406,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_colours_are_kept() {
+    fn custom_colors_are_kept() {
         let mut prefs = Preferences::new(&AppSettings::default());
         prefs.settings.theme = "Custom".into();
         prefs.custom.bg = Color32::from_rgb(1, 2, 3);

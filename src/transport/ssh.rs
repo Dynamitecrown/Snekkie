@@ -380,9 +380,10 @@ async fn establish(
     ask: HostKeyAsker,
     sink: Arc<dyn Sink>,
     lost: Arc<Mutex<Option<String>>>,
+    access: &crate::network::NetworkAccess,
 ) -> Result<Session, String> {
     let host = profile.host.trim().to_string();
-    let stream = connect_tcp(&host, profile.port).await?;
+    let stream = connect_tcp(&host, profile.port, access).await?;
 
     // Time spent waiting for the user to answer a host key prompt doesn't
     // count towards the handshake timeout.
@@ -427,9 +428,21 @@ pub fn start(
     ask: HostKeyAsker,
     sink: Arc<dyn Sink>,
 ) -> Link {
+    start_with_access(runtime, profile, credentials, size, ask, sink, crate::network::NetworkAccess::default())
+}
+
+pub fn start_with_access(
+    runtime: &tokio::runtime::Handle,
+    profile: Profile,
+    credentials: Credentials,
+    size: (u16, u16),
+    ask: HostKeyAsker,
+    sink: Arc<dyn Sink>,
+    access: crate::network::NetworkAccess,
+) -> Link {
     let (link, commands) = Link::new();
     runtime.spawn(async move {
-        let reason = run(profile, credentials, size, ask, sink.clone(), commands).await;
+        let reason = run(profile, credentials, size, ask, sink.clone(), commands, access).await;
         sink.closed(reason);
     });
     link
@@ -442,12 +455,13 @@ async fn run(
     ask: HostKeyAsker,
     sink: Arc<dyn Sink>,
     mut commands: UnboundedReceiver<Command>,
+    access: crate::network::NetworkAccess,
 ) -> Option<String> {
     let lost = Arc::new(Mutex::new(None));
     // Keep an eye on the command queue while connecting, so closing the tab
     // cancels a slow connect and a resize during it isn't lost.
     let handle = {
-        let connecting = establish(&profile, &credentials, ask, sink.clone(), lost.clone());
+        let connecting = establish(&profile, &credentials, ask, sink.clone(), lost.clone(), &access);
         tokio::pin!(connecting);
         loop {
             tokio::select! {

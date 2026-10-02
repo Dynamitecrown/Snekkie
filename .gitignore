@@ -10,6 +10,9 @@ build/
 dist/
 *.spec
 
+# Local project guidance, plans and issue notes (including nested files).
+/documents/
+
 # --- Editors --------------------------------------------------------------
 .vscode/
 .idea/

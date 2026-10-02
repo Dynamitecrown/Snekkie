@@ -381,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn split_coloured_prompts_advance_once_per_page() {
+    fn split_colored_prompts_advance_once_per_page() {
         for marker in ["--More--", "---More---", "<--- More --->"] {
             let mut pager = showing(b"sh run\r");
             let bytes = format!("\r\nline one\r\n\x1b[7m{marker}\x1b[0m");

@@ -1,4 +1,4 @@
-//! App-wide preferences: colour theme and defaults for new sessions.
+//! App-wide preferences: color theme and defaults for new sessions.
 //!
 //! Distinct from a Profile (one saved connection): this is the one set of
 //! look-and-feel settings shared by the whole app. Same settings.json as the
@@ -19,28 +19,87 @@ pub const THEME_KEYS: [&str; 4] = ["fg", "bg", "cursor", "selection"];
 
 pub const DEFAULT_THEME: &str = "Snekkie Dark";
 
-/// Built-in presets: foreground, background, cursor, selection. The
-/// 16-colour ANSI palette stays fixed across themes.
-pub const THEMES: [(&str, [&str; 4]); 6] = [
+/// Built-in presets: foreground, background, cursor, selection.
+pub const THEMES: [(&str, [&str; 4]); 18] = [
     ("Snekkie Dark", ["#d0d0d0", "#1a1a1a", "#3ad900", "#3a5a80"]),
     ("Solarized Dark", ["#839496", "#002b36", "#268bd2", "#073642"]),
     ("Solarized Light", ["#657b83", "#fdf6e3", "#268bd2", "#eee8d5"]),
     ("Monokai", ["#f8f8f2", "#272822", "#a6e22e", "#49483e"]),
     ("Classic Green", ["#33ff33", "#0c0c0c", "#33ff33", "#1f4d1f"]),
     ("High Contrast", ["#ffffff", "#000000", "#ffff00", "#444444"]),
+    ("Monochrome Green", ["#66ff66", "#081008", "#99ff99", "#205020"]),
+    ("CRT", ["#72f792", "#07110b", "#a4ffbb", "#214b30"]),
+    ("CRT Super", ["#72f792", "#07110b", "#a4ffbb", "#214b30"]),
+    ("E-Ink Super", ["#252722", "#ecece2", "#343830", "#c6c9bb"]),
+    ("Blueprint Super", ["#ccecff", "#102c49", "#73d5ff", "#284e6b"]),
+    ("Amber Super", ["#ffd078", "#1c1209", "#ffe0a3", "#634323"]),
+    ("Amber Terminal", ["#ffbf5a", "#171008", "#ffda91", "#604018"]),
+    ("Midnight Blue", ["#d7e3ff", "#101827", "#82b5ff", "#29466d"]),
+    ("Ocean", ["#c7ece8", "#0c242b", "#5de0c7", "#24535d"]),
+    ("Purple Haze", ["#e8dcf5", "#21182d", "#c19aff", "#4b3665"]),
+    ("Soft Grey", ["#dddddd", "#242424", "#f0f0f0", "#505050"]),
+    ("Paper Light", ["#303642", "#f5f2e9", "#356d92", "#c9dce8"]),
 ];
 
 /// Themes that have been renamed. A settings.json written before the app
 /// was renamed still says "PyTerm Dark".
 const THEME_ALIASES: [(&str, &str); 1] = [("PyTerm Dark", "Snekkie Dark")];
 
-/// The four colours a theme sets, resolved to real colours.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppAppearance {
+    #[default]
+    Standard,
+    Crt,
+    EInk,
+    Blueprint,
+    Amber,
+}
+
+impl AppAppearance {
+    pub const ALL: [Self; 5] = [Self::Standard, Self::Crt, Self::EInk, Self::Blueprint, Self::Amber];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard",
+            Self::Crt => "CRT monitor",
+            Self::EInk => "E-Ink reader",
+            Self::Blueprint => "Blueprint console",
+            Self::Amber => "Amber workstation",
+        }
+    }
+}
+
+/// Static terminal effects, independent of the animation settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeEffects {
+    #[serde(deserialize_with = "lenient")]
+    pub monochrome: bool,
+    #[serde(deserialize_with = "lenient")]
+    pub crt: bool,
+    #[serde(deserialize_with = "lenient")]
+    pub retro_ui: bool,
+    #[serde(deserialize_with = "lenient")]
+    pub appearance: AppAppearance,
+}
+
+impl ThemeEffects {
+    pub fn appearance(self) -> AppAppearance {
+        if self.appearance == AppAppearance::Standard && self.retro_ui { AppAppearance::Crt } else { self.appearance }
+    }
+    pub fn is_super(self) -> bool {
+        self.appearance() != AppAppearance::Standard
+    }
+}
+
+/// A theme's resolved colors and terminal effects.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Theme {
     pub fg: Color32,
     pub bg: Color32,
     pub cursor: Color32,
     pub selection: Color32,
+    pub effects: ThemeEffects,
 }
 
 impl Default for Theme {
@@ -70,6 +129,27 @@ fn preset(name: &str) -> Option<Theme> {
         bg: parse_hex(bg).unwrap(),
         cursor: parse_hex(cursor).unwrap(),
         selection: parse_hex(selection).unwrap(),
+        effects: ThemeEffects {
+            monochrome: matches!(
+                name,
+                "Monochrome Green"
+                    | "CRT"
+                    | "CRT Super"
+                    | "Amber Terminal"
+                    | "Paper Light"
+                    | "E-Ink Super"
+                    | "Blueprint Super"
+                    | "Amber Super"
+            ),
+            crt: matches!(name, "CRT" | "CRT Super" | "Amber Super"),
+            retro_ui: name == "CRT Super",
+            appearance: match name {
+                "E-Ink Super" => AppAppearance::EInk,
+                "Blueprint Super" => AppAppearance::Blueprint,
+                "Amber Super" => AppAppearance::Amber,
+                _ => AppAppearance::Standard,
+            },
+        },
     })
 }
 
@@ -82,7 +162,7 @@ pub type Scheme = BTreeMap<String, String>;
 
 impl Theme {
     /// Build from a stored scheme, falling back per key to the default
-    /// theme so a hand-edited file missing one colour still works.
+    /// theme so a hand-edited file missing one color still works.
     pub fn from_scheme(scheme: &Scheme) -> Theme {
         let base = Theme::default();
         let get = |key: &str, fallback: Color32| scheme.get(key).and_then(|v| parse_hex(v)).unwrap_or(fallback);
@@ -91,14 +171,39 @@ impl Theme {
             bg: get("bg", base.bg),
             cursor: get("cursor", base.cursor),
             selection: get("selection", base.selection),
+            effects: ThemeEffects {
+                monochrome: scheme.get("monochrome").is_some_and(|v| v == "true"),
+                crt: scheme.get("crt").is_some_and(|v| v == "true"),
+                retro_ui: scheme.get("retro_ui").is_some_and(|v| v == "true"),
+                appearance: scheme
+                    .get("appearance")
+                    .and_then(|v| serde_json::from_value(serde_json::Value::String(v.clone())).ok())
+                    .unwrap_or_default(),
+            },
         }
     }
 
     pub fn to_scheme(self) -> Scheme {
-        [("fg", self.fg), ("bg", self.bg), ("cursor", self.cursor), ("selection", self.selection)]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), to_hex(v)))
-            .collect()
+        let mut scheme: Scheme =
+            [("fg", self.fg), ("bg", self.bg), ("cursor", self.cursor), ("selection", self.selection)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), to_hex(v)))
+                .collect();
+        // Ordinary themes keep the original four-key format.
+        for (key, enabled) in
+            [("monochrome", self.effects.monochrome), ("crt", self.effects.crt), ("retro_ui", self.effects.retro_ui)]
+        {
+            if enabled {
+                scheme.insert(key.into(), "true".into());
+            }
+        }
+        if self.effects.appearance != AppAppearance::Standard {
+            scheme.insert(
+                "appearance".into(),
+                serde_json::to_value(self.effects.appearance).unwrap().as_str().unwrap().into(),
+            );
+        }
+        scheme
     }
 }
 
@@ -115,7 +220,9 @@ pub struct AppSettings {
     pub custom_cursor: String,
     #[serde(deserialize_with = "lenient")]
     pub custom_selection: String,
-    /// Themes the user saved, name -> {fg, bg, cursor, selection}.
+    #[serde(deserialize_with = "lenient")]
+    pub custom_effects: ThemeEffects,
+    /// Themes the user saved, including any optional terminal effects.
     #[serde(deserialize_with = "lenient_themes")]
     pub saved_themes: BTreeMap<String, Scheme>,
     // Defaults filled into a brand-new session's Advanced tab.
@@ -130,9 +237,15 @@ pub struct AppSettings {
     /// Ask GitHub for a newer release each time Snekkie starts.
     #[serde(deserialize_with = "lenient")]
     pub check_for_updates: bool,
+    /// No update requests; ask before DNS and non-local connections.
+    #[serde(deserialize_with = "lenient")]
+    pub offline_mode: bool,
     /// Automatically press Space at paging prompts during show commands.
     #[serde(deserialize_with = "lenient")]
     pub auto_paging: bool,
+    /// Shared by every device syntax and all open sessions.
+    #[serde(deserialize_with = "lenient")]
+    pub highlighting_intensity: u8,
     #[serde(deserialize_with = "lenient")]
     pub animations: Animations,
 }
@@ -145,13 +258,16 @@ impl Default for AppSettings {
             custom_bg: "#1a1a1a".into(),
             custom_cursor: "#3ad900".into(),
             custom_selection: "#3a5a80".into(),
+            custom_effects: ThemeEffects::default(),
             saved_themes: BTreeMap::new(),
             font_family: String::new(),
             font_size: 11,
             scrollback: 5000,
             show_sidebar: true,
             check_for_updates: true,
+            offline_mode: false,
             auto_paging: false,
+            highlighting_intensity: crate::terminal::highlight::DEFAULT_INTENSITY,
             animations: Animations::default(),
         }
     }
@@ -221,10 +337,12 @@ animation_kind! {
     /// What a character you type does when it lands on the screen.
     TypedText, default Pop, {
         Off = "off", "Off", "Typed characters appear as they are.";
-        Pop = "pop", "Pop", "Each character pops in a little larger, in the cursor colour, then settles.";
+        Pop = "pop", "Pop", "Each character pops in a little larger, in the cursor color, then settles.";
         Bounce = "bounce", "Bounce", "Each character drops into place with a small bounce.";
-        Flash = "flash", "Flash", "The cell behind each character flashes the cursor colour and fades.";
+        Flash = "flash", "Flash", "The cell behind each character flashes the cursor color and fades.";
         Fade = "fade", "Fade", "Each character fades in.";
+        Stamp = "stamp", "Stamp", "Each character stamps down from above and settles into the cell.";
+        Laser = "laser", "Laser", "A bright laser pulse writes each character, then cools.";
     }
 }
 
@@ -232,12 +350,16 @@ animation_kind! {
     /// Particles thrown off the cursor on each keystroke.
     KeystrokeBurst, default Sparks, {
         Off = "off", "Off", "Nothing comes off the cursor.";
-        Sparks = "sparks", "Sparks", "A spray of sparks in the cursor colour that fall away.";
-        Confetti = "confetti", "Confetti", "A pinch of colourful confetti that tumbles down.";
+        Sparks = "sparks", "Sparks", "A spray of sparks in the cursor color that fall away.";
+        Confetti = "confetti", "Confetti", "A pinch of colorful confetti that tumbles down.";
         Embers = "embers", "Embers", "Warm embers that drift upward and die out.";
         Bubbles = "bubbles", "Bubbles", "Small bubbles that float up and fade.";
         Stars = "stars", "Stars", "A few twinkling stars that scatter outward.";
         Ripple = "ripple", "Ripple", "A ring that spreads out from the cursor.";
+        Explosion = "explosion", "Explosion", "A miniature fireball throws sparks and an expanding shockwave.";
+        Lasers = "lasers", "Lasers", "Glowing laser bolts shoot outward from the cursor.";
+        Lightning = "lightning", "Lightning", "Short branching bolts of electricity crackle around the cursor.";
+        Portal = "portal", "Portal", "A ring opens with orbiting sparks, then fades closed.";
     }
 }
 
@@ -259,7 +381,9 @@ animation_kind! {
         Drop = "drop", "Drop", "New text drops into place as it fades in.";
         Zoom = "zoom", "Zoom", "New text grows from small to full size.";
         Decode = "decode", "Decode", "New text flickers through random symbols before settling, like decrypting.";
-        Heat = "heat", "Heat", "New text arrives in the cursor colour and cools to its own colour.";
+        Heat = "heat", "Heat", "New text arrives in the cursor color and cools to its own color.";
+        Hologram = "hologram", "Hologram", "New text materializes with a gentle holographic shimmer.";
+        Matrix = "matrix", "Binary decode", "A shower of binary digits resolves into the actual output.";
     }
 }
 
@@ -288,11 +412,13 @@ animation_kind! {
     /// A mark on each line of fresh output, so it stands out as it arrives.
     NewLines, default Glow, {
         Off = "off", "Off", "New lines are not marked.";
-        Glow = "glow", "Glow", "New lines get a faint glow in the cursor colour that fades away.";
+        Glow = "glow", "Glow", "New lines get a faint glow in the cursor color that fades away.";
         Flash = "flash", "Flash", "New lines flash briefly.";
         Marker = "marker", "Marker", "A bar in the margin marks new lines, then fades.";
         Underline = "underline", "Underline", "A line sweeps under new text, then fades.";
         Shimmer = "shimmer", "Shimmer", "A band of light passes across new lines.";
+        Laser = "laser", "Laser sweep", "A glowing laser head sweeps across each new line.";
+        Radar = "radar", "Radar pulse", "An expanding radar ring marks fresh output.";
     }
 }
 
@@ -371,13 +497,23 @@ where
     if let serde_json::Value::Object(themes) = value {
         for (name, scheme) in themes {
             let serde_json::Value::Object(scheme) = scheme else { continue };
-            let colours: Scheme = scheme
+            let colors: Scheme = scheme
                 .into_iter()
-                .filter(|(k, _)| THEME_KEYS.contains(&k.as_str()))
-                .filter_map(|(k, v)| v.as_str().map(|v| (k, v.to_string())))
+                .filter(|(k, _)| {
+                    THEME_KEYS.contains(&k.as_str())
+                        || matches!(k.as_str(), "monochrome" | "crt" | "retro_ui" | "appearance")
+                })
+                .filter_map(|(k, v)| {
+                    let value = v.as_str().map(str::to_string).or_else(|| {
+                        matches!(k.as_str(), "monochrome" | "crt" | "retro_ui")
+                            .then(|| v.as_bool().map(|b| b.to_string()))
+                            .flatten()
+                    })?;
+                    Some((k, value))
+                })
                 .collect();
-            if !colours.is_empty() {
-                clean.insert(name, colours);
+            if THEME_KEYS.iter().any(|key| colors.contains_key(*key)) {
+                clean.insert(name, colors);
             }
         }
     }
@@ -393,6 +529,7 @@ impl AppSettings {
             bg: parse_hex(&self.custom_bg).unwrap_or(base.bg),
             cursor: parse_hex(&self.custom_cursor).unwrap_or(base.cursor),
             selection: parse_hex(&self.custom_selection).unwrap_or(base.selection),
+            effects: self.custom_effects,
         }
     }
 
@@ -401,9 +538,10 @@ impl AppSettings {
         self.custom_bg = to_hex(theme.bg);
         self.custom_cursor = to_hex(theme.cursor);
         self.custom_selection = to_hex(theme.selection);
+        self.custom_effects = theme.effects;
     }
 
-    /// Colours for any theme name: preset, saved, or "Custom".
+    /// Colors for any theme name: preset, saved, or "Custom".
     pub fn theme_named(&self, name: &str) -> Theme {
         if name == "Custom" {
             return self.custom_theme();
@@ -414,7 +552,7 @@ impl AppSettings {
         preset(name).unwrap_or_default()
     }
 
-    /// Colours of the active theme.
+    /// Colors of the active theme.
     pub fn colors(&self) -> Theme {
         self.theme_named(&self.theme)
     }
@@ -424,7 +562,7 @@ impl AppSettings {
         THEMES
             .iter()
             .map(|(n, _)| n.to_string())
-            .chain(self.saved_themes.keys().cloned())
+            .chain(self.saved_themes.keys().filter(|n| !is_builtin(n) && *n != "Custom").cloned())
             .chain(std::iter::once("Custom".to_string()))
             .collect()
     }
@@ -453,12 +591,43 @@ impl SettingsStore {
             settings.theme = DEFAULT_THEME.into();
         }
         settings.animations.speed = settings.animations.pace();
+        settings.highlighting_intensity =
+            crate::terminal::highlight::normalize_intensity(settings.highlighting_intensity);
+        // The installer writes only this small policy file, leaving all existing
+        // themes, profiles and JSON preferences intact. Preferences keeps it in sync.
+        let policy_path = self.path.with_file_name("network.ini");
+        if policy_path.exists() {
+            let text = fs::read_to_string(policy_path).unwrap_or_default();
+            let read = |key: &str| {
+                text.lines().find_map(|line| {
+                    let (name, value) = line.trim().split_once('=')?;
+                    (name.trim() == key).then(|| value.trim())
+                })
+            };
+            settings.offline_mode = read("OfflineMode") != Some("0");
+            settings.check_for_updates = !settings.offline_mode && read("CheckForUpdates") == Some("1");
+        }
+        if settings.offline_mode {
+            settings.check_for_updates = false;
+        }
         settings
     }
 
     pub fn save(&self, settings: &AppSettings) -> std::io::Result<()> {
         let text = serde_json::to_string_pretty(settings).map_err(std::io::Error::other)?;
-        config::write_atomic(&self.path, &text)
+        config::write_atomic(&self.path, &text)?;
+        let policy_path = self.path.with_file_name("network.ini");
+        if policy_path.exists() || settings.offline_mode {
+            config::write_atomic(
+                &policy_path,
+                &format!(
+                    "[Network]\nOfflineMode={}\nCheckForUpdates={}\n",
+                    u8::from(settings.offline_mode),
+                    u8::from(settings.check_for_updates && !settings.offline_mode)
+                ),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -479,6 +648,48 @@ mod tests {
         let settings = SettingsStore::new(dir.path().join("nope.json")).load();
         assert_eq!(settings, AppSettings::default());
         assert_eq!(settings.colors(), Theme::default());
+    }
+
+    #[test]
+    fn installer_policy_disables_online_updates_and_preferences_can_change_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path().join("settings.json"));
+        store.save(&AppSettings::default()).unwrap();
+        fs::write(dir.path().join("network.ini"), "[Network]\r\nOfflineMode=1\r\nCheckForUpdates=1\r\n").unwrap();
+        let mut settings = store.load();
+        assert!(settings.offline_mode);
+        assert!(!settings.check_for_updates);
+        settings.offline_mode = false;
+        settings.check_for_updates = false;
+        store.save(&settings).unwrap();
+        assert_eq!(store.load(), settings);
+        settings.check_for_updates = true;
+        store.save(&settings).unwrap();
+        assert_eq!(store.load(), settings);
+        fs::write(dir.path().join("network.ini"), "damaged").unwrap();
+        assert!(store.load().offline_mode);
+        assert!(!store.load().check_for_updates);
+    }
+
+    #[test]
+    fn all_super_appearances_round_trip_and_legacy_crt_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path().join("settings.json"));
+        for name in ["E-Ink Super", "Blueprint Super", "Amber Super", "CRT Super"] {
+            let mut settings = AppSettings::default();
+            let theme = settings.theme_named(name);
+            assert!(theme.effects.is_super());
+            settings.saved_themes.insert("My setup".into(), theme.to_scheme());
+            settings.theme = "My setup".into();
+            store.save(&settings).unwrap();
+            assert_eq!(store.load().colors(), theme);
+            settings.set_custom_theme(theme);
+            settings.theme = "Custom".into();
+            store.save(&settings).unwrap();
+            assert_eq!(store.load().colors(), theme);
+        }
+        let legacy = load(r##"{"saved_themes":{"Old CRT":{"fg":"#33ff33","retro_ui":true}},"theme":"Old CRT"}"##);
+        assert_eq!(legacy.colors().effects.appearance(), AppAppearance::Crt);
     }
 
     #[test]
@@ -527,10 +738,75 @@ mod tests {
             bg: Color32::from_rgb(40, 50, 60),
             cursor: Color32::from_rgb(70, 80, 90),
             selection: Color32::from_rgb(100, 110, 120),
+            effects: ThemeEffects::default(),
         };
         settings.set_custom_theme(theme);
         store.save(&settings).unwrap();
         assert_eq!(store.load().colors(), theme);
+    }
+
+    #[test]
+    fn terminal_effects_survive_custom_and_named_theme_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path().join("settings.json"));
+        for name in ["Monochrome Green", "CRT", "CRT Super", "Amber Terminal"] {
+            let mut settings = AppSettings::default();
+            let mut edited = settings.theme_named(name);
+            edited.fg = Color32::from_rgb(120, 240, 140);
+            settings.set_custom_theme(edited);
+            settings.theme = "Custom".into();
+            store.save(&settings).unwrap();
+            assert_eq!(store.load().colors(), edited);
+
+            settings.saved_themes.insert("My theme".into(), edited.to_scheme());
+            settings.theme = "My theme".into();
+            store.save(&settings).unwrap();
+            assert_eq!(store.load().colors(), edited);
+            assert_ne!(store.load().theme_named(name).fg, edited.fg);
+        }
+    }
+
+    #[test]
+    fn old_and_malformed_themes_keep_effects_off() {
+        let settings = load(
+            r##"{
+            "theme": "Old theme",
+            "custom_effects": {"monochrome": "yes", "crt": null},
+            "saved_themes": {
+                "Old theme": {"fg": "#ffffff", "crt": "yes", "monochrome": 42},
+                "Boolean effects": {"fg": "#33ff33", "crt": true, "monochrome": true},
+                "No colors": {"crt": true}
+            }
+        }"##,
+        );
+        assert_eq!(settings.colors().effects, ThemeEffects::default());
+        assert_eq!(settings.custom_theme().effects, ThemeEffects::default());
+        assert_eq!(
+            settings.theme_named("Boolean effects").effects,
+            ThemeEffects { monochrome: true, crt: true, ..ThemeEffects::default() }
+        );
+        assert!(!settings.saved_themes.contains_key("No colors"));
+        assert_eq!(Theme::default().to_scheme().len(), 4);
+    }
+
+    #[test]
+    fn a_saved_theme_matching_a_new_preset_is_preserved_and_listed_once() {
+        let settings = load(r##"{"theme": "CRT", "saved_themes": {"CRT": {"fg": "#abcdef"}}}"##);
+        assert_eq!(settings.colors().fg, parse_hex("#abcdef").unwrap());
+        assert_eq!(settings.colors().effects, ThemeEffects::default());
+        assert_eq!(settings.theme_names().iter().filter(|n| *n == "CRT").count(), 1);
+    }
+
+    #[test]
+    fn highlighting_intensity_defaults_normalizes_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path().join("settings.json"));
+        assert_eq!(load("{}").highlighting_intensity, 3);
+        assert_eq!(load(r#"{"highlighting_intensity":"bad"}"#).highlighting_intensity, 3);
+        assert_eq!(load(r#"{"highlighting_intensity":99}"#).highlighting_intensity, 5);
+        let settings = AppSettings { highlighting_intensity: 1, ..Default::default() };
+        store.save(&settings).unwrap();
+        assert_eq!(store.load().highlighting_intensity, 1);
     }
 
     #[test]

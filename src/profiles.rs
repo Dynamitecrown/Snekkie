@@ -4,14 +4,15 @@
 //! format the Python releases wrote, so an existing sessions.json loads
 //! unchanged. Passwords are deliberately *not* stored.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::config;
 use crate::terminal::keys::Backspace;
+use crate::{config, settings};
 
 /// Deserialize a field, falling back to its default if the value has the
 /// wrong type. sessions.json is a text file people edit by hand, and one bad
@@ -171,6 +172,11 @@ pub struct Profile {
     /// stays readable by the Python releases; see [`Profile::kind`].
     #[serde(deserialize_with = "lenient")]
     pub kind: String,
+    #[serde(deserialize_with = "lenient")]
+    pub favorite: bool,
+    /// Empty = the normal tab appearance; otherwise a saved #rrggbb color.
+    #[serde(deserialize_with = "lenient")]
+    pub tab_color: String,
 
     // SSH, telnet and raw TCP
     #[serde(deserialize_with = "lenient")]
@@ -224,7 +230,7 @@ pub struct Profile {
     /// "del" or "ctrl-h"; see [`Backspace`].
     #[serde(deserialize_with = "lenient")]
     pub backspace: String,
-    /// See `highlight::SYNTAX_LABELS`.
+    /// See `highlight::syntax_options`.
     #[serde(deserialize_with = "lenient")]
     pub device_syntax: String,
 }
@@ -234,6 +240,8 @@ impl Default for Profile {
         Profile {
             name: "New session".into(),
             kind: "ssh".into(),
+            favorite: false,
+            tab_color: String::new(),
             host: String::new(),
             port: 22,
             keepalive: 60,
@@ -315,8 +323,246 @@ impl Profile {
         if self.backspace.is_empty() {
             self.backspace = defaults.backspace;
         }
+        self.tab_color = settings::parse_hex(&self.tab_color).map(settings::to_hex).unwrap_or_default();
         self
     }
+}
+
+/// Supported profiles and notes to review before importing. Reading this data
+/// neither changes the saved collection nor opens a connection.
+pub struct ProfileImport {
+    pub profiles: Vec<Profile>,
+    pub warnings: Vec<String>,
+}
+
+/// A deliberately explicit export schema. Arbitrary input fields, credentials,
+/// key contents and host-key trust can never pass through a profile export.
+#[derive(Serialize)]
+struct ExportProfile<'a> {
+    name: &'a str,
+    kind: &'a str,
+    favorite: bool,
+    tab_color: String,
+    host: &'a str,
+    port: u16,
+    keepalive: u32,
+    username: &'a str,
+    auth: &'a str,
+    key_file: &'a str,
+    device: &'a str,
+    baud: u32,
+    bytesize: u8,
+    parity: &'a str,
+    stopbits: f32,
+    rtscts: bool,
+    xonxoff: bool,
+    scrollback: u32,
+    font_family: &'a str,
+    font_size: u32,
+    log_path: &'a str,
+    local_echo: &'a str,
+    backspace: &'a str,
+    device_syntax: &'a str,
+}
+
+impl<'a> From<&'a Profile> for ExportProfile<'a> {
+    fn from(profile: &'a Profile) -> Self {
+        Self {
+            name: &profile.name,
+            kind: &profile.kind,
+            favorite: profile.favorite,
+            tab_color: settings::parse_hex(&profile.tab_color).map(settings::to_hex).unwrap_or_default(),
+            host: &profile.host,
+            port: profile.port,
+            keepalive: profile.keepalive,
+            username: &profile.username,
+            auth: &profile.auth,
+            key_file: &profile.key_file,
+            device: &profile.device,
+            baud: profile.baud,
+            bytesize: profile.bytesize,
+            parity: &profile.parity,
+            stopbits: profile.stopbits,
+            rtscts: profile.rtscts,
+            xonxoff: profile.xonxoff,
+            scrollback: profile.scrollback,
+            font_family: &profile.font_family,
+            font_size: profile.font_size,
+            log_path: &profile.log_path,
+            local_echo: &profile.local_echo,
+            backspace: &profile.backspace,
+            device_syntax: &profile.device_syntax,
+        }
+    }
+}
+
+/// Export selected profiles using the same version-1 sessions envelope as the
+/// saved store. A private-key path is only a reference; its file is never read.
+pub fn export_profiles(profiles: &[Profile]) -> Result<String, String> {
+    let sessions: Vec<_> = profiles.iter().map(ExportProfile::from).collect();
+    serde_json::to_string_pretty(&serde_json::json!({ "version": 1, "sessions": sessions }))
+        .map_err(|error| format!("Could not encode profiles: {error}"))
+}
+
+/// Read a profile export with strict envelope and destination validation.
+/// Malformed or unsupported rows become notes instead of silently changing a
+/// protocol/destination. Optional fields absent in older exports keep defaults.
+pub fn parse_import(bytes: &[u8]) -> Result<ProfileImport, String> {
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err("Profile exports must be no larger than 16 MiB.".into());
+    }
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    let payload: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| format!("Could not read profile JSON: {error}"))?;
+    let object = payload.as_object().ok_or("Expected a version-1 profile export object.")?;
+    if object.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err("Unsupported profile export version; expected version 1.".into());
+    }
+    let sessions = object
+        .get("sessions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("The profile export must contain a sessions array.")?;
+    let mut batch = ProfileImport { profiles: Vec::new(), warnings: Vec::new() };
+    for (index, value) in sessions.iter().enumerate() {
+        match imported_profile(value) {
+            Ok((profile, notes)) => {
+                batch.warnings.extend(notes.into_iter().map(|note| format!("{}: {note}", profile.name)));
+                batch.profiles.push(profile);
+            }
+            Err(reason) => batch.warnings.push(format!("Session {} skipped: {reason}", index + 1)),
+        }
+    }
+    if sessions.is_empty() {
+        batch.warnings.push("This export contains no saved sessions.".into());
+    }
+    Ok(batch)
+}
+
+fn imported_profile(value: &serde_json::Value) -> Result<(Profile, Vec<String>), String> {
+    let fields = value.as_object().ok_or("expected a session object")?;
+    let name = fields
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or("missing session name")?;
+    let kind = fields.get("kind").and_then(serde_json::Value::as_str).ok_or("missing protocol")?;
+    if !Kind::ALL.iter().any(|supported| supported.as_str() == kind) {
+        return Err(format!("{name}: unsupported protocol"));
+    }
+    let string_fields = [
+        "name",
+        "kind",
+        "tab_color",
+        "host",
+        "username",
+        "auth",
+        "key_file",
+        "device",
+        "parity",
+        "font_family",
+        "log_path",
+        "local_echo",
+        "backspace",
+        "device_syntax",
+    ];
+    let integer_fields = ["port", "keepalive", "baud", "bytesize", "scrollback", "font_size"];
+    let boolean_fields = ["favorite", "rtscts", "xonxoff"];
+    for field in string_fields {
+        if fields.get(field).is_some_and(|value| !value.is_string()) {
+            return Err(format!("{name}: {field} must be text"));
+        }
+    }
+    for field in integer_fields {
+        let maximum = match field {
+            "port" => u16::MAX as u64,
+            "bytesize" => u8::MAX as u64,
+            _ => u32::MAX as u64,
+        };
+        if fields.get(field).is_some_and(|value| value.as_u64().is_none_or(|number| number > maximum)) {
+            return Err(format!("{name}: invalid {field}"));
+        }
+    }
+    for field in boolean_fields {
+        if fields.get(field).is_some_and(|value| !value.is_boolean()) {
+            return Err(format!("{name}: {field} must be true or false"));
+        }
+    }
+    if fields.get("stopbits").is_some_and(|value| value.as_f64().is_none()) {
+        return Err(format!("{name}: invalid stopbits"));
+    }
+    let mut profile: Profile = serde_json::from_value(value.clone()).map_err(|error| format!("{name}: {error}"))?;
+    profile.name = name.into();
+    if profile.kind().is_network() {
+        profile.host = profile.host.trim().into();
+        if profile.host.is_empty() {
+            return Err(format!("{name}: missing hostname or IP address"));
+        }
+        if !fields.contains_key("port") {
+            profile.port = profile.kind().default_port().ok_or_else(|| format!("{name}: raw TCP requires a port"))?;
+        }
+        if profile.port == 0 {
+            return Err(format!("{name}: port must be between 1 and 65535"));
+        }
+    } else {
+        profile.device = profile.device.trim().into();
+        if profile.device.is_empty() {
+            return Err(format!("{name}: missing serial device"));
+        }
+        if profile.baud == 0
+            || !(5..=8).contains(&profile.bytesize)
+            || !["None", "Even", "Odd"].contains(&profile.parity.as_str())
+            || ![1.0, 2.0].contains(&profile.stopbits)
+        {
+            return Err(format!("{name}: unsupported serial settings"));
+        }
+    }
+    if !["password", "key", "agent"].contains(&profile.auth.as_str()) {
+        return Err(format!("{name}: unsupported SSH authentication method"));
+    }
+    if profile.font_size == 0
+        || !["auto", "on", "off"].contains(&profile.local_echo.as_str())
+        || !["del", "ctrl-h"].contains(&profile.backspace.as_str())
+    {
+        return Err(format!("{name}: unsupported terminal settings"));
+    }
+    let mut notes = Vec::new();
+    if !profile.tab_color.is_empty() && settings::parse_hex(&profile.tab_color).is_none() {
+        notes.push("invalid tab color cleared".into());
+    }
+    let unsupported: Vec<_> = fields
+        .keys()
+        .filter(|field| {
+            !string_fields.contains(&field.as_str())
+                && !integer_fields.contains(&field.as_str())
+                && !boolean_fields.contains(&field.as_str())
+                && field.as_str() != "stopbits"
+        })
+        .collect();
+    if !unsupported.is_empty() {
+        notes.push(format!(
+            "{} unsupported field(s) ignored; only supported profile settings are imported",
+            unsupported.len()
+        ));
+    }
+    Ok((profile.sanitize(), notes))
+}
+
+/// Keep existing profiles unchanged and give imports unique, case-insensitive
+/// names. Order remains stable so a preview can show exactly what will be added.
+pub fn merge_import(existing: &[Profile], incoming: impl IntoIterator<Item = Profile>) -> Vec<Profile> {
+    let mut merged = existing.to_vec();
+    let mut names: HashSet<_> = existing.iter().map(|profile| profile.name.to_lowercase()).collect();
+    for mut profile in incoming {
+        let original = profile.name.clone();
+        let mut suffix = 1;
+        while !names.insert(profile.name.to_lowercase()) {
+            profile.name = format!("{original} (Imported {suffix})");
+            suffix += 1;
+        }
+        merged.push(profile);
+    }
+    merged
 }
 
 #[derive(Serialize, Deserialize)]
@@ -502,6 +748,147 @@ mod tests {
     }
 
     #[test]
+    fn older_sessions_get_no_favorite_or_saved_color() {
+        let (_dir, store) = store_with(PYTHON_SESSIONS);
+        for profile in store.profiles {
+            assert!(!profile.favorite);
+            assert!(profile.tab_color.is_empty());
+        }
+    }
+
+    #[test]
+    fn favorite_and_saved_color_round_trip_and_load_leniently() {
+        let (_dir, mut store) = store_with(
+            r##"{"version":1,"sessions":[{"name":"bad","favorite":"yes","tab_color":17},{"name":"invalid","tab_color":"#gg0000"},{"name":"normalized","favorite":true,"tab_color":" AABBCC "}]}"##,
+        );
+        assert!(!store.get("bad").unwrap().favorite);
+        assert!(store.get("bad").unwrap().tab_color.is_empty());
+        assert!(store.get("invalid").unwrap().tab_color.is_empty());
+        assert_eq!(store.get("normalized").unwrap().tab_color, "#aabbcc");
+        store
+            .put(Profile { name: "favorite".into(), favorite: true, tab_color: "#112233".into(), ..Profile::default() })
+            .unwrap();
+        let loaded = ProfileStore::open(store.path.clone());
+        let favorite = loaded.get("favorite").unwrap();
+        assert!(favorite.favorite);
+        assert_eq!(favorite.tab_color, "#112233");
+    }
+
+    #[test]
+    fn profile_exports_round_trip_all_protocols_and_supported_fields() {
+        let profiles = Kind::ALL.map(|kind| Profile {
+            name: format!("Lab {}", kind.label()),
+            kind: kind.as_str().into(),
+            host: "192.0.2.10".into(),
+            port: 2222,
+            username: "operator".into(),
+            auth: "key".into(),
+            key_file: "C:/example/id_ed25519".into(),
+            device: "COM4".into(),
+            baud: 115200,
+            favorite: true,
+            tab_color: "#aabbcc".into(),
+            keepalive: 15,
+            log_path: "example.log".into(),
+            local_echo: "off".into(),
+            backspace: "ctrl-h".into(),
+            device_syntax: "cisco_ios".into(),
+            ..Profile::default()
+        });
+        let text = export_profiles(&profiles).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["version"], 1);
+        assert_eq!(payload["sessions"].as_array().unwrap().len(), 4);
+        let imported = parse_import(text.as_bytes()).unwrap();
+        assert!(imported.warnings.is_empty());
+        assert_eq!(imported.profiles, profiles);
+    }
+
+    #[test]
+    fn imported_unsupported_fields_do_not_pass_through_export_or_persistence() {
+        let input = br#"{"version":1,"sessions":[{"name":"Lab","kind":"ssh","host":"192.0.2.1","password":"secret-password","private_key":"secret-key-material","known_hosts":"secret-trust"}]}"#;
+        let imported = parse_import(input).unwrap();
+        assert_eq!(imported.profiles.len(), 1);
+        assert_eq!(imported.warnings.len(), 1);
+        let text = export_profiles(&imported.profiles).unwrap();
+        for secret in ["secret-password", "secret-key-material", "secret-trust", "known_hosts", "private_key"] {
+            assert!(!text.contains(secret));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore { path: dir.path().join("sessions.json"), profiles: imported.profiles };
+        store.save().unwrap();
+        let saved = fs::read_to_string(&store.path).unwrap();
+        assert!(!saved.contains("secret-"));
+    }
+
+    #[test]
+    fn import_rejects_invalid_envelopes_and_oversized_inputs() {
+        for input in [
+            "invalid",
+            "[]",
+            "{}",
+            r#"{"version":2,"sessions":[]}"#,
+            r#"{"version":"1","sessions":[]}"#,
+            r#"{"version":1,"sessions":{}}"#,
+        ] {
+            assert!(parse_import(input.as_bytes()).is_err(), "{input}");
+        }
+        assert!(parse_import(&vec![b' '; 16 * 1024 * 1024 + 1]).is_err());
+        assert!(parse_import(b"\xef\xbb\xbf{\"version\":1,\"sessions\":[]}").is_ok());
+    }
+
+    #[test]
+    fn import_skips_malformed_and_incompatible_entries_without_changing_destination() {
+        let input = br#"{"version":1,"sessions":[
+            {"name":"SSH","kind":"ssh","host":"192.0.2.1"},
+            {"name":"Telnet","kind":"telnet","host":"192.0.2.2"},
+            {"name":"Bad port","kind":"ssh","host":"192.0.2.3","port":"22"},
+            {"name":"Zero port","kind":"ssh","host":"192.0.2.3","port":0},
+            {"name":"Huge port","kind":"ssh","host":"192.0.2.3","port":65536},
+            {"name":"Missing host","kind":"ssh"},
+            {"name":"Unsupported","kind":"ftp","host":"192.0.2.3"},
+            {"name":"Missing protocol","host":"192.0.2.3"},
+            {"name":"Raw no port","kind":"raw","host":"192.0.2.3"},
+            {"name":"Bad serial","kind":"serial","device":"COM4","stopbits":1.5},
+            {"name":"No serial device","kind":"serial"},
+            {"name":"Bad bool","kind":"ssh","host":"192.0.2.3","favorite":"yes"},
+            {"name":"Bad font","kind":"ssh","host":"192.0.2.3","font_size":-1},
+            {"name":"Valid serial","kind":"serial","device":"COM4"},
+            false
+        ]}"#;
+        let imported = parse_import(input).unwrap();
+        assert_eq!(
+            imported.profiles.iter().map(|profile| profile.name.as_str()).collect::<Vec<_>>(),
+            ["SSH", "Telnet", "Valid serial"]
+        );
+        assert_eq!(imported.profiles[0].port, 22);
+        assert_eq!(imported.profiles[1].port, 23);
+        assert_eq!(imported.warnings.len(), 12);
+    }
+
+    #[test]
+    fn import_clears_invalid_colors_with_a_preview_note() {
+        let imported = parse_import(
+            br#"{"version":1,"sessions":[{"name":"Lab","kind":"ssh","host":"192.0.2.1","tab_color":"invalid"}]}"#,
+        )
+        .unwrap();
+        assert!(imported.profiles[0].tab_color.is_empty());
+        assert_eq!(imported.warnings, ["Lab: invalid tab color cleared"]);
+    }
+
+    #[test]
+    fn merge_import_preserves_existing_profiles_and_reserves_case_insensitive_suffixes() {
+        let profile = |name: &str| Profile { name: name.into(), host: "192.0.2.1".into(), ..Profile::default() };
+        let existing = [profile("LAB"), profile("Lab (Imported 1)")];
+        let merged = merge_import(&existing, [profile("lab"), profile("Lab"), profile("Other")]);
+        assert_eq!(merged[..2], existing);
+        assert_eq!(
+            merged.iter().map(|profile| profile.name.as_str()).collect::<Vec<_>>(),
+            ["LAB", "Lab (Imported 1)", "lab (Imported 2)", "Lab (Imported 3)", "Other"]
+        );
+    }
+
+    #[test]
     fn auto_echo_is_only_for_telnet_servers_that_do_not_echo() {
         for kind in Kind::ALL {
             assert!(LocalEcho::On.applies(kind, true));
@@ -549,6 +936,8 @@ mod tests {
         for key in [
             "name",
             "kind",
+            "favorite",
+            "tab_color",
             "host",
             "port",
             "keepalive",

@@ -1,7 +1,9 @@
 //! Snekkie: a tabbed SSH and serial terminal.
 
 pub mod config;
+pub mod network;
 pub mod profiles;
+pub mod putty;
 pub mod session;
 pub mod settings;
 pub mod terminal;

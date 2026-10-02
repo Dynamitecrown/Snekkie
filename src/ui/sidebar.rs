@@ -8,7 +8,7 @@ use egui::{ComboBox, DragValue, RichText, TextEdit, Ui};
 use super::style;
 use crate::profiles::{Auth, Kind, LocalEcho, Profile, ProfileStore};
 use crate::settings::AppSettings;
-use crate::terminal::highlight::{SYNTAX_LABELS, syntax_label};
+use crate::terminal::highlight::{syntax_label, syntax_options};
 use crate::terminal::keys::Backspace;
 use crate::transport::serial::{self, BAUD_RATES, DATA_BITS, PARITIES, PortInfo, STOP_BITS};
 
@@ -35,6 +35,10 @@ pub enum Action {
     Save(Profile),
     /// Ask, then delete the saved session with this name.
     Delete(String),
+    ToggleFavorite(String),
+    ProfileColor(String),
+    ImportProfiles,
+    ExportProfiles,
     /// Ask for a device path typed by hand ("Other…").
     OtherDevice,
     /// Ask for a baud rate that isn't in the list.
@@ -101,6 +105,9 @@ pub struct Sidebar {
     custom_devices: Vec<String>,
     port_popup_was_open: bool,
     selected_saved: Option<String>,
+    saved_filter: String,
+    favorites_only: bool,
+    blocks_terminal_input: bool,
     focus_host: bool,
     list_ports: fn() -> Vec<PortInfo>,
 }
@@ -120,6 +127,9 @@ impl Sidebar {
             custom_devices: Vec::new(),
             port_popup_was_open: false,
             selected_saved: None,
+            saved_filter: String::new(),
+            favorites_only: false,
+            blocks_terminal_input: false,
             focus_host: false,
             list_ports,
         };
@@ -151,6 +161,16 @@ impl Sidebar {
     pub fn set_name(&mut self, name: String) {
         self.draft.name = name;
         self.name_destination = Some(destination(&self.draft));
+    }
+
+    pub fn selected_saved(&self) -> Option<&str> {
+        self.selected_saved.as_deref()
+    }
+
+    /// Also includes a saved-row menu's dismissal frame, when focus may
+    /// already have returned to a terminal.
+    pub fn blocks_terminal_input(&self) -> bool {
+        self.blocks_terminal_input
     }
 
     pub fn refresh_ports(&mut self) {
@@ -222,6 +242,25 @@ impl Sidebar {
         monospace_fonts: &[String],
         accent: egui::Color32,
     ) -> Vec<Action> {
+        self.blocks_terminal_input = false;
+        let width = ui.available_width();
+        egui::ScrollArea::vertical()
+            .id_salt("sidebar_contents")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(width.min(ui.available_width()));
+                self.contents_ui(ui, store, monospace_fonts, accent)
+            })
+            .inner
+    }
+
+    fn contents_ui(
+        &mut self,
+        ui: &mut Ui,
+        store: &ProfileStore,
+        monospace_fonts: &[String],
+        accent: egui::Color32,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         style::section_heading(ui, "New session");
 
@@ -245,7 +284,7 @@ impl Sidebar {
                 .truncate()
                 .selected_text(syntax_label(&self.draft.device_syntax))
                 .show_ui(ui, |ui| {
-                    for (value, label) in SYNTAX_LABELS {
+                    for (value, label) in syntax_options() {
                         ui.selectable_value(&mut self.draft.device_syntax, value.to_string(), label);
                     }
                 });
@@ -262,7 +301,7 @@ impl Sidebar {
             }
         });
 
-        egui::Frame::new().stroke(egui::Stroke::new(1.0, style::BORDER)).corner_radius(4.0).inner_margin(8.0).show(
+        egui::Frame::new().stroke(egui::Stroke::new(1.0, style::border(ui))).corner_radius(4.0).inner_margin(8.0).show(
             ui,
             |ui| {
                 ui.set_width(ui.available_width());
@@ -362,7 +401,7 @@ impl Sidebar {
                 let selected = choices.iter().find(|c| c.device == self.draft.device);
                 let selected_text = match selected {
                     Some(choice) => RichText::new(&choice.label),
-                    None => RichText::new(port_placeholder(&self.ports)).color(style::TEXT_SECONDARY),
+                    None => RichText::new(port_placeholder(&self.ports)).color(style::secondary(ui)),
                 };
                 let mut picked: Option<String> = None;
                 let mut other = false;
@@ -464,7 +503,7 @@ impl Sidebar {
         ui.add(
             egui::Label::new(
                 RichText::new("Cisco console default is 9600-8-N-1, no flow control.")
-                    .color(style::TEXT_SECONDARY)
+                    .color(style::secondary(ui))
                     .small(),
             )
             .wrap(),
@@ -521,12 +560,53 @@ impl Sidebar {
     }
 
     fn saved_ui(&mut self, ui: &mut Ui, store: &ProfileStore, actions: &mut Vec<Action>) {
-        style::section_heading(ui, "Saved sessions");
+        // Favorites sits in the heading row to leave the list as much room as
+        // possible in the default window.
+        let favorites = style::section_heading_with(ui, "Saved sessions", |ui| {
+            ui.checkbox(&mut self.favorites_only, "Favorites only")
+        });
+        self.blocks_terminal_input |= favorites.has_focus() || favorites.lost_focus();
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - button_width(ui, "Clear") - ui.spacing().item_spacing.x).max(40.0);
+            let filter = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(width, ui.spacing().interact_size.y),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_max_width(width);
+                        ui.add(text_field(&mut self.saved_filter, "Filter saved sessions", width))
+                    },
+                )
+                .inner;
+            filter.widget_info(|| {
+                let mut info = egui::WidgetInfo::text_edit(
+                    ui.is_enabled(),
+                    &self.saved_filter,
+                    &self.saved_filter,
+                    "Filter saved sessions",
+                );
+                info.label = Some("Filter saved sessions".into());
+                info
+            });
+            self.blocks_terminal_input |= filter.has_focus() || filter.lost_focus();
+            let clear = ui.add_enabled(!self.saved_filter.is_empty(), egui::Button::new("Clear"));
+            clear.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, clear.enabled(), "Clear session filter")
+            });
+            if clear.on_hover_text("Clear session filter").clicked() {
+                self.saved_filter.clear();
+                filter.request_focus();
+                self.blocks_terminal_input = true;
+            }
+        });
+        let query = self.saved_filter.trim().to_lowercase();
+        let visible: Vec<&Profile> =
+            store.profiles.iter().filter(|p| matches_saved_filter(p, &query, self.favorites_only)).collect();
         let button_row = 34.0;
         let list_height = (ui.available_height() - button_row).max(60.0);
         egui::Frame::new()
-            .fill(style::BG_LIST)
-            .stroke(egui::Stroke::new(1.0, style::BORDER))
+            .fill(ui.visuals().faint_bg_color)
+            .stroke(egui::Stroke::new(1.0, style::border(ui)))
             .corner_radius(4.0)
             .inner_margin(4.0)
             .show(ui, |ui| {
@@ -535,35 +615,83 @@ impl Sidebar {
                     ui,
                     |ui| {
                         if store.profiles.is_empty() {
-                            ui.label(RichText::new("No saved sessions yet").color(style::TEXT_SECONDARY));
+                            ui.label(RichText::new("No saved sessions yet").color(style::secondary(ui)));
+                        } else if visible.is_empty() {
+                            ui.label(RichText::new("No matching sessions").color(style::secondary(ui)));
                         }
-                        for profile in &store.profiles {
-                            let selected = self.selected_saved.as_deref() == Some(profile.name.as_str());
-                            let response = ui
-                                .with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                                    ui.add(
-                                        egui::Button::selectable(selected, &profile.name)
-                                            .min_size(egui::vec2(0.0, 22.0)),
-                                    )
-                                })
-                                .inner;
-                            let response =
-                                response.on_hover_text(format!("{} — double-click to connect", profile.kind().label()));
-                            if response.clicked() {
-                                self.selected_saved = Some(profile.name.clone());
-                            }
-                            if response.double_clicked() {
-                                self.selected_saved = Some(profile.name.clone());
-                                self.load(profile.clone());
-                                actions.push(Action::Connect(self.collect()));
-                            }
+                        for profile in visible {
+                            ui.push_id(("saved_profile", &profile.name), |ui| {
+                                let selected = self.selected_saved.as_deref() == Some(profile.name.as_str());
+                                let response = ui
+                                    .horizontal(|ui| {
+                                        let label = format!(
+                                            "{} {}",
+                                            if profile.favorite { "Unfavorite" } else { "Favorite" },
+                                            profile.name
+                                        );
+                                        let star = ui.add_sized(
+                                            [24.0, 22.0],
+                                            egui::Button::new(if profile.favorite { "★" } else { "☆" }),
+                                        );
+                                        star.widget_info(|| {
+                                            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &label)
+                                        });
+                                        self.blocks_terminal_input |= star.has_focus() || star.lost_focus();
+                                        if star.on_hover_text(label).clicked() {
+                                            actions.push(Action::ToggleFavorite(profile.name.clone()));
+                                        }
+                                        ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                                            ui.add(
+                                                egui::Button::selectable(selected, &profile.name)
+                                                    .truncate()
+                                                    .min_size(egui::vec2(0.0, 22.0)),
+                                            )
+                                        })
+                                        .inner
+                                    })
+                                    .inner;
+                                // The same strip open tabs show for the profile's default color.
+                                if let Some(color) = crate::settings::parse_hex(&profile.tab_color) {
+                                    let rect = response.rect;
+                                    let strip = egui::Rect::from_x_y_ranges(
+                                        rect.left()..=rect.left() + 3.0,
+                                        rect.top() + 2.0..=rect.bottom() - 2.0,
+                                    );
+                                    ui.painter().rect_filled(strip, 1.0, color);
+                                }
+                                let response = response
+                                    .on_hover_text(format!("{} — double-click to connect", profile.kind().label()));
+                                let menu_was_open =
+                                    egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+                                let menu = response.context_menu(|ui| {
+                                    if ui.button("Default tab color…").clicked() {
+                                        actions.push(Action::ProfileColor(profile.name.clone()));
+                                        ui.close();
+                                    }
+                                });
+                                self.blocks_terminal_input |=
+                                    menu_was_open || menu.is_some() || response.has_focus() || response.lost_focus();
+                                if response.clicked() {
+                                    self.selected_saved = Some(profile.name.clone());
+                                }
+                                if response.double_clicked() {
+                                    self.selected_saved = Some(profile.name.clone());
+                                    self.load((*profile).clone());
+                                    actions.push(Action::Connect(self.collect()));
+                                }
+                            });
                         }
                     },
                 );
             });
         ui.horizontal(|ui| {
-            let width = (ui.available_width() - 16.0) / 3.0;
-            let selected = self.selected_saved.clone().filter(|name| store.get(name).is_some());
+            let more_width = button_width(ui, MORE);
+            // Rounded down: even a fraction too wide would grow the resizable panel.
+            let width = ((ui.available_width() - more_width - ui.spacing().item_spacing.x * 3.0) / 3.0).floor();
+            let selected = self
+                .selected_saved
+                .clone()
+                .filter(|name| store.get(name).is_some_and(|p| matches_saved_filter(p, &query, self.favorites_only)));
             if ui.add_enabled(selected.is_some(), egui::Button::new("Load").min_size([width, 0.0].into())).clicked()
                 && let Some(profile) = selected.as_deref().and_then(|n| store.get(n))
             {
@@ -577,8 +705,31 @@ impl Sidebar {
             {
                 actions.push(Action::Delete(name));
             }
+            // Import/export are also under Settings; here they share a menu so
+            // the list keeps its height.
+            let (more, _) = egui::containers::menu::MenuButton::new(MORE).ui(ui, |ui| {
+                if ui.button("Import profiles…").clicked() {
+                    actions.push(Action::ImportProfiles);
+                }
+                if ui.add_enabled(!store.profiles.is_empty(), egui::Button::new("Export profiles…")).clicked() {
+                    actions.push(Action::ExportProfiles);
+                }
+            });
+            more.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "More profile actions"));
+            let menu_open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&more));
+            self.blocks_terminal_input |= menu_open || more.has_focus() || more.lost_focus();
+            more.on_hover_text("Import or export profiles");
         });
     }
+}
+
+fn matches_saved_filter(profile: &Profile, query: &str, favorites_only: bool) -> bool {
+    (!favorites_only || profile.favorite)
+        && (query.is_empty()
+            || [&profile.name, &profile.host, &profile.device, &profile.kind]
+                .into_iter()
+                .any(|value| value.to_lowercase().contains(query))
+            || profile.kind().label().to_lowercase().contains(query))
 }
 
 fn destination(profile: &Profile) -> (Kind, String, u16) {
@@ -619,13 +770,20 @@ fn row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
     .inner
 }
 
+/// Label of the saved-session menu with import and export.
+const MORE: &str = "…";
+
+/// Width of a plain text button, for sizing the rest of its row.
+fn button_width(ui: &Ui, text: &str) -> f32 {
+    ui.fonts_mut(|f| {
+        f.layout_no_wrap(text.to_string(), egui::TextStyle::Button.resolve(ui.style()), egui::Color32::WHITE).size().x
+    }) + ui.spacing().button_padding.x * 2.0
+}
+
 /// A widget filling the row with a button after it. Returns whether the
 /// button was clicked.
 fn with_trailing_button(ui: &mut Ui, button: &str, add: impl FnOnce(&mut Ui, f32)) -> bool {
-    let button_width = ui.fonts_mut(|f| {
-        f.layout_no_wrap(button.to_string(), egui::TextStyle::Button.resolve(ui.style()), egui::Color32::WHITE).size().x
-    }) + ui.spacing().button_padding.x * 2.0;
-    let width = (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(40.0);
+    let width = (ui.available_width() - button_width(ui, button) - ui.spacing().item_spacing.x).max(40.0);
     // Boxed in, because a truncating combo box measures its text against
     // everything left in the row and would push the button out of the panel.
     let height = ui.spacing().interact_size.y;
@@ -658,7 +816,151 @@ pub fn font_picker(ui: &mut Ui, id: &str, family: &mut String, monospace_fonts: 
 
 #[cfg(test)]
 mod tests {
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::{NodeT, Queryable};
+
     use super::*;
+
+    struct SavedSessionsTest {
+        sidebar: Sidebar,
+        store: ProfileStore,
+        actions: Vec<Action>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn saved_sessions_harness() -> Harness<'static, SavedSessionsTest> {
+        saved_sessions_harness_sized([300.0, 640.0])
+    }
+
+    fn saved_sessions_harness_sized(size: [f32; 2]) -> Harness<'static, SavedSessionsTest> {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore {
+            path: dir.path().join("sessions.json"),
+            profiles: vec![
+                Profile { name: "Alpha".into(), host: "192.0.2.10".into(), ..Default::default() },
+                Profile {
+                    name: "Beta".into(),
+                    kind: "serial".into(),
+                    device: "COM10".into(),
+                    favorite: true,
+                    ..Default::default()
+                },
+            ],
+        };
+        let state = SavedSessionsTest {
+            sidebar: Sidebar::with_port_lister(&AppSettings::default(), Vec::new),
+            store,
+            actions: Vec::new(),
+            _dir: dir,
+        };
+        let mut harness = Harness::builder().with_size(size).build_ui_state(
+            |ui, state: &mut SavedSessionsTest| {
+                let actions = state.sidebar.ui(ui, &state.store, &[], egui::Color32::LIGHT_BLUE);
+                state.actions.extend(actions);
+            },
+            state,
+        );
+        harness.run_ok();
+        harness
+    }
+
+    #[test]
+    fn saved_filter_searches_destinations_and_protocol_labels() {
+        let profile = Profile {
+            name: "Core Café".into(),
+            host: "Router.EXAMPLE".into(),
+            kind: "raw".into(),
+            device: "COM10".into(),
+            ..Default::default()
+        };
+        for query in ["café", "router.example", "com10", "raw", "tcp", ""] {
+            assert!(matches_saved_filter(&profile, query, false), "{query}");
+        }
+        assert!(!matches_saved_filter(&profile, "other", false));
+        assert!(!matches_saved_filter(&profile, "", true));
+        assert!(matches_saved_filter(&Profile { favorite: true, ..profile }, "tcp", true));
+    }
+
+    #[test]
+    fn filtering_hides_selected_actions_without_changing_the_destination() {
+        let mut harness = saved_sessions_harness();
+        harness.get_by_label("Alpha").click();
+        harness.run_ok();
+        assert_eq!(harness.state().sidebar.selected_saved(), Some("Alpha"));
+        harness.get_by_label("Filter saved sessions").click();
+        harness.event(egui::Event::Text("com10".into()));
+        harness.run_ok();
+        assert!(harness.query_by_label("Alpha").is_none());
+        harness.get_by_label("Beta");
+        assert!(harness.get_by_label("Load").accesskit_node().is_disabled());
+        assert!(harness.get_by_label("Delete").accesskit_node().is_disabled());
+        assert_eq!(harness.state().sidebar.selected_saved(), Some("Alpha"));
+        assert!(harness.state().sidebar.blocks_terminal_input());
+        assert!(harness.state().actions.is_empty());
+        harness.get_by_label("Clear session filter").click();
+        harness.run_ok();
+        assert!(!harness.get_by_label("Load").accesskit_node().is_disabled());
+        harness.get_by_label("Load").click();
+        harness.run_ok();
+        assert_eq!(harness.state().sidebar.draft.host, "192.0.2.10");
+        assert_eq!(harness.state().sidebar.collect().name, "Alpha");
+    }
+
+    #[test]
+    fn favorites_filter_and_star_target_the_named_profile_without_connecting() {
+        let mut harness = saved_sessions_harness();
+        harness.get_by_label("Alpha").click();
+        harness.run_ok();
+        harness.get_by_label("Favorites only").click();
+        harness.run_ok();
+        assert!(harness.query_by_label("Alpha").is_none());
+        assert!(harness.get_by_label("Load").accesskit_node().is_disabled());
+        harness.get_by_label("Unfavorite Beta").click();
+        harness.run_ok();
+        assert_eq!(harness.state().actions, [Action::ToggleFavorite("Beta".into())]);
+        assert_eq!(harness.state().sidebar.selected_saved(), Some("Alpha"));
+        assert_eq!(harness.state().sidebar.draft.host, "");
+        harness.get_by_label("Favorites only").click();
+        harness.run_ok();
+        harness.get_by_label("Favorite Alpha");
+        assert!(!harness.get_by_label("Load").accesskit_node().is_disabled());
+    }
+
+    #[test]
+    fn saved_profile_context_color_targets_its_row() {
+        let mut harness = saved_sessions_harness();
+        harness.get_by_label("Alpha").click();
+        harness.run_ok();
+        harness.get_by_label("Beta").click_button_modifiers(egui::PointerButton::Secondary, egui::Modifiers::NONE);
+        harness.run_ok();
+        assert!(harness.state().sidebar.blocks_terminal_input());
+        harness.get_by_label("Default tab color…").click();
+        harness.run_ok();
+        assert_eq!(harness.state().actions, [Action::ProfileColor("Beta".into())]);
+        assert_eq!(harness.state().sidebar.selected_saved(), Some("Alpha"));
+    }
+
+    #[test]
+    fn profile_actions_remain_reachable_in_a_short_sidebar() {
+        let mut harness = saved_sessions_harness_sized([280.0, 320.0]);
+        harness.get_by_label("More profile actions").scroll_to_me();
+        harness.run_ok();
+        let more = harness.get_by_label("More profile actions");
+        assert!(more.rect().bottom() <= 320.0, "{:?}", more.rect());
+        more.click();
+        harness.run_ok();
+        assert!(harness.state().sidebar.blocks_terminal_input());
+        harness.get_by_label("Export profiles…").click();
+        harness.run_ok();
+        assert_eq!(harness.state().actions, [Action::ExportProfiles]);
+        assert!(harness.query_by_label("Export profiles…").is_none(), "the menu closes after choosing");
+
+        harness.get_by_label("More profile actions").click();
+        harness.run_ok();
+        harness.get_by_label("Import profiles…").click();
+        harness.run_ok();
+        assert_eq!(harness.state().actions, [Action::ExportProfiles, Action::ImportProfiles]);
+    }
 
     fn port(device: &str, serial: &str) -> PortInfo {
         PortInfo {

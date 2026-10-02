@@ -1,6 +1,6 @@
 [package]
 name = "snekkie"
-version = "2.4.1"
+version = "2.5.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A tabbed SSH and serial terminal"
@@ -40,7 +40,7 @@ winresource = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
-egui_kittest = { version = "0.36", features = ["eframe"] }
+egui_kittest = { version = "0.36", features = ["eframe", "wgpu"] }
 
 [profile.release]
 opt-level = 3

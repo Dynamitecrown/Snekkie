@@ -1,4 +1,4 @@
-//! Turning the emulator's colour references into real colours.
+//! Turning the emulator's color references into real colors.
 
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
@@ -7,7 +7,7 @@ use egui::Color32;
 
 use crate::settings::Theme;
 
-/// The 16 ANSI colours. Fixed across themes, same values as the Python
+/// The 16 ANSI colors. Fixed across themes, same values as the Python
 /// release, which in turn are the Tango palette.
 pub const ANSI: [Color32; 16] = [
     Color32::from_rgb(0x2e, 0x34, 0x36), // black
@@ -28,7 +28,7 @@ pub const ANSI: [Color32; 16] = [
     Color32::from_rgb(0xee, 0xee, 0xec), // bright white
 ];
 
-/// xterm's 256-colour palette: the 16 above, a 6x6x6 cube, and 24 greys.
+/// xterm's 256-color palette: the 16 above, a 6x6x6 cube, and 24 greys.
 pub fn indexed(index: u8) -> Color32 {
     match index {
         0..=15 => ANSI[index as usize],
@@ -56,8 +56,8 @@ fn dim(c: Color32) -> Color32 {
     Color32::from_rgb((c.r() as u16 * 2 / 3) as u8, (c.g() as u16 * 2 / 3) as u8, (c.b() as u16 * 2 / 3) as u8)
 }
 
-/// Palette entry by alacritty's colour index (0-255 plus the named slots),
-/// honouring any colour the remote redefined with OSC 4/10/11.
+/// Palette entry by alacritty's color index (0-255 plus the named slots),
+/// honouring any color the remote redefined with OSC 4/10/11.
 pub fn palette(index: usize, theme: &Theme, overrides: &Colors) -> Color32 {
     if let Some(rgb) = overrides[index] {
         return from_rgb(rgb);
@@ -89,7 +89,7 @@ fn resolve(color: Color, theme: &Theme, overrides: &Colors) -> Color32 {
 pub fn cell_colors(cell: &Cell, theme: &Theme, overrides: &Colors) -> (Color32, Color32) {
     let flags = cell.flags;
     let mut fg_ref = cell.fg;
-    // Bold on one of the first eight colours means its bright variant, the
+    // Bold on one of the first eight colors means its bright variant, the
     // way xterm and PuTTY draw it.
     if flags.contains(Flags::BOLD)
         && let Color::Named(n) = fg_ref
@@ -97,8 +97,11 @@ pub fn cell_colors(cell: &Cell, theme: &Theme, overrides: &Colors) -> (Color32, 
     {
         fg_ref = Color::Indexed(n as u8 + 8);
     }
-    let mut fg = resolve(fg_ref, theme, overrides);
-    let mut bg = resolve(cell.bg, theme, overrides);
+    let (mut fg, mut bg) = if theme.effects.monochrome {
+        (theme.fg, theme.bg)
+    } else {
+        (resolve(fg_ref, theme, overrides), resolve(cell.bg, theme, overrides))
+    };
     if flags.contains(Flags::DIM) && !flags.contains(Flags::BOLD) {
         fg = dim(fg);
     }
@@ -125,7 +128,7 @@ mod tests {
     }
 
     #[test]
-    fn default_colours_come_from_the_theme() {
+    fn default_colors_come_from_the_theme() {
         let theme = Theme::default();
         let colors = Colors::default();
         let cell = Cell::default();
@@ -140,5 +143,36 @@ mod tests {
         let theme = Theme::default();
         let cell = Cell { fg: Color::Named(NamedColor::Red), flags: Flags::BOLD, ..Cell::default() };
         assert_eq!(cell_colors(&cell, &theme, &Colors::default()).0, ANSI[9]);
+    }
+
+    #[test]
+    fn monochrome_ignores_remote_colors_but_keeps_text_styles() {
+        let theme = crate::settings::AppSettings::default().theme_named("Monochrome Green");
+        let mut overrides = Colors::default();
+        overrides[NamedColor::Foreground as usize] = Some(Rgb { r: 255, g: 0, b: 0 });
+        overrides[NamedColor::Background as usize] = Some(Rgb { r: 0, g: 0, b: 255 });
+        overrides[196] = Some(Rgb { r: 255, g: 0, b: 255 });
+        for fg in [
+            Color::Named(NamedColor::Foreground),
+            Color::Named(NamedColor::Red),
+            Color::Indexed(196),
+            Color::Spec(Rgb { r: 255, g: 0, b: 255 }),
+        ] {
+            let cell = Cell { fg, bg: Color::Spec(Rgb { r: 0, g: 0, b: 255 }), ..Cell::default() };
+            assert_eq!(cell_colors(&cell, &theme, &overrides), (theme.fg, theme.bg));
+            assert_eq!(
+                cell_colors(&Cell { flags: Flags::BOLD, ..cell.clone() }, &theme, &overrides),
+                (theme.fg, theme.bg)
+            );
+            assert_eq!(
+                cell_colors(&Cell { flags: Flags::DIM, ..cell.clone() }, &theme, &overrides),
+                (dim(theme.fg), theme.bg)
+            );
+            assert_eq!(
+                cell_colors(&Cell { flags: Flags::INVERSE, ..cell.clone() }, &theme, &overrides),
+                (theme.bg, theme.fg)
+            );
+            assert_eq!(cell_colors(&Cell { flags: Flags::HIDDEN, ..cell }, &theme, &overrides), (theme.bg, theme.bg));
+        }
     }
 }

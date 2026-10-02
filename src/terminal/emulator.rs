@@ -1,7 +1,7 @@
 //! Terminal emulation: turns raw bytes into a screen.
 //!
 //! Writing this yourself is the classic trap -- VT100 has scroll regions,
-//! origin mode, character sets, 256-colour and truecolour SGR, and a hundred
+//! origin mode, character sets, 256-color and truecolor SGR, and a hundred
 //! edge cases that only show up when you run `nano` over a flaky link.
 //! alacritty_terminal (the engine inside the Alacritty terminal) handles all
 //! of it, so this is a thin wrapper that adds what Snekkie needs on top.
@@ -46,10 +46,10 @@ impl EventListener for Listener {
             Event::PtyWrite(text) => (self.respond)(text.into_bytes()),
             Event::ColorRequest(index, format) => {
                 let theme = self.shared.lock().theme;
-                // The emulator's own colour table is not reachable from here,
-                // so remote-redefined colours report their defaults.
-                let colour = colors::palette(index, &theme, &Default::default());
-                (self.respond)(format(colors::to_rgb(colour)).into_bytes());
+                // The emulator's own color table is not reachable from here,
+                // so remote-redefined colors report their defaults.
+                let color = colors::palette(index, &theme, &Default::default());
+                (self.respond)(format(colors::to_rgb(color)).into_bytes());
             }
             Event::TextAreaSizeRequest(format) => {
                 let s = self.shared.lock();
@@ -71,6 +71,13 @@ pub struct Emulator {
     term: Term<Listener>,
     parser: Processor,
     shared: Arc<Mutex<Shared>>,
+    /// Lines of history kept, as configured.
+    scrollback: usize,
+    /// Bumped whenever the content may have changed.
+    revision: u64,
+    /// Rows that have scrolled up into the history, as far as can be told;
+    /// see [`Emulator::row_id`].
+    scrolled: i64,
 }
 
 pub const MIN_COLUMNS: usize = 2;
@@ -90,11 +97,55 @@ impl Emulator {
         let config = Config { scrolling_history: scrollback, ..Config::default() };
         let listener = Listener { respond, shared: shared.clone() };
         let term = Term::new(config, &TermSize::new(columns, lines), listener);
-        Emulator { term, parser: Processor::new(), shared }
+        Emulator { term, parser: Processor::new(), shared, scrollback, revision: 0, scrolled: 0 }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
+        let (alt, history, offset) = (self.alt_screen(), self.history_size(), self.display_offset());
         self.parser.advance(&mut self.term, bytes);
+        self.revision += 1;
+        let (now_history, now_offset) = (self.history_size(), self.display_offset());
+        if alt || self.alt_screen() || now_history < history || now_offset < offset {
+            // A full-screen program's screen has no history, and a cleared
+            // or reset history has nothing left to follow.
+            return;
+        }
+        // A view scrolled back stays on the same rows: the terminal moves
+        // its offset by exactly the rows that scrolled in, until the offset
+        // reaches the top of a full history. At the live bottom, a history
+        // that isn't full yet grows by the same count. A full history at the
+        // live bottom gives no sign, so nothing is counted; anything that
+        // relies on these numbers has to check what it finds.
+        let moved = if offset > 0 {
+            now_offset - offset
+        } else if history < self.scrollback {
+            now_history - history
+        } else {
+            0
+        };
+        self.scrolled += moved as i64;
+    }
+
+    /// Changes whenever the screen or history might have.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// A number for a grid row that stays with the row as output scrolls it
+    /// up into the history, so a position found earlier can be found again.
+    /// Best effort: rows can't be followed through a full history while
+    /// the view is at the bottom, a resize rewraps them and the device can
+    /// rewrite the screen, so check what's there before relying on it.
+    pub fn row_id(&self, line: Line) -> i64 {
+        self.scrolled + i64::from(line.0)
+    }
+
+    /// The grid row a [`Emulator::row_id`] now refers to, if it's still in
+    /// the history or on the screen.
+    pub fn row_line(&self, id: i64) -> Option<Line> {
+        let grid = self.term.grid();
+        let line = i32::try_from(id - self.scrolled).ok().map(Line)?;
+        (grid.topmost_line() <= line && line <= grid.bottommost_line()).then_some(line)
     }
 
     pub fn term(&self) -> &Term<Listener> {
@@ -129,6 +180,7 @@ impl Emulator {
             return false;
         }
         self.term.resize(TermSize::new(columns, lines));
+        self.revision += 1;
         let mut s = self.shared.lock();
         s.columns = columns as u16;
         s.lines = lines as u16;
@@ -341,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn colours_and_attributes_are_parsed() {
+    fn colors_and_attributes_are_parsed() {
         let (mut emu, _) = emulator(20, 4, 100);
         emu.feed(b"\x1b[1;31mR\x1b[0m\x1b[38;2;1;2;3mT");
         let grid = emu.term().grid();
