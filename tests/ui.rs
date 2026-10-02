@@ -296,7 +296,8 @@ fn choose_theme(harness: &mut Harness<'static, SnekkieApp>, current: &str, next:
 fn tab_colors_follow_their_sessions_when_reordered_reconnected_and_cleared() {
     let dir = tempfile::tempdir().unwrap();
     let mut harness = harness(&dir);
-    let _first = open_raw_tab(&mut harness, "first");
+    let first_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let _first = open_raw_tab_on_listener(&mut harness, "first", &first_listener);
     let _second = open_raw_tab(&mut harness, "second");
     pick_tab_color(&mut harness, "first", "Blue");
     pick_tab_color(&mut harness, "second", "Red");
@@ -317,6 +318,8 @@ fn tab_colors_follow_their_sessions_when_reordered_reconnected_and_cleared() {
     harness.run_ok();
     harness.get_by_label("Reconnect").click();
     harness.run_ok();
+    let (mut reconnected, _) = first_listener.accept().unwrap();
+    device_prints(&mut harness, &mut reconnected, "first>");
     assert_eq!(harness.state().tab_colors()[1], colors[0]);
     pick_tab_color(&mut harness, "first", "Custom color…");
     harness.get_by_label("Cancel").click();
@@ -534,10 +537,18 @@ fn logging_status_tracks_open_failure_active_writer_and_remote_close() {
 }
 
 fn open_raw_tab(harness: &mut Harness<'static, SnekkieApp>, name: &str) -> std::net::TcpStream {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    open_raw_tab_on_listener(harness, name, &listener)
+}
+
+fn open_raw_tab_on_listener(
+    harness: &mut Harness<'static, SnekkieApp>,
+    name: &str,
+    listener: &std::net::TcpListener,
+) -> std::net::TcpStream {
     use std::io::Write;
     use std::time::{Duration, Instant};
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let ctx = harness.ctx.clone();
     harness.state_mut().open_session(
         &ctx,
@@ -787,7 +798,9 @@ fn find_bar_fits_the_minimum_window_with_sidebar_and_keeps_its_match_visible() {
             .unwrap();
         let mut app = harness_sized(&dir, [520.0, 320.0]);
         let mut device = open_raw_tab(&mut app, "small");
-        device_prints(&mut app, &mut device, "\r\nR1#show ip interface brief\r\nGi0/0 192.0.2.1 up up\r\nready");
+        // Start the IP at column zero: platform fonts can wrap this narrow
+        // pane differently, and the visibility check needs it on one row.
+        device_prints(&mut app, &mut device, "\r\nR1#show ip interface brief\r\n192.0.2.1 up up\r\nready");
         app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
         app.run_ok();
         app.run_ok();
