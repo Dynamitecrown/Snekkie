@@ -1,6 +1,6 @@
 # Paste preview, pacing and right-click behavior
 
-Paste review, pacing and the right-click preference are available in 2.6.0 source builds. The published 2.5.0 release uses PuTTY-style direct paste.
+Paste review, pacing and the right-click preference are available in Snekkie 2.6.0. Version 2.5.0 used PuTTY-style direct paste.
 
 In **Settings → Preferences → General**, choose **Right-click pastes (PuTTY style)**:
 
@@ -15,7 +15,7 @@ Opening, navigating or dismissing the menu sends no terminal input and does not 
 
 ## Review multiline paste
 
-Source builds enable **Preview multiline paste** by default. Clipboard text containing CR or LF opens **Review paste**, regardless of whether it came from the keyboard, Edit menu, right-click or context-menu Paste. Single-line paste stays immediate. Plain Ctrl+V remains the device's control key; use **Ctrl+Shift+V** for clipboard paste.
+Snekkie 2.6.0 enables **Preview multiline paste** by default. Clipboard text containing CR or LF opens **Review paste**, regardless of whether it came from the keyboard, Edit menu, right-click or context-menu Paste. Single-line paste stays immediate. Plain Ctrl+V remains the device's control key; use **Ctrl+Shift+V** for clipboard paste.
 
 Review the destination and line count, edit **Paste text**, and choose the delay between lines. **Send paste** submits the reviewed text. **Cancel** or Escape sends nothing. Enter in the editor only adds a newline. Switching tabs cannot redirect the reviewed paste; reconnecting or closing its destination invalidates it.
 

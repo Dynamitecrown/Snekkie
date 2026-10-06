@@ -2,6 +2,8 @@
 
 These features are included in Snekkie 2.5.0. See the [release notes](releases/2.5.0.md) for an overview and the [downloads](https://github.com/Dynamitecrown/Snekkie/releases/tag/v2.5.0) for packaged builds.
 
+For the newer snippets, paste and logging features, see the [2.6.0 release notes](releases/2.6.0.md).
+
 ## Full app themes
 
 Choose a preset in **Settings → Preferences → General**. There are now 18 presets, including four complete app appearances:
@@ -103,7 +105,7 @@ The tab gets a tinted background and a colored left edge; the active underline u
 
 Set a per-session log path in the sidebar's **Advanced** page. Logging remains raw received bytes, appended to the configured file. The status bar for the current tab shows **Logging** while recording, **Logging off** when no log is active, or **Logging failed** after an open/write/flush error. Hover over **Logging** for the path or **Logging failed** for the reason.
 
-**Open log folder** opens the configured file's parent folder when a log path is present. Folder-opening errors are shown in the app. A write or flush failure produces one warning and disables the failed writer; output continues to reach the terminal and the connection stays alive. Reconnect to retry opening the log. Source builds for the next update add [readable local input/output logging, password controls and rotation](session-logging.md).
+**Open log folder** opens the configured file's parent folder when a log path is present. Folder-opening errors are shown in the app. A write or flush failure produces one warning and disables the failed writer; output continues to reach the terminal and the connection stays alive. Reconnect to retry opening the log. Snekkie 2.6.0 adds [readable local input/output logging, password controls and rotation](session-logging.md).
 
 ## Find in terminal output
 

@@ -1,6 +1,6 @@
 # Local session logging
 
-Available in 2.6.0 source builds. Published 2.5.0 provides raw received-byte logging and status reporting; the additions below await packaged publication.
+Available in Snekkie 2.6.0. Version 2.5.0 provided raw received-byte logging and status reporting; 2.6.0 adds the input/output formats, privacy controls and rotation below.
 
 ## Enable logging for a profile
 

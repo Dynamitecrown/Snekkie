@@ -1,6 +1,6 @@
 # Saved command snippets
 
-Available in 2.6.0 source builds. The published 2.5.0 release does not include this feature.
+Available in Snekkie 2.6.0. See the [release notes](releases/2.6.0.md) for the complete update.
 
 Open **Edit → Command snippets…** or press **Ctrl+Shift+S**. You can manage the library without a connection. To use a snippet, open the library from the connected tab you want to target; its name, protocol and destination appear above the controls.
 

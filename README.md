@@ -6,13 +6,13 @@ A tabbed SSH, Telnet, raw TCP and serial terminal for network engineers. Connect
 
 Snekkie is built in Rust and runs on Windows and Linux. The Windows installer works without administrator rights, keeps your sessions and preferences during upgrades, and supports updates from inside the application.
 
-**New in 2.5.0:** Terminal text search, full app themes including E-Ink Super, expanded animations, network privacy controls, PuTTY session import, saved-session filtering and favorites, persistent profile tab colors, JSON profile import/export, logging status, highlighting intensity controls, additional device platforms and more export formats. See the [feature guide](docs/new-features.md) and [2.5.0 release notes](docs/releases/2.5.0.md). Download [Snekkie 2.5.0](https://github.com/Dynamitecrown/Snekkie/releases/tag/v2.5.0).
+**New in 2.6.0:** Saved command snippets, multiline paste review and pacing, configurable right-click behavior, local input/output logging with password controls and rotation, and terminal search fixes. See the [2.6.0 release notes](docs/releases/2.6.0.md). Download [Snekkie 2.6.0](https://github.com/Dynamitecrown/Snekkie/releases/tag/v2.6.0).
 
-**2.6.0, available in source builds:** [Saved command snippets](docs/command-snippets.md) with vendor groups, temporary variables, a destination preview, an editable local draft and selected-template import/export. Open **Edit → Command snippets…** or press **Ctrl+Shift+S**. See the [2.6.0 release notes](docs/releases/2.6.0.md) for the complete changes; packaged downloads remain at 2.5.0 until publication.
+[Saved command snippets](docs/command-snippets.md) provide vendor groups, temporary variables, a destination preview, an editable local draft and selected-template import/export. Open **Edit → Command snippets…** or press **Ctrl+Shift+S**.
 
-Source builds also add [multiline paste preview and pacing](docs/paste-behavior.md), with destination review, editable text, progress and Stop. The right-click preference chooses direct paste or the context menu. **Settings → Preferences → General** controls both choices and the default delay.
+[Multiline paste preview and pacing](docs/paste-behavior.md) provide destination review, editable text, progress and Stop. The right-click preference chooses direct paste or the context menu. **Settings → Preferences → General** controls both choices and the default delay.
 
-[Local session logging](docs/session-logging.md) in source builds records input and output per profile, with readable timestamps, raw output, automatic filenames and rotation. **Log passwords** defaults off; recognized sensitive input is redacted, and **Private input** covers unusual prompts. Configure it under **Advanced → Logging options**.
+[Local session logging](docs/session-logging.md) records input and output per profile, with readable timestamps, raw output, automatic filenames and rotation. **Log passwords** defaults off; recognized sensitive input is redacted, and **Private input** covers unusual prompts. Configure it under **Advanced → Logging options**.
 
 ---
 
@@ -96,8 +96,8 @@ Download `Snekkie-Setup-<version>.exe` and run it.
 - **Uninstalling:** from *Apps & features*. Saved sessions and settings (`%APPDATA%\snekkie`) are left in place, so reinstalling later picks up where you left off.
 - **Rolling out to several machines:** the installer runs unattended with `/S`:
   ```
-  Snekkie-Setup-2.5.0.exe /S                 install or upgrade silently
-  Snekkie-Setup-2.5.0.exe /S /D=C:\Tools\Snekkie   first install into a specific folder
+  Snekkie-Setup-2.6.0.exe /S                 install or upgrade silently
+  Snekkie-Setup-2.6.0.exe /S /D=C:\Tools\Snekkie   first install into a specific folder
   "%LOCALAPPDATA%\Programs\Snekkie\uninstall.exe" /S
   ```
   A silent upgrade exits with code 5 if Snekkie is running, and refuses to downgrade.
@@ -131,7 +131,7 @@ tar -xzf snekkie-linux-x86_64.tar.gz
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste (selecting also copies, right-click also pastes) |
 | Ctrl+F | Find in terminal output; Enter: older match, Shift+Enter: newer match, Escape: close |
-| Ctrl+Shift+S | Command snippets (source builds; next update) |
+| Ctrl+Shift+S | Command snippets |
 | Shift+PgUp / Shift+PgDn | Scroll back through history |
 | Ctrl+Shift+L | Clear screen and scrollback |
 | Ctrl+Shift+B | Send break (serial and telnet) |
