@@ -4,14 +4,13 @@
 //! big `show run` is parsed off the UI thread and nothing piles up while the
 //! window is minimised. The UI thread only locks the emulator to draw it.
 
-use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
+use crate::logging::{LogHandle, Privacy};
 use crate::profiles::{Kind, Profile};
 use crate::settings::Theme;
 use crate::terminal::emulator::{Emulator, Responder};
@@ -71,6 +70,9 @@ pub struct Shared {
     pub emulator: Mutex<Emulator>,
     state: Mutex<State>,
     log: Mutex<SessionLog>,
+    input_log: Mutex<Option<LogHandle>>,
+    log_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    privacy: Mutex<Privacy>,
     // UI status must never wait for a writer blocked on filesystem I/O.
     log_status: Mutex<LogStatus>,
     notices: Mutex<Vec<Notice>>,
@@ -84,6 +86,23 @@ pub struct Shared {
 }
 
 impl Shared {
+    fn fail_log(&self, generation: u64, message: String) {
+        let first = {
+            let mut log = self.log.lock();
+            let mut status = self.log_status.lock();
+            if !self.is_current(generation) || matches!(*status, LogStatus::Failed(_)) {
+                false
+            } else {
+                *log = SessionLog::Failed;
+                *status = LogStatus::Failed(message.clone());
+                true
+            }
+        };
+        if first {
+            *self.input_log.lock() = None;
+            self.notify(NoticeLevel::Warning, message);
+        }
+    }
     fn is_current(&self, generation: u64) -> bool {
         self.generation.load(Ordering::SeqCst) == generation
     }
@@ -95,10 +114,11 @@ impl Shared {
 
     /// Put bytes on the screen and in the log.
     fn show(&self, bytes: &[u8]) {
+        let safe = self.privacy.lock().output(bytes);
         let failure = {
             let mut log = self.log.lock();
             if let SessionLog::Active(writer) = &mut *log {
-                match writer.write_all(bytes).and_then(|_| writer.flush()) {
+                match writer.write_all(&safe).and_then(|_| writer.flush()) {
                     Ok(()) => None,
                     Err(error) => {
                         let message = format!("Session logging failed: {error}");
@@ -114,6 +134,7 @@ impl Shared {
         };
         // Notice/repaint callbacks must not run while holding the log lock.
         if let Some(message) = failure {
+            *self.input_log.lock() = None;
             self.notify(NoticeLevel::Warning, message);
         }
         self.emulator.lock().feed(bytes);
@@ -158,6 +179,10 @@ impl Sink for SessionSink {
                     {
                         // A pager response isn't typing or local echo.
                         link.write(vec![b' ']);
+                        let logged = shared.input_log.lock().as_ref().map(|handle| handle.input(vec![b' ']));
+                        if let Some(Err(error)) = logged {
+                            shared.fail_log(generation, format!("Session logging failed: {error}"));
+                        }
                     }
                 });
             }
@@ -188,6 +213,7 @@ impl Sink for SessionSink {
             // Reconnecting may have replaced the log while this worker closed.
             if self.shared.is_current(self.generation) && log.stop() {
                 *self.shared.log_status.lock() = LogStatus::Off;
+                *self.shared.input_log.lock() = None;
             }
         }
         (self.shared.repaint)();
@@ -223,6 +249,7 @@ pub struct Session {
     pub shared: Arc<Shared>,
     /// The current transport, also used by the emulator to answer queries.
     link: Arc<Mutex<Option<Link>>>,
+    resolved_log_path: std::path::PathBuf,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -244,6 +271,9 @@ impl Session {
             emulator: Mutex::new(emulator),
             state: Mutex::new(State::Connecting),
             log: Mutex::new(SessionLog::Off),
+            input_log: Mutex::new(None),
+            log_workers: Mutex::new(Vec::new()),
+            privacy: Mutex::new(Privacy::default()),
             log_status: Mutex::new(LogStatus::Off),
             notices: Mutex::new(Vec::new()),
             remote_echo: AtomicBool::new(false),
@@ -251,7 +281,9 @@ impl Session {
             generation: AtomicU64::new(0),
             repaint: Box::new(repaint),
         });
-        Session { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), profile, shared, link }
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let resolved_log_path = Self::resolve_log_path(&profile, id);
+        Session { id, profile, shared, link, resolved_log_path }
     }
 
     /// Start (or restart) the connection.
@@ -263,7 +295,15 @@ impl Session {
         let generation = self.shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
         *self.shared.state.lock() = State::Connecting;
         self.shared.remote_echo.store(false, Ordering::SeqCst);
+        *self.shared.privacy.lock() = Privacy::new(self.profile.log_passwords);
         self.open_log();
+
+        if self.profile.log_passwords && !cx.password.is_empty() {
+            self.record_input(format!("SSH authentication password: {}\n", cx.password).into_bytes(), "");
+        }
+        if self.profile.log_passwords && !cx.key_passphrase.is_empty() {
+            self.record_input(format!("SSH key passphrase: {}\n", cx.key_passphrase).into_bytes(), "");
+        }
 
         let sink: Arc<dyn Sink> = Arc::new(SessionSink {
             shared: self.shared.clone(),
@@ -301,22 +341,41 @@ impl Session {
     }
 
     fn open_log(&mut self) {
+        self.resolved_log_path = Self::resolve_log_path(&self.profile, self.id);
         let path = self.profile.log_path.trim();
         let mut log = self.shared.log.lock();
         *log = SessionLog::Off;
+        *self.shared.input_log.lock() = None;
         *self.shared.log_status.lock() = LogStatus::Off;
         if path.is_empty() {
             return;
         }
-        let path = Path::new(path);
-        let opened = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| OpenOptions::new().create(true).append(true).open(path));
+        let path = self.log_path();
+        let limit = u64::from(self.profile.log_rotate_mb) * 1024 * 1024;
+        let shared = Arc::downgrade(&self.shared);
+        let generation = self.connection_generation();
+        let failure: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |message| {
+            if let Some(shared) = shared.upgrade() {
+                shared.fail_log(generation, message);
+            }
+        });
+        let opened = LogHandle::start(
+            &path,
+            limit,
+            self.profile.log_rotate_daily,
+            self.profile.log_passwords,
+            self.profile.log_format != "text",
+            failure,
+        )
+        .map(|(handle, worker)| {
+            self.shared.log_workers.lock().retain(|worker| !worker.is_finished());
+            self.shared.log_workers.lock().push(worker);
+            *self.shared.input_log.lock() = Some(handle.clone());
+            Box::new(handle) as Box<dyn Write + Send>
+        });
         match opened {
             Ok(file) => {
-                *log = SessionLog::Active(Box::new(file));
+                *log = SessionLog::Active(file);
                 *self.shared.log_status.lock() = LogStatus::Active;
             }
             Err(e) => {
@@ -324,6 +383,69 @@ impl Session {
                 *log = SessionLog::Failed;
                 *self.shared.log_status.lock() = LogStatus::Failed(message.clone());
                 drop(log);
+                self.shared.notify(NoticeLevel::Warning, message);
+            }
+        }
+    }
+
+    pub fn log_path(&self) -> std::path::PathBuf {
+        self.resolved_log_path.clone()
+    }
+
+    fn resolve_log_path(profile: &Profile, id: u64) -> std::path::PathBuf {
+        crate::logging::resolved_path(
+            profile.log_path.trim(),
+            if profile.kind() == Kind::Serial { &profile.device } else { &profile.host },
+        )
+        .as_os_str()
+        .to_string_lossy()
+        .replace("{session}", &format!("{}-{}", std::process::id(), id))
+        .into()
+    }
+
+    pub fn private_input(&self) -> bool {
+        self.shared.privacy.lock().manual
+    }
+
+    /// Called once input is closed at application exit, outside frame rendering.
+    pub fn finish_logs(&self) {
+        let workers = self.take_log_workers();
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
+
+    pub fn take_log_workers(&self) -> Vec<std::thread::JoinHandle<()>> {
+        std::mem::take(&mut *self.shared.log_workers.lock())
+    }
+
+    pub fn set_private_input(&self, enabled: bool) {
+        self.shared.privacy.lock().manual = enabled;
+    }
+
+    pub fn password_input_protected(&self) -> bool {
+        let prompt = self.shared.emulator.lock().cursor_line_text();
+        self.shared.privacy.lock().protected(&prompt)
+    }
+
+    fn record_input(&self, bytes: Vec<u8>, prompt: &str) {
+        let bytes = self.shared.privacy.lock().input(&bytes, prompt);
+        self.record_safe_input(bytes);
+    }
+
+    fn record_safe_input(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let result = self.shared.input_log.lock().as_ref().map(|handle| handle.input(bytes));
+        if let Some(Err(error)) = result {
+            let message = format!("Session logging failed: {error}");
+            let mut status = self.shared.log_status.lock();
+            if !matches!(*status, LogStatus::Failed(_)) {
+                *status = LogStatus::Failed(message.clone());
+                drop(status);
+                *self.shared.log.lock() = SessionLog::Failed;
+                *self.shared.input_log.lock() = None;
                 self.shared.notify(NoticeLevel::Warning, message);
             }
         }
@@ -341,6 +463,11 @@ impl Session {
         self.state() == State::Connected
     }
 
+    /// Identifies the connection reviewed by a command preview.
+    pub fn connection_generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::SeqCst)
+    }
+
     /// Connected or still trying: closing it would cut something off.
     pub fn is_live(&self) -> bool {
         !matches!(self.state(), State::Closed(_))
@@ -353,8 +480,13 @@ impl Session {
     /// Send what the user typed, and draw it too if the far end won't.
     /// Dropped unless connected.
     pub fn write(&self, bytes: Vec<u8>) {
-        if !self.is_connected() {
-            return;
+        self.write_reviewed(self.connection_generation(), bytes);
+    }
+
+    /// Submit input only to the connection that was reviewed, preserving echo/paging.
+    pub fn write_reviewed(&self, generation: u64, bytes: Vec<u8>) -> bool {
+        if !self.is_connected() || !self.shared.is_current(generation) {
+            return false;
         }
         let echo = self.echoes_locally().then(|| keys::local_echo(&bytes));
         let visible = {
@@ -363,13 +495,19 @@ impl Session {
         };
         let mut pager = self.shared.pager.lock();
         pager.sent(&bytes, &visible);
-        if let Some(link) = self.link.lock().as_ref() {
-            link.write(bytes);
-        }
+        // Arm suppression before the device can echo any of these bytes.
+        let input = self.shared.privacy.lock().input(&bytes, &visible);
+        let submitted = self.link.lock().as_ref().is_some_and(|link| link.try_write(bytes));
         drop(pager);
-        if let Some(echo) = echo.filter(|e| !e.is_empty()) {
-            self.shared.show(&echo);
+        if submitted {
+            self.record_safe_input(input);
         }
+        if submitted && let Some(echo) = echo.filter(|e| !e.is_empty()) {
+            // Local echo is already recorded as TX. Never duplicate it as RX.
+            self.shared.emulator.lock().feed(&echo);
+            (self.shared.repaint)();
+        }
+        submitted
     }
 
     pub fn echoes_locally(&self) -> bool {
@@ -397,6 +535,7 @@ impl Session {
                 if let Some(link) = self.link.lock().as_ref() {
                     link.send(Command::Break);
                 }
+                self.record_input(b"[BREAK]\n".to_vec(), "");
             }
             (Kind::Serial | Kind::Telnet, _) => self.shared.notify(NoticeLevel::Warning, "Not connected".into()),
         }
@@ -416,6 +555,7 @@ impl Session {
         if self.shared.log.lock().stop() {
             *self.shared.log_status.lock() = LogStatus::Off;
         }
+        *self.shared.input_log.lock() = None;
     }
 
     pub fn description(&self) -> String {
@@ -455,6 +595,7 @@ mod logging_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     fn wait_until(mut done: impl FnMut() -> bool) {
@@ -481,6 +622,8 @@ mod logging_tests {
                 host: "127.0.0.1".into(),
                 port: listener.local_addr().unwrap().port(),
                 log_path: path.display().to_string(),
+                log_format: "raw".into(),
+                log_passwords: true,
                 ..Profile::default()
             };
             let mut session = Session::new(profile, Theme::default(), || {});
@@ -561,6 +704,7 @@ mod logging_tests {
         let mut console = Console::new(&path);
         assert_eq!(console.session.log_status(), LogStatus::Active);
         console.send(b"Switch#", "Switch#");
+        wait_until(|| std::fs::read(&path).unwrap() == b"Switch#");
         assert_eq!(std::fs::read(&path).unwrap(), b"Switch#");
 
         let writer = Arc::new(Mutex::new(WriterState::default()));
@@ -597,6 +741,7 @@ mod logging_tests {
         console.reconnect();
         assert_eq!(console.session.log_status(), LogStatus::Active);
         console.send(b" recovered", "recovered");
+        wait_until(|| std::fs::read(&path).unwrap() == b"Switch# recovered");
         assert_eq!(std::fs::read(&path).unwrap(), b"Switch# recovered");
     }
 
@@ -621,6 +766,7 @@ mod logging_tests {
         console.send(chunks[0], "Switch#");
         console.send(chunks[1], "caf\u{e9}");
         let expected = [b"previous\r\n".as_slice(), chunks[0], chunks[1]].concat();
+        wait_until(|| std::fs::read(&path).unwrap() == expected);
         assert_eq!(std::fs::read(&path).unwrap(), expected);
         assert_eq!(console.session.log_status(), LogStatus::Active);
         console.session.shutdown();
@@ -758,6 +904,95 @@ mod logging_tests {
         assert_eq!(session.state(), State::Closed(None));
         assert_eq!(session.log_status(), LogStatus::Off);
     }
+
+    #[test]
+    fn text_logs_both_directions_redacts_echo_and_flushes_partial_lines_on_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.log");
+        let mut console = Console::new(&path);
+        console.session.profile.log_format = "text".into();
+        console.session.profile.log_passwords = false;
+        console.reconnect();
+        console.send(b"\x1b[32mPassword:\x1b[0m ", "Password:");
+        console.session.write(b"top-secret\r".to_vec());
+        let mut command = [0; 11];
+        console.peer.read_exact(&mut command).unwrap();
+        assert_eq!(&command, b"top-secret\r");
+        console.send(b"top-", "top-");
+        console.send(b"secret\r\nWelcome\r\n", "Welcome");
+        console.session.write(b"show version\r".to_vec());
+        console.peer.read_exact(&mut [0; 13]).unwrap();
+        console.send(b"caf\xc3", "caf");
+        console.send(b"\xa9\r\nlast partial", "last partial");
+        console.session.shutdown();
+        console.session.finish_logs();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("top-secret"), "{text}");
+        assert!(text.contains("[private input]") && text.contains("[private output]"));
+        assert!(text.contains("TX show version") && text.contains("RX Welcome"));
+        assert!(text.contains("RX café") && text.contains("RX last partial"));
+        assert!(!text.contains('\x1b'));
+    }
+
+    #[test]
+    fn explicit_password_logging_and_private_input_work_for_text_and_raw() {
+        for format in ["text", "raw"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.log");
+            let mut console = Console::new(&path);
+            console.session.profile.log_format = format.into();
+            console.session.profile.log_passwords = true;
+            console.reconnect();
+            console.send(b"Password: ", "Password:");
+            console.session.write(b"allowed-secret\r".to_vec());
+            console.peer.read_exact(&mut [0; 15]).unwrap();
+            console.send(b"allowed-secret\r\nready\r\n", "ready");
+            console.session.set_private_input(true);
+            console.session.write(b"private-override\r".to_vec());
+            console.peer.read_exact(&mut [0; 17]).unwrap();
+            console.send(b"private-override\r\n", "private-override");
+            console.session.set_private_input(false);
+            console.send(b"\r\npublic output\r\n", "public output");
+            console.session.shutdown();
+            console.session.finish_logs();
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            if format == "raw" {
+                text.push_str(&std::fs::read_to_string(path.with_file_name("session.log.input.log")).unwrap());
+            }
+            assert!(text.contains("allowed-secret"));
+            assert!(!text.contains("private-override"), "{format}: {text}");
+            assert!(text.contains("public output"));
+        }
+    }
+
+    #[test]
+    fn asynchronous_writer_failure_disables_logging_once_without_closing_the_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.log");
+        let mut console = Console::new(&path);
+        let shared = Arc::downgrade(&console.session.shared);
+        let generation = console.session.connection_generation();
+        let failure = Arc::new(move |message| {
+            if let Some(shared) = shared.upgrade() {
+                shared.fail_log(generation, message);
+            }
+        });
+        let writer = Arc::new(Mutex::new(WriterState { fail_write: true, ..Default::default() }));
+        let (handle, worker) = LogHandle::start_test(Box::new(InjectedWriter(writer)), failure).unwrap();
+        *console.session.shared.log.lock() = SessionLog::Active(Box::new(handle.clone()));
+        *console.session.shared.input_log.lock() = Some(handle);
+        console.session.shared.log_workers.lock().push(worker);
+        console.send(b"trigger failure\r\n", "trigger failure");
+        wait_until(|| matches!(console.session.log_status(), LogStatus::Failed(_)));
+        assert_eq!(console.session.take_notices().len(), 1);
+        console.send(b"output continues\r\n", "output continues");
+        console.session.write(b"show version\r".to_vec());
+        let mut command = [0; 13];
+        console.peer.read_exact(&mut command).unwrap();
+        assert_eq!(&command, b"show version\r");
+        assert!(console.session.is_connected());
+        assert!(console.session.take_notices().is_empty());
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -785,6 +1020,8 @@ mod tests {
             kind: "serial".into(),
             device,
             log_path: log_path.into(),
+            log_format: "raw".into(),
+            log_passwords: true,
             ..Profile::default()
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -807,6 +1044,7 @@ mod tests {
         let (session, mut master, _rt) = serial_session(log.to_str().unwrap());
         std::io::Write::write_all(&mut master, b"Switch#").unwrap();
         wait_until(|| session.shared.emulator.lock().line_text(0) == "Switch#");
+        wait_until(|| std::fs::read(&log).unwrap() == b"Switch#");
         assert_eq!(std::fs::read(&log).unwrap(), b"Switch#");
         assert_eq!(session.status_text(), format!("{}   [connected]   80x24", session.description()));
     }

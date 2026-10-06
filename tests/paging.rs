@@ -35,6 +35,8 @@ impl Console {
             host: "127.0.0.1".into(),
             port: listener.local_addr().unwrap().port(),
             log_path,
+            log_format: "raw".into(),
+            log_passwords: true,
             ..Profile::default()
         };
         let mut session = Session::new(profile, Theme::default(), || {});
@@ -100,6 +102,7 @@ fn show_commands_page_in_the_background_and_preserve_the_log() {
     console.send(end, "end\nSwitch#");
     console.expect_quiet();
     let expected: Vec<u8> = [b"Switch#".as_slice(), first, rest, b"\r\x1b[2K--More--\x1b[0m", second, end].concat();
+    wait_until(|| std::fs::read(&log).unwrap() == expected);
     assert_eq!(std::fs::read(&log).unwrap(), expected);
 
     console.session.write(b"sh ip route\r".to_vec());

@@ -134,6 +134,9 @@ impl Sidebar {
             list_ports,
         };
         sidebar.reset(settings);
+        if !sidebar.ports.is_empty() {
+            sidebar.set_kind(Kind::Serial);
+        }
         sidebar
     }
 
@@ -521,6 +524,37 @@ impl Sidebar {
                 ui.add(text_field(&mut self.draft.log_path, "(no session logging)", width));
             })
             .then(|| actions.push(Action::BrowseLog));
+        });
+        egui::CollapsingHeader::new("Logging options").show(ui, |ui| {
+        if ui.button("Automatic log filename").clicked() {
+            self.draft.log_path =
+                crate::config::config_dir().join("logs").join("{host}-{date}-{session}.log").display().to_string();
+        }
+        row(ui, "Log format", |ui| {
+            egui::ComboBox::from_id_salt("log_format")
+                .width(ui.available_width().floor())
+                .truncate()
+                .selected_text(if self.draft.log_format == "text" {
+                    "Text (input + output)"
+                } else {
+                    "Raw + input log"
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.draft.log_format, "text".into(), "Text log (input + output)");
+                    ui.selectable_value(&mut self.draft.log_format, "raw".into(), "Raw output + input log");
+                })
+                .response
+        });
+        ui.checkbox(&mut self.draft.log_passwords, "Log passwords")
+            .on_hover_text("Off by default. Recognized password prompts and credential commands are redacted when off. Private input always suppresses logging.");
+        if self.draft.log_passwords {
+            ui.add(egui::Label::new(egui::RichText::new("Passwords will be stored locally in plain text.").color(ui.visuals().warn_fg_color)).wrap());
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Rotate log at");
+            ui.add(DragValue::new(&mut self.draft.log_rotate_mb).range(0..=1024).suffix(" MiB"));
+            ui.checkbox(&mut self.draft.log_rotate_daily, "Rotate daily");
+        });
         });
         row(ui, "Local echo", |ui| {
             let mut echo = self.draft.local_echo();
@@ -1019,6 +1053,7 @@ mod tests {
         let settings = AppSettings { font_size: 14, ..AppSettings::default() };
         let mut sidebar = Sidebar::with_port_lister(&settings, two_cables);
         assert_eq!(sidebar.draft.font_size, 14);
+        sidebar.set_kind(Kind::Ssh);
         sidebar.draft.host = " 10.0.0.1 ".into();
         assert_eq!(sidebar.collect().name, "10.0.0.1");
 

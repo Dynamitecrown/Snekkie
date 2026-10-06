@@ -4453,10 +4453,11 @@ dependencies = [
 
 [[package]]
 name = "snekkie"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "alacritty_terminal",
  "arboard",
+ "chrono",
  "dirs",
  "eframe",
  "egui",

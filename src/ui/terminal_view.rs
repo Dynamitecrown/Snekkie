@@ -68,6 +68,11 @@ pub struct ViewOptions<'a> {
     /// False while a dialog is up: its Enter or Escape must not also reach
     /// the device through a terminal that still has keyboard focus.
     pub keyboard: bool,
+    /// Mouse actions remain available when a sidebar field owns the keyboard,
+    /// but are blocked while a modal is open.
+    pub mouse_input: bool,
+    /// Preserve PuTTY-style right-click paste unless the user chooses the menu.
+    pub right_click_paste: bool,
     /// With `enabled` off, the view draws and redraws exactly as it did
     /// before there were animations.
     pub animations: Animations,
@@ -93,6 +98,8 @@ pub struct ViewOutput {
     pub copy: Option<String>,
     /// The user asked to paste (right-click or the context menu).
     pub paste_requested: bool,
+    /// Clipboard event text; the app owns preview and paced execution.
+    pub paste_text: Option<String>,
     /// A snapshot of output to save or append with the app's file dialog.
     pub text_export: Option<TextExport>,
 }
@@ -283,10 +290,15 @@ impl TerminalView {
             self.blink_epoch = now;
         }
 
-        self.handle_mouse(ui, &response, session, &metrics, now, &mut out);
+        if options.mouse_input {
+            self.handle_mouse(ui, &response, session, &metrics, now, &mut out);
+            if response.secondary_clicked() {
+                out.paste_requested = options.right_click_paste && !ctrl_secondary_click(ui);
+            }
+        }
         self.search.work(ui.ctx(), &session.shared.emulator, metrics.lines);
         let menu_was_open = Popup::is_id_open(ui.ctx(), Popup::default_response_id(&response));
-        let menu_shown = self.context_menu(ui, &response, session, options.keyboard, &mut out);
+        let menu_shown = self.context_menu(ui, &response, session, options, &mut out);
         // Escape closes search from any of its controls, even after clicking
         // back into the terminal. Consume it before terminal input is encoded.
         // A context menu keeps its own Escape dismissal first.
@@ -359,14 +371,18 @@ impl TerminalView {
         ui: &Ui,
         response: &egui::Response,
         session: &Session,
-        keyboard: bool,
+        options: &ViewOptions<'_>,
         out: &mut ViewOutput,
     ) -> bool {
-        let open = keyboard && response.secondary_clicked() && ctrl_secondary_click(ui);
+        // A mouse click transfers focus out of a sidebar field even when
+        // terminal keyboard input is still blocked for that frame.
+        let open = options.mouse_input
+            && response.secondary_clicked()
+            && (!options.right_click_paste || ctrl_secondary_click(ui));
         let state = if open {
             response.surrender_focus();
             Some(SetOpenCommand::Bool(true))
-        } else if response.clicked() || !keyboard {
+        } else if response.clicked() || !options.mouse_input {
             Some(SetOpenCommand::Bool(false))
         } else {
             None
@@ -587,8 +603,9 @@ impl TerminalView {
                     if mods_now.ctrl && !mods_now.shift {
                         self.typed(session, vec![0x16], now, 0, animations);
                     } else {
-                        // One burst for the lot; what it prints is output.
-                        self.typed(session, keys::encode_paste(&text), now, 0, animations);
+                        out.paste_text = Some(text);
+                        // The app may open a review dialog this frame.
+                        break;
                     }
                 }
                 _ => {}
@@ -636,9 +653,8 @@ impl TerminalView {
         }
 
         if response.secondary_clicked() {
-            // PuTTY habit: plain right-click pastes. Ctrl+right-click opens
-            // the context menu without sending anything to the device.
-            out.paste_requested = !ctrl_secondary_click(ui);
+            // The view's settings choose paste versus menu. A secondary
+            // click must not also modify the selection.
             return;
         }
 
@@ -1422,6 +1438,7 @@ mod tests {
         view: TerminalView,
         session: Session,
         requests: Vec<ViewOutput>,
+        right_click_paste: bool,
     }
 
     fn context_harness() -> Harness<'static, ContextMenuTest> {
@@ -1429,10 +1446,16 @@ mod tests {
             view: TerminalView::default(),
             session: Session::new(Default::default(), Theme::default(), || {}),
             requests: Vec::new(),
+            right_click_paste: true,
         };
         let mut harness = Harness::builder().with_size([600.0, 400.0]).build_ui_state(
             |ui, state: &mut ContextMenuTest| {
-                let options = ViewOptions { keyboard: true, ..view_options(Animations::default()) };
+                let options = ViewOptions {
+                    keyboard: true,
+                    mouse_input: true,
+                    right_click_paste: state.right_click_paste,
+                    ..view_options(Animations::default())
+                };
                 let out = state.view.show(ui, &state.session, &options);
                 if out.copy.is_some() || out.paste_requested || out.text_export.is_some() {
                     state.requests.push(out);
@@ -1541,6 +1564,44 @@ mod tests {
         harness.get_by_label("Paste").click();
         harness.run_ok();
         assert!(harness.state().requests.last().unwrap().paste_requested);
+    }
+
+    #[test]
+    fn right_click_can_open_the_menu_without_pasting_and_switch_back_immediately() {
+        let mut harness = context_harness();
+        harness.state_mut().right_click_paste = false;
+        {
+            let mut emu = harness.state().session.shared.emulator.lock();
+            let point = emu.cursor();
+            emu.start_selection(point, Side::Left, true);
+        }
+        let selected = harness.state().session.shared.emulator.lock().selection_text();
+        harness.get_by_label("Terminal output").click_secondary();
+        harness.run_ok();
+        harness.get_by_label("Paste");
+        assert!(harness.state().requests.is_empty(), "opening a menu must never request paste");
+        assert_eq!(harness.state().session.shared.emulator.lock().selection_text(), selected);
+        harness.key_press(Key::ArrowDown);
+        harness.key_press(Key::Escape);
+        harness.run_ok();
+        assert!(harness.query_by_label("Paste").is_none());
+        assert!(harness.state().requests.is_empty());
+        harness.get_by_label("Terminal output").click_secondary();
+        harness.run_ok();
+        harness.get_by_label("Paste").click();
+        harness.run_ok();
+        assert_eq!(harness.state().requests.len(), 1);
+        assert!(harness.state().requests[0].paste_requested);
+        harness.state_mut().requests.clear();
+        open_context_menu(&mut harness);
+        assert!(harness.state().requests.is_empty(), "Ctrl+right-click still opens the menu");
+        harness.key_press(Key::Escape);
+        harness.run_ok();
+        harness.state_mut().right_click_paste = true;
+        harness.get_by_label("Terminal output").click_secondary();
+        harness.run_ok();
+        assert!(harness.state().requests.last().unwrap().paste_requested);
+        assert!(harness.query_by_label("Paste").is_none());
     }
 
     #[test]
@@ -1794,6 +1855,8 @@ mod tests {
             regular: FontId::monospace(14.0),
             bold: FontId::monospace(14.0),
             keyboard: false,
+            mouse_input: false,
+            right_click_paste: true,
             animations,
         }
     }

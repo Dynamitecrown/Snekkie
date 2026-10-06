@@ -243,6 +243,14 @@ pub struct AppSettings {
     /// Automatically press Space at paging prompts during show commands.
     #[serde(deserialize_with = "lenient")]
     pub auto_paging: bool,
+    /// PuTTY-style direct paste; false opens the terminal menu on right-click.
+    #[serde(deserialize_with = "lenient_right_click_paste")]
+    pub right_click_paste: bool,
+    /// Review multiline clipboard text before it reaches the device.
+    #[serde(deserialize_with = "lenient_right_click_paste")]
+    pub preview_multiline_paste: bool,
+    #[serde(deserialize_with = "lenient_paste_delay")]
+    pub paste_delay_ms: u64,
     /// Shared by every device syntax and all open sessions.
     #[serde(deserialize_with = "lenient")]
     pub highlighting_intensity: u8,
@@ -267,10 +275,29 @@ impl Default for AppSettings {
             check_for_updates: true,
             offline_mode: false,
             auto_paging: false,
+            right_click_paste: true,
+            preview_multiline_paste: true,
+            paste_delay_ms: crate::paste::DEFAULT_DELAY_MS,
             highlighting_intensity: crate::terminal::highlight::DEFAULT_INTENSITY,
             animations: Animations::default(),
         }
     }
+}
+
+fn lenient_right_click_paste<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_bool().unwrap_or(true))
+}
+
+fn lenient_paste_delay<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_u64().unwrap_or(crate::paste::DEFAULT_DELAY_MS).min(crate::paste::MAX_DELAY_MS))
 }
 
 /// Declares one kind of animation: its styles, each with the name stored in
@@ -746,6 +773,21 @@ mod tests {
     }
 
     #[test]
+    fn paste_preferences_default_safely_and_round_trip() {
+        for json in ["{}", r#"{"preview_multiline_paste":"bad","paste_delay_ms":-1}"#] {
+            let settings = load(json);
+            assert!(settings.preview_multiline_paste);
+            assert_eq!(settings.paste_delay_ms, 100);
+        }
+        assert_eq!(load(r#"{"paste_delay_ms":999999}"#).paste_delay_ms, crate::paste::MAX_DELAY_MS);
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path().join("settings.json"));
+        let settings = AppSettings { preview_multiline_paste: false, paste_delay_ms: 250, ..Default::default() };
+        store.save(&settings).unwrap();
+        assert_eq!(store.load(), settings);
+    }
+
+    #[test]
     fn terminal_effects_survive_custom_and_named_theme_saves() {
         let dir = tempfile::tempdir().unwrap();
         let store = SettingsStore::new(dir.path().join("settings.json"));
@@ -830,6 +872,21 @@ mod tests {
         settings.auto_paging = false;
         store.save(&settings).unwrap();
         assert!(!store.load().auto_paging);
+    }
+
+    #[test]
+    fn right_click_paste_preserves_the_default_for_old_or_malformed_settings_and_round_trips() {
+        for json in
+            ["{}", r#"{"right_click_paste":null}"#, r#"{"right_click_paste":"menu"}"#, r#"{"right_click_paste":0}"#]
+        {
+            assert!(load(json).right_click_paste);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path().join("settings.json"));
+        for enabled in [false, true] {
+            store.save(&AppSettings { right_click_paste: enabled, ..Default::default() }).unwrap();
+            assert_eq!(store.load().right_click_paste, enabled);
+        }
     }
 
     #[test]

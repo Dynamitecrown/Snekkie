@@ -13,17 +13,21 @@ use egui::{
 use parking_lot::Mutex;
 
 use super::fonts::{self, Fonts};
+use super::paste::{Action as PasteAction, PastePreview};
 use super::preferences::{self, Preferences};
 use super::profile_transfer::ProfileTransfer;
 use super::putty_import::PuttyImport;
 use super::sidebar::{self, Sidebar};
+use super::snippets::{Action as SnippetAction, SnippetTarget, SnippetWindow};
 use super::style;
 use super::terminal_view::{TerminalView, TextExport, ViewOptions};
 use super::updater::{self, Updater};
 use crate::network::{NetworkAccess, NetworkQuestion};
+use crate::paste::{PasteQueue, PasteTarget};
 use crate::profiles::{Auth, Kind, Profile, ProfileStore};
 use crate::session::{ConnectContext, LogStatus, NoticeLevel, Session, State};
 use crate::settings::{AppSettings, SettingsStore, Theme};
+use crate::snippets::{Snippet, SnippetStore};
 use crate::terminal::keys;
 use crate::transport::serial::PortInfo;
 use crate::transport::ssh::{self, HostKeyAsker, HostKeyQuestion};
@@ -41,8 +45,9 @@ Ctrl+Tab        Next tab (Ctrl+Shift+Tab: previous)
 Ctrl+Q          Quit
 
 Ctrl+Shift+C    Copy      (selecting also copies)
-Ctrl+Shift+V    Paste     (right-click also pastes)
+Ctrl+Shift+V    Paste     (right-click pastes by default; configurable)
 Ctrl+F          Find in output (Enter: older, Shift+Enter: newer)
+Ctrl+Shift+S    Command snippets
 Ctrl+Right-click  Terminal context menu (copy, save text, selection)
 Shift+PgUp/Dn   Scroll back through history
 Ctrl+Shift+L    Clear screen and scrollback
@@ -67,6 +72,7 @@ enum ConfirmAction {
     CloseTab(u64),
     Quit,
     DeleteSaved(String),
+    DeleteSnippet(u64),
     ReplaceTheme(String),
     DeleteTheme(String),
     InstallUpdate,
@@ -105,6 +111,7 @@ enum Command {
     Paste,
     SelectAll,
     Find,
+    Snippets,
     ClearScreen,
     ResetTerminal,
     SendBreak,
@@ -145,6 +152,11 @@ impl Default for Paths {
 
 pub struct SnekkieApp {
     store: ProfileStore,
+    snippet_store: SnippetStore,
+    snippets: Option<SnippetWindow>,
+    paste_preview: Option<PastePreview>,
+    paste_queue: Option<PasteQueue>,
+    retired_log_workers: Vec<std::thread::JoinHandle<()>>,
     settings_store: SettingsStore,
     settings: AppSettings,
     sidebar: Sidebar,
@@ -184,6 +196,7 @@ impl SnekkieApp {
     /// Styling needs the egui context, so it happens on the first frame
     /// (see `poll_background`), not here.
     pub fn with_port_lister(paths: Paths, list_ports: fn() -> Vec<PortInfo>) -> Self {
+        let snippet_store = SnippetStore::open(paths.sessions.with_file_name("snippets.json"));
         let store = ProfileStore::open(paths.sessions);
         let settings_store = SettingsStore::new(paths.settings);
         let settings = settings_store.load();
@@ -198,6 +211,11 @@ impl SnekkieApp {
             network_questions: Arc::new(Mutex::new(VecDeque::new())),
             sidebar: Sidebar::with_port_lister(&settings, list_ports),
             store,
+            snippet_store,
+            snippets: None,
+            paste_preview: None,
+            paste_queue: None,
+            retired_log_workers: Vec::new(),
             settings_store,
             settings,
             tabs: Vec::new(),
@@ -421,6 +439,12 @@ impl SnekkieApp {
         password: String,
         key_passphrase: String,
     ) {
+        if let Target::Reconnect(id) = pending.target
+            && self.paste_queue.as_ref().is_some_and(|q| q.target.id == id)
+        {
+            self.paste_queue = None;
+            self.flash(ctx, "Paste canceled by reconnect. Remaining lines were discarded.");
+        }
         let cx = ConnectContext {
             runtime: self.runtime.handle(),
             ask_host_key: self.host_key_asker(ctx),
@@ -477,7 +501,11 @@ impl SnekkieApp {
             return;
         }
         let tab = self.tabs.remove(index);
+        if self.paste_queue.as_ref().is_some_and(|q| q.target.id == id) {
+            self.paste_queue = None;
+        }
         tab.session.shutdown();
+        self.retired_log_workers.extend(tab.session.take_log_workers());
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
         } else if index < self.active {
@@ -524,10 +552,8 @@ impl SnekkieApp {
                 }
             }
             Command::Paste => {
-                if let Some(text) = self.clipboard_text()
-                    && let Some(tab) = self.current()
-                {
-                    tab.session.write(keys::encode_paste(&text));
+                if let Some(text) = self.clipboard_text() {
+                    self.request_paste(ctx, &text);
                 }
             }
             Command::SelectAll => {
@@ -541,6 +567,14 @@ impl SnekkieApp {
                     let selected = tab.session.shared.emulator.lock().selection_text();
                     tab.view.open_search(selected.filter(|t| !t.contains('\n') && t.chars().count() <= 200));
                 }
+            }
+            Command::Snippets => {
+                let target = self.current().filter(|t| t.session.is_connected()).map(|t| SnippetTarget {
+                    id: t.session.id,
+                    generation: t.session.connection_generation(),
+                    description: format!("{} — {}", t.session.title(), t.session.description()),
+                });
+                self.snippets = Some(SnippetWindow::new(target));
             }
             Command::ClearScreen => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -639,7 +673,7 @@ impl SnekkieApp {
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Command> {
         const CTRL: Modifiers = Modifiers::CTRL;
         const CTRL_SHIFT: Modifiers = Modifiers { ctrl: true, shift: true, ..Modifiers::NONE };
-        let table: [(Modifiers, Key, Command); 15] = [
+        let table: [(Modifiers, Key, Command); 16] = [
             (CTRL_SHIFT, Key::N, Command::NewSession),
             (CTRL_SHIFT, Key::D, Command::Duplicate),
             (CTRL_SHIFT, Key::R, Command::Reconnect),
@@ -647,6 +681,7 @@ impl SnekkieApp {
             (CTRL, Key::Q, Command::Quit),
             (CTRL_SHIFT, Key::A, Command::SelectAll),
             (CTRL, Key::F, Command::Find),
+            (CTRL_SHIFT, Key::S, Command::Snippets),
             (CTRL_SHIFT, Key::L, Command::ClearScreen),
             (CTRL_SHIFT, Key::B, Command::SendBreak),
             (CTRL, Key::B, Command::ToggleSidebar),
@@ -795,6 +830,7 @@ impl SnekkieApp {
                 item(ui, "Select all", "Ctrl+Shift+A", Command::SelectAll);
                 ui.separator();
                 item(ui, "Find…", "Ctrl+F", Command::Find);
+                item(ui, "Command snippets…", "Ctrl+Shift+S", Command::Snippets);
             });
             egui::Popup::menu(&terminal).show(|ui| {
                 let label = if self.settings.auto_paging {
@@ -863,6 +899,15 @@ impl SnekkieApp {
             self.flash = None;
         }
         ui.horizontal_wrapped(|ui| {
+            if let Some(queue) = &self.paste_queue {
+                ui.label(format!("Paste: {}/{} line(s) — {}", queue.submitted, queue.total, queue.target.description))
+                    .on_hover_text("Progress counts lines submitted to the transport, not device acknowledgments.");
+                if ui.button("Stop paste").clicked() {
+                    self.paste_queue = None;
+                    self.flash(ui.ctx(), "Paste stopped. Already submitted lines cannot be recalled.");
+                }
+                ui.separator();
+            }
             let text = self.current().map_or_else(|| "No session".to_string(), |t| t.session.status_text());
             if self.settings.offline_mode {
                 ui.label(RichText::new("Offline mode").strong())
@@ -872,9 +917,18 @@ impl SnekkieApp {
             ui.label(RichText::new(text).color(style::secondary(ui)));
             if let Some(tab) = self.current() {
                 ui.separator();
+                let mut private = tab.session.private_input();
+                if ui.checkbox(&mut private, "Private input").on_hover_text("Suppress input and output logging until switched off. Use this for unrecognized sensitive prompts.").changed() {
+                    tab.session.set_private_input(private);
+                }
+                if tab.session.password_input_protected() {
+                    ui.label("Password input protected");
+                } else if tab.session.profile.log_passwords && tab.session.log_status() == LogStatus::Active {
+                    ui.label("Password logging ON");
+                }
                 match tab.session.log_status() {
                     LogStatus::Active => {
-                        ui.label("Logging").on_hover_text(&tab.session.profile.log_path);
+                        ui.label("Logging").on_hover_text(tab.session.log_path().display().to_string());
                     }
                     LogStatus::Failed(error) => {
                         ui.label(RichText::new("Logging failed").color(ui.visuals().error_fg_color))
@@ -890,7 +944,7 @@ impl SnekkieApp {
                         .add_enabled(self.folder_open.is_none(), egui::Button::new("Open log folder").small())
                         .clicked()
                 {
-                    self.request_open_log_folder(ui.ctx(), PathBuf::from(path.trim()));
+                    self.request_open_log_folder(ui.ctx(), tab.session.log_path());
                 }
             }
             if let Some((flash, _)) = &self.flash {
@@ -1003,11 +1057,16 @@ impl SnekkieApp {
     fn finish_profile_export(&mut self, ctx: &egui::Context, path: Option<PathBuf>, profiles: &[Profile]) {
         let Some(path) = path else { return };
         let policy_path = self.settings_store.path.with_file_name("network.ini");
-        if [self.store.path.as_path(), self.settings_store.path.as_path(), policy_path.as_path()]
-            .into_iter()
-            .any(|store| same_file_path(&path, store))
+        if [
+            self.store.path.as_path(),
+            self.settings_store.path.as_path(),
+            policy_path.as_path(),
+            self.snippet_store.path.as_path(),
+        ]
+        .into_iter()
+        .any(|store| same_file_path(&path, store))
         {
-            self.message("Export profiles", "Choose a different file. Exporting over Snekkie's active profiles or preferences would replace saved data.");
+            self.message("Export profiles", "Choose a different file. Exporting over Snekkie's active profiles, preferences or snippets would replace saved data.");
             return;
         }
         let result = crate::profiles::export_profiles(profiles)
@@ -1290,9 +1349,13 @@ impl SnekkieApp {
         let (regular, bold) =
             Fonts::font_ids(family.as_deref(), fonts::points_to_pixels(tab.session.profile.font_size));
         let syntax = tab.session.profile.device_syntax.clone();
-        let keyboard = self.dialogs.is_empty()
+        let sending = self.paste_queue.as_ref().is_some_and(|q| q.target.id == tab.session.id);
+        let mouse_input = self.dialogs.is_empty()
             && self.preferences.is_none()
-            && (!self.settings.show_sidebar || !self.sidebar.blocks_terminal_input());
+            && self.snippets.is_none()
+            && self.paste_preview.is_none()
+            && !sending;
+        let keyboard = mouse_input && (!self.settings.show_sidebar || !self.sidebar.blocks_terminal_input());
         let animations = self.settings.animations;
         let options = ViewOptions {
             theme,
@@ -1301,6 +1364,8 @@ impl SnekkieApp {
             regular,
             bold,
             keyboard,
+            mouse_input,
+            right_click_paste: self.settings.right_click_paste,
             animations,
         };
         let out = if theme.effects.is_super() {
@@ -1311,10 +1376,12 @@ impl SnekkieApp {
         if let Some(text) = out.copy {
             ctx.copy_text(text);
         }
-        if out.paste_requested
+        if let Some(text) = out.paste_text {
+            self.request_paste(&ctx, &text);
+        } else if out.paste_requested
             && let Some(text) = self.clipboard_text()
         {
-            self.tabs[self.active].session.write(keys::encode_paste(&text));
+            self.request_paste(&ctx, &text);
         }
         if let Some(export) = out.text_export {
             let picker = rfd::FileDialog::new()
@@ -1603,6 +1670,11 @@ impl SnekkieApp {
                         self.message("Delete session", format!("Could not save sessions: {e}"));
                     }
                 }
+                ConfirmAction::DeleteSnippet(id) => {
+                    if let Err(error) = self.snippet_store.delete(id) {
+                        self.message("Delete snippet", error);
+                    }
+                }
                 ConfirmAction::ReplaceTheme(name) => {
                     if let Some(prefs) = self.preferences.as_mut()
                         && let Err(e) = prefs.save_theme(&name)
@@ -1708,8 +1780,252 @@ impl SnekkieApp {
         }
     }
 
+    fn snippet_target_valid(&self, target: &SnippetTarget) -> bool {
+        self.tab_index(target.id).is_some_and(|index| {
+            let session = &self.tabs[index].session;
+            session.is_connected() && session.connection_generation() == target.generation
+        })
+    }
+
+    fn request_paste(&mut self, ctx: &egui::Context, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.paste_queue.is_some() {
+            self.message("Paste", "A paste is already running. Stop it before starting another.");
+            return;
+        }
+        let Some(tab) = self.current().filter(|t| t.session.is_connected()) else {
+            self.flash(ctx, "Choose a connected tab before pasting.");
+            return;
+        };
+        let target = PasteTarget {
+            id: tab.session.id,
+            generation: tab.session.connection_generation(),
+            description: format!("{} — {}", tab.session.title(), tab.session.description()),
+        };
+        if self.settings.preview_multiline_paste && crate::paste::multiline(text) {
+            self.paste_preview = Some(PastePreview::new(target, text, self.settings.paste_delay_ms));
+        } else if let Err(error) = self.start_paste(ctx, target, text, 0) {
+            self.message("Paste", error);
+        }
+    }
+
+    fn start_paste(
+        &mut self,
+        ctx: &egui::Context,
+        target: PasteTarget,
+        text: &str,
+        delay_ms: u64,
+    ) -> Result<(), String> {
+        if self.paste_queue.is_some() {
+            return Err("A paste is already running. Stop it before starting another.".into());
+        }
+        if !self.snippet_target_valid(&target) {
+            return Err("The reviewed connection changed or closed. Review the commands again.".into());
+        }
+        let queue = PasteQueue::new(target, text, delay_ms, std::time::Instant::now());
+        if queue.total <= 1 || delay_ms == 0 {
+            let index = self.tab_index(queue.target.id).ok_or("The destination tab closed.")?;
+            if !self.tabs[index].session.write_reviewed(queue.target.generation, keys::encode_paste(text)) {
+                return Err("The destination disconnected before the paste could be submitted.".into());
+            }
+            self.flash(ctx, format!("Paste submitted to {}", queue.target.description));
+        } else {
+            self.paste_queue = Some(queue);
+            ctx.request_repaint();
+        }
+        Ok(())
+    }
+
+    fn advance_paste(&mut self, ctx: &egui::Context) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(mut queue) = self.paste_queue.take() else { return };
+        if !self.snippet_target_valid(&queue.target) {
+            self.flash(
+                ctx,
+                "Paste canceled: the reviewed connection changed or closed. Remaining lines were discarded.",
+            );
+            return;
+        }
+        let now = std::time::Instant::now();
+        if let Some(line) = queue.next_line(now) {
+            let index = self.tab_index(queue.target.id).unwrap();
+            if !self.tabs[index].session.write_reviewed(queue.target.generation, line) {
+                self.flash(ctx, "Paste canceled: the destination disconnected. Remaining lines were discarded.");
+                return;
+            }
+        }
+        if queue.complete() {
+            self.flash(ctx, format!("Paste submitted to {}", queue.target.description));
+        } else {
+            ctx.request_repaint_after(queue.remaining_delay(now));
+            self.paste_queue = Some(queue);
+        }
+    }
+
+    fn paste_ui(&mut self, ctx: &egui::Context, blocked: bool) {
+        let Some(mut preview) = self.paste_preview.take() else { return };
+        let valid = self.snippet_target_valid(&preview.target);
+        let mut action = None;
+        let modal = egui::Modal::new(Id::new("paste_preview")).show(ctx, |ui| {
+            ui.set_width((ctx.content_rect().width() - 48.0).clamp(240.0, 620.0));
+            if blocked {
+                ui.disable();
+            }
+            action = preview.ui(ui, valid);
+        });
+        if !blocked && modal.should_close() {
+            action = Some(PasteAction::Cancel);
+        }
+        match action {
+            Some(PasteAction::Send) => {
+                if let Err(error) = self.start_paste(ctx, preview.target.clone(), &preview.text, preview.delay_ms) {
+                    self.paste_preview = Some(preview);
+                    self.message("Paste", error);
+                }
+            }
+            Some(PasteAction::Cancel) => {}
+            None => self.paste_preview = Some(preview),
+        }
+    }
+
+    fn send_snippet(&mut self, ctx: &egui::Context, target: &SnippetTarget, text: &str) -> Result<(), String> {
+        crate::snippets::validate_commands(text)?;
+        if !self.snippet_target_valid(target) {
+            return Err("The reviewed connection changed or closed. Reopen snippets on a connected tab and review the commands again.".into());
+        }
+        let index = self.tab_index(target.id).ok_or("The destination tab closed.")?;
+        let mut text = text.to_string();
+        if !text.ends_with(['\r', '\n']) {
+            text.push('\n');
+        }
+        self.start_paste(ctx, target.clone(), &text, self.settings.paste_delay_ms)?;
+        self.active = index;
+        self.tabs[index].view.focus();
+        Ok(())
+    }
+
+    fn snippets_ui(&mut self, ctx: &egui::Context, blocked: bool) {
+        let Some(mut window) = self.snippets.take() else { return };
+        let target_valid = window.target.as_ref().is_some_and(|target| self.snippet_target_valid(target));
+        let mut action = None;
+        let modal = egui::Modal::new(Id::new("command_snippets")).show(ctx, |ui| {
+            ui.set_width((ctx.content_rect().width() - 64.0).clamp(240.0, 620.0));
+            if blocked {
+                ui.disable();
+            }
+            action = window.ui(ui, &self.snippet_store, target_valid);
+        });
+        if !blocked && modal.should_close() {
+            action = Some(SnippetAction::Close);
+        }
+        self.snippets = Some(window);
+        match action {
+            Some(SnippetAction::Close) => self.snippets = None,
+            Some(SnippetAction::Save(snippet)) => match self.snippet_store.put(snippet) {
+                Ok(id) => {
+                    if let Some(window) = &mut self.snippets {
+                        window.saved(id);
+                    }
+                }
+                Err(error) => self.message("Save snippet", error),
+            },
+            Some(SnippetAction::Delete(id)) => {
+                if let Some(snippet) = self.snippet_store.get(id) {
+                    self.confirm(
+                        "Delete snippet",
+                        format!("Delete “{}” from {}?", snippet.name, snippet.group_label()),
+                        ConfirmAction::DeleteSnippet(id),
+                    );
+                }
+            }
+            Some(SnippetAction::ImportFile) => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Import command snippets")
+                    .add_filter("Snekkie snippets (*.json)", &["json"])
+                    .pick_file()
+                {
+                    let result = std::fs::File::open(&path)
+                        .and_then(|file| {
+                            let mut bytes = Vec::new();
+                            file.take(crate::snippets::MAX_FILE_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+                            Ok(bytes)
+                        })
+                        .map_err(|e| format!("Could not read {}: {e}", path.display()))
+                        .and_then(|bytes| self.preview_snippet_import(&bytes));
+                    if let Err(error) = result {
+                        self.message("Import snippets", error);
+                    }
+                }
+            }
+            Some(SnippetAction::Import(rows)) => match self.snippet_store.import(rows) {
+                Ok(count) => {
+                    if let Some(window) = &mut self.snippets {
+                        window.imported();
+                    }
+                    self.flash(ctx, format!("Imported {count} snippet(s)."));
+                }
+                Err(error) => self.message("Import snippets", error),
+            },
+            Some(SnippetAction::Export(rows)) => {
+                let path = rfd::FileDialog::new()
+                    .set_title("Export command snippets")
+                    .set_file_name("snekkie-snippets.json")
+                    .add_filter("Snekkie snippets (*.json)", &["json"])
+                    .save_file();
+                self.finish_snippet_export(ctx, path, &rows);
+            }
+            Some(SnippetAction::Send(text)) => {
+                let target = self.snippets.as_ref().and_then(|window| window.target.clone());
+                let result = target
+                    .as_ref()
+                    .ok_or_else(|| "Choose a connected destination first.".to_string())
+                    .and_then(|target| self.send_snippet(ctx, target, &text));
+                match result {
+                    Ok(()) => self.snippets = None,
+                    Err(error) => self.message("Send commands", error),
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn finish_snippet_export(&mut self, ctx: &egui::Context, path: Option<PathBuf>, snippets: &[Snippet]) {
+        let Some(path) = path else { return };
+        let policy_path = self.settings_store.path.with_file_name("network.ini");
+        if [
+            self.store.path.as_path(),
+            self.settings_store.path.as_path(),
+            policy_path.as_path(),
+            self.snippet_store.path.as_path(),
+        ]
+        .into_iter()
+        .any(|store| same_file_path(&path, store))
+        {
+            self.message("Export snippets", "Choose a different file. Exporting over Snekkie's active profiles, preferences or snippets would replace saved data.");
+            return;
+        }
+        let result = crate::snippets::export_snippets(snippets)
+            .and_then(|text| crate::config::write_atomic(&path, &text).map_err(|e| e.to_string()));
+        match result {
+            Ok(()) => {
+                if let Some(window) = &mut self.snippets {
+                    window.imported();
+                }
+                self.flash(ctx, format!("Exported {} snippet(s) to {}", snippets.len(), path.display()));
+            }
+            Err(error) => self.message("Export snippets", format!("Could not export {}: {error}", path.display())),
+        }
+    }
+
     fn modal_open(&self) -> bool {
-        !self.dialogs.is_empty() || self.preferences.is_some()
+        !self.dialogs.is_empty()
+            || self.preferences.is_some()
+            || self.snippets.is_some()
+            || self.paste_preview.is_some()
     }
 
     /// One frame of the whole app.
@@ -1761,7 +2077,11 @@ impl SnekkieApp {
         // Preferences sits under any dialog it opened (theme name, confirm).
         let dialog_open = !self.dialogs.is_empty();
         self.preferences_ui(&ctx, dialog_open);
+        self.snippets_ui(&ctx, dialog_open);
+        self.paste_ui(&ctx, dialog_open);
         self.dialogs_ui(&ctx);
+        // Process Stop, close and reconnect before considering the next line.
+        self.advance_paste(&ctx);
 
         // Back to typing where you left off once the last dialog closes.
         if modal_open
@@ -1775,12 +2095,24 @@ impl SnekkieApp {
 
     /// Hang up everything; called on exit.
     pub fn shutdown(&mut self) {
+        self.paste_queue = None;
+        self.paste_preview = None;
         for tab in &self.tabs {
             tab.session.shutdown();
         }
     }
 
     // -- test hooks -----------------------------------------------------
+
+    #[doc(hidden)]
+    pub fn paste_running(&self) -> bool {
+        self.paste_queue.is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn paste_clipboard_text(&mut self, ctx: &egui::Context, text: &str) {
+        self.request_paste(ctx, text);
+    }
 
     #[doc(hidden)]
     pub fn tab_titles(&self) -> Vec<String> {
@@ -1841,6 +2173,14 @@ impl SnekkieApp {
     pub fn preview_profile_import(&mut self, bytes: &[u8]) -> Result<(), String> {
         let batch = crate::profiles::parse_import(bytes)?;
         self.dialogs.push(Dialog::ProfileTransfer(Box::new(ProfileTransfer::import(batch, &self.store.profiles))));
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn preview_snippet_import(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let batch = crate::snippets::parse_import(bytes)?;
+        let window = self.snippets.get_or_insert_with(|| SnippetWindow::new(None));
+        window.preview_import(batch, &self.snippet_store.snippets);
         Ok(())
     }
 
@@ -1996,6 +2336,12 @@ impl eframe::App for SnekkieApp {
 
     fn on_exit(&mut self) {
         self.shutdown();
+        for tab in &self.tabs {
+            tab.session.finish_logs();
+        }
+        for worker in self.retired_log_workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -2051,7 +2397,12 @@ mod tests {
         let ctx = egui::Context::default();
         app.finish_profile_export(&ctx, None, &profiles[..1]);
         assert!(app.flash.is_none() && app.dialogs.is_empty());
-        for path in [app.store.path.clone(), app.settings_store.path.clone(), dir.path().join("network.ini")] {
+        for path in [
+            app.store.path.clone(),
+            app.settings_store.path.clone(),
+            dir.path().join("network.ini"),
+            app.snippet_store.path.clone(),
+        ] {
             app.finish_profile_export(&ctx, Some(path), &profiles[..1]);
             assert!(app.dialog_texts().last().unwrap().contains("Choose a different file"));
             app.dialogs.clear();
@@ -2083,6 +2434,116 @@ mod tests {
         assert_eq!(app.store.profiles, [original]);
         assert!(app.tabs.is_empty());
         assert!(app.dialog_texts()[0].contains("Could not save imported profiles"));
+    }
+
+    #[test]
+    fn snippet_exports_preserve_live_stores_and_write_only_the_selected_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = SnekkieApp::with_port_lister(paths, Vec::new);
+        let id = app
+            .snippet_store
+            .put(Snippet { name: "Version".into(), template: "show version".into(), ..Default::default() })
+            .unwrap();
+        let rows = vec![app.snippet_store.get(id).unwrap().clone()];
+        let ctx = egui::Context::default();
+        app.finish_snippet_export(&ctx, None, &rows);
+        assert!(app.dialogs.is_empty() && app.flash.is_none());
+        for path in [
+            app.store.path.clone(),
+            app.settings_store.path.clone(),
+            dir.path().join("network.ini"),
+            app.snippet_store.path.clone(),
+        ] {
+            if !path.exists() {
+                std::fs::write(&path, "original data").unwrap();
+            }
+            let original = std::fs::read(&path).unwrap();
+            app.finish_snippet_export(&ctx, Some(path.clone()), &rows);
+            assert!(app.dialog_texts().last().unwrap().contains("Choose a different file"));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            app.dialogs.clear();
+        }
+        let export = dir.path().join("export.json");
+        app.finish_snippet_export(&ctx, Some(export.clone()), &rows);
+        let batch = crate::snippets::parse_import(&std::fs::read(export).unwrap()).unwrap();
+        assert_eq!(batch.snippets[0].template, rows[0].template);
+        assert!(app.tabs.is_empty());
+        app.finish_snippet_export(&ctx, Some(dir.path().to_path_buf()), &rows);
+        assert!(app.dialog_texts().last().unwrap().contains("Could not export"));
+    }
+
+    #[test]
+    fn reviewed_snippet_target_survives_focus_changes_but_not_reconnect_or_close() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = SnekkieApp::with_port_lister(paths, Vec::new);
+        let ctx = egui::Context::default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        app.open_session(
+            &ctx,
+            Profile {
+                name: "Original".into(),
+                kind: "raw".into(),
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                ..Default::default()
+            },
+        );
+        let (mut first, _) = listener.accept().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.tabs[0].session.is_connected() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.run_command(&ctx, Command::Snippets);
+        let target = app.snippets.as_ref().unwrap().target.clone().unwrap();
+        app.snippets = None;
+        app.tabs.push(Tab {
+            session: Session::new(Profile::default(), app.settings.colors(), || {}),
+            view: TerminalView::default(),
+            color: None,
+            color_override: false,
+        });
+        app.active = 1;
+        for (commands, expected) in [("show a\r\nshow b\nshow c\r", "show a\rshow b\rshow c\r"), ("show d", "show d\r")]
+        {
+            app.send_snippet(&ctx, &target, commands).unwrap();
+            while app.paste_queue.is_some() {
+                assert!(Instant::now() < deadline);
+                app.advance_paste(&ctx);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            first.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut bytes = vec![0; expected.len()];
+            first.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, expected.as_bytes());
+            assert_eq!(app.active, 0);
+        }
+        app.start_paste(&ctx, target.clone(), "first\nnever replay\n", 5000).unwrap();
+        app.advance_paste(&ctx);
+        let mut first_line = [0; 6];
+        first.read_exact(&mut first_line).unwrap();
+        assert_eq!(&first_line, b"first\r");
+        app.run_command(&ctx, Command::Reconnect);
+        assert!(app.paste_queue.is_none());
+        let (mut replacement, _) = listener.accept().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.tabs[0].session.is_connected() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.send_snippet(&ctx, &target, "stale command").is_err());
+        replacement.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+        assert!(replacement.read(&mut [0; 64]).is_err());
+        let new_target = PasteTarget { generation: app.tabs[0].session.connection_generation(), ..target.clone() };
+        app.start_paste(&ctx, new_target, "must not send\nsecond\n", 5000).unwrap();
+        assert!(app.paste_queue.is_some());
+        app.close_tab(target.id, true);
+        assert!(app.paste_queue.is_none());
+        assert_eq!(replacement.read(&mut [0; 64]).unwrap_or(0), 0);
+        assert!(app.send_snippet(&ctx, &target, "closed command").is_err());
     }
 
     #[test]

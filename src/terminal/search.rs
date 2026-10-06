@@ -8,8 +8,8 @@
 //! A history can hold hundreds of thousands of lines, and scanning that
 //! takes far longer than a frame. Counting and stepping between matches are
 //! done a slice at a time (see [`SLICE_CELLS`]), each slice under one hold
-//! of the emulator's lock, so neither the UI nor the connection feeding the
-//! terminal waits long.
+//! of the emulator's lock. Each slice finishes a logical line, so one very
+//! long wrapped line can exceed the budget.
 
 use std::cmp::Ordering;
 
@@ -21,7 +21,7 @@ use regex::{Regex, RegexBuilder};
 use super::emulator::Emulator;
 
 /// About how many cells one slice of a long search reads before letting go
-/// of the emulator. A few milliseconds' work in a release build.
+/// of the emulator. This is a soft budget: a logical line is read whole.
 pub const SLICE_CELLS: usize = 400_000;
 
 /// What to look for.
@@ -34,7 +34,7 @@ impl Pattern {
     /// `query` is literal text unless `regex` is set. Matching ignores case
     /// unless `match_case` is set. Errors are short enough to show inline.
     pub fn new(query: &str, match_case: bool, regex: bool) -> Result<Pattern, String> {
-        let source = if regex { query.to_string() } else { regex::escape(query) };
+        let source = if regex { query.to_string() } else { Self::literal_source(query) };
         RegexBuilder::new(&source).case_insensitive(!match_case).build().map(|regex| Pattern { regex }).map_err(
             |error| match error {
                 regex::Error::CompiledTooBig(_) => "Pattern is too complex".to_string(),
@@ -47,6 +47,13 @@ impl Pattern {
                 }
             },
         )
+    }
+
+    /// Escape selected or literal text for the displayed terminal content.
+    pub(crate) fn literal_source(query: &str) -> String {
+        // Copied terminal text retains tabs, whose on-screen width depends
+        // on the device's tab stops. Match their displayed gap instead.
+        regex::escape(query).replace('\t', " +")
     }
 }
 
@@ -120,14 +127,17 @@ fn scan_line(
                 scratch.text.push(' ');
                 continue;
             }
-            scratch.text.push(cell.c);
+            // The tab marker occupies one blank cell; the remaining cells
+            // up to the tab stop already contain spaces in the grid.
+            scratch.text.push(if cell.c == '\t' { ' ' } else { cell.c });
             if let Some(marks) = cell.zerowidth() {
                 scratch.text.extend(marks);
             }
         }
     }
     let read = columns * (last.0 - first.0 + 1) as usize;
-    let text = scratch.text.trim_end();
+    // Only grid padding is dropped. Unicode whitespace can be actual output.
+    let text = scratch.text.trim_end_matches(' ');
     let spans: Vec<(usize, usize)> =
         pattern.regex.find_iter(text).filter(|m| !m.is_empty()).map(|m| (m.start(), m.end())).collect();
     if spans.is_empty() {
@@ -166,6 +176,9 @@ pub fn matches_between(emulator: &Emulator, pattern: &Pattern, first: Line, last
     let grid = emulator.term().grid();
     let first = first.max(grid.topmost_line());
     let last = last.min(grid.bottommost_line());
+    if first > last {
+        return Vec::new();
+    }
     let mut found = Vec::new();
     let mut scratch = Scratch::default();
     let mut line = line_start(grid, first);
@@ -467,6 +480,74 @@ mod tests {
         assert!(!error.contains('\n'));
         // The same text is fine as a literal.
         assert!(Pattern::new("(ab", false, false).is_ok());
+    }
+
+    #[test]
+    fn ranges_outside_the_grid_and_reversed_ranges_are_empty() {
+        let mut emu = emulator(10, 3, 10);
+        emu.feed(b"needle");
+        let p = pattern("needle");
+        for (first, last) in [(10, 20), (-20, -10), (2, 0), (0, -1)] {
+            assert!(matches_between(&emu, &p, Line(first), Line(last)).is_empty());
+        }
+        assert_eq!(matches_between(&emu, &p, Line(-20), Line(20)), all(&emu, &p));
+    }
+
+    #[test]
+    fn tabs_match_the_displayed_gap_and_copied_literal_text() {
+        let mut emu = emulator(30, 3, 10);
+        emu.feed(b"a\tb\r\nx\x1b[3g\x1b[6G\x1bH\r\tc");
+        assert_eq!(all(&emu, &pattern("a       b")), [Found { start: at(0, 0), end: at(0, 8) }]);
+        assert_eq!(all(&emu, &pattern("a\tb")), [Found { start: at(0, 0), end: at(0, 8) }]);
+        assert_eq!(all(&emu, &pattern("x    c")), [Found { start: at(1, 0), end: at(1, 5) }]);
+        let p = Pattern::new(r"^a\s+b$", true, true).unwrap();
+        assert_eq!(all(&emu, &p), [Found { start: at(0, 0), end: at(0, 8) }]);
+    }
+
+    #[test]
+    fn trailing_unicode_whitespace_is_content_and_hidden_text_is_not() {
+        let mut emu = emulator(30, 3, 10);
+        emu.feed("end\u{a0}\r\nleft \x1b[8msecret\x1b[0m right".as_bytes());
+        let p = Pattern::new("end\u{a0}$", true, true).unwrap();
+        assert_eq!(all(&emu, &p), [Found { start: at(0, 0), end: at(0, 3) }]);
+        assert!(all(&emu, &pattern("secret")).is_empty());
+        assert_eq!(all(&emu, &pattern("right")), [Found { start: at(1, 12), end: at(1, 16) }]);
+    }
+
+    #[test]
+    fn resizing_reflows_matches_and_restarts_a_partial_count() {
+        let mut emu = emulator(20, 6, 100);
+        emu.feed(b"prefix needle suffix\r\nneedle\r\nready");
+        let p = pattern("needle");
+        let mut tally = Count::new(&emu);
+        assert_eq!(tally.step(&emu, &p, None, 20), None);
+        for columns in [10, 30, 8, 20] {
+            emu.resize(columns, 6);
+            let found = all(&emu, &p);
+            assert_eq!(found.len(), 2, "{columns}");
+            assert!(found.iter().all(|&f| still_matches(&emu, &p, f)));
+            assert_eq!(find(&emu, &p, Direction::Older, at(5, columns - 1), 10), Some(found[1]));
+        }
+        let result = (0..100).find_map(|_| tally.step(&emu, &p, None, 20)).unwrap();
+        assert_eq!(result, Tally { total: 2, index: None });
+    }
+
+    #[test]
+    fn trimmed_history_and_screen_changes_discard_partial_counts() {
+        let mut emu = emulator(20, 4, 5);
+        let p = pattern("needle");
+        emu.feed(b"needle\r\nneedle\r\n");
+        let mut tally = Count::new(&emu);
+        assert_eq!(tally.step(&emu, &p, None, 20), None);
+        for _ in 0..15 {
+            emu.feed(b"filler\r\n");
+        }
+        assert!(all(&emu, &p).is_empty());
+        assert_eq!(tally.step(&emu, &p, None, SLICE_CELLS).unwrap().total, 0);
+        emu.feed(b"\x1b[?1049h\x1b[Hneedle");
+        assert_eq!(tally.step(&emu, &p, None, SLICE_CELLS).unwrap().total, 1);
+        emu.feed(b"\x1b[?1049l");
+        assert_eq!(tally.step(&emu, &p, None, SLICE_CELLS).unwrap().total, 0);
     }
 
     #[test]

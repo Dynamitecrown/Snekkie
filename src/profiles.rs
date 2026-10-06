@@ -224,6 +224,16 @@ pub struct Profile {
     /// Empty = no logging.
     #[serde(deserialize_with = "lenient")]
     pub log_path: String,
+    /// Older profiles retain raw received-byte logs; new profiles use text.
+    #[serde(default = "legacy_log_format", deserialize_with = "lenient_log_format")]
+    pub log_format: String,
+    #[serde(deserialize_with = "lenient")]
+    pub log_passwords: bool,
+    /// 0 disables size rotation; defaults preserve old log behavior on load.
+    #[serde(default, deserialize_with = "lenient")]
+    pub log_rotate_mb: u32,
+    #[serde(default, deserialize_with = "lenient")]
+    pub log_rotate_daily: bool,
     /// "auto", "on" or "off"; see [`LocalEcho`].
     #[serde(deserialize_with = "lenient")]
     pub local_echo: String,
@@ -259,11 +269,28 @@ impl Default for Profile {
             font_family: String::new(),
             font_size: 11,
             log_path: String::new(),
+            log_format: "text".into(),
+            log_passwords: false,
+            log_rotate_mb: 10,
+            log_rotate_daily: true,
             local_echo: "auto".into(),
             backspace: "del".into(),
             device_syntax: "none".into(),
         }
     }
+}
+
+fn legacy_log_format() -> String {
+    "raw".into()
+}
+
+fn lenient_log_format<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value.as_str() {
+        Some("text") => "text",
+        _ => "raw",
+    }
+    .into())
 }
 
 impl Profile {
@@ -360,6 +387,10 @@ struct ExportProfile<'a> {
     font_family: &'a str,
     font_size: u32,
     log_path: &'a str,
+    log_format: &'a str,
+    log_passwords: bool,
+    log_rotate_mb: u32,
+    log_rotate_daily: bool,
     local_echo: &'a str,
     backspace: &'a str,
     device_syntax: &'a str,
@@ -389,6 +420,11 @@ impl<'a> From<&'a Profile> for ExportProfile<'a> {
             font_family: &profile.font_family,
             font_size: profile.font_size,
             log_path: &profile.log_path,
+            log_format: &profile.log_format,
+            // Transfer never enables secret recording on another installation.
+            log_passwords: false,
+            log_rotate_mb: profile.log_rotate_mb,
+            log_rotate_daily: profile.log_rotate_daily,
             local_echo: &profile.local_echo,
             backspace: &profile.backspace,
             device_syntax: &profile.device_syntax,
@@ -462,12 +498,13 @@ fn imported_profile(value: &serde_json::Value) -> Result<(Profile, Vec<String>),
         "parity",
         "font_family",
         "log_path",
+        "log_format",
         "local_echo",
         "backspace",
         "device_syntax",
     ];
-    let integer_fields = ["port", "keepalive", "baud", "bytesize", "scrollback", "font_size"];
-    let boolean_fields = ["favorite", "rtscts", "xonxoff"];
+    let integer_fields = ["port", "keepalive", "baud", "bytesize", "scrollback", "font_size", "log_rotate_mb"];
+    let boolean_fields = ["favorite", "rtscts", "xonxoff", "log_passwords", "log_rotate_daily"];
     for field in string_fields {
         if fields.get(field).is_some_and(|value| !value.is_string()) {
             return Err(format!("{name}: {field} must be text"));
@@ -527,6 +564,13 @@ fn imported_profile(value: &serde_json::Value) -> Result<(Profile, Vec<String>),
         return Err(format!("{name}: unsupported terminal settings"));
     }
     let mut notes = Vec::new();
+    if profile.log_passwords {
+        profile.log_passwords = false;
+        notes.push("password logging disabled on import; enable it explicitly on this installation".into());
+    }
+    if fields.get("log_format").is_some_and(|value| !matches!(value.as_str(), Some("raw" | "text"))) {
+        return Err(format!("{name}: unsupported log format"));
+    }
     if !profile.tab_color.is_empty() && settings::parse_hex(&profile.tab_color).is_none() {
         notes.push("invalid tab color cleared".into());
     }
@@ -754,6 +798,34 @@ mod tests {
             assert!(!profile.favorite);
             assert!(profile.tab_color.is_empty());
         }
+    }
+
+    #[test]
+    fn logging_preferences_preserve_old_formats_and_require_explicit_password_opt_in() {
+        let (_old_dir, old) = store_with(
+            r#"{"version":1,"sessions":[{"name":"old"},{"name":"bad","log_passwords":"yes","log_format":42}]}"#,
+        );
+        for profile in &old.profiles {
+            assert_eq!(profile.log_format, "raw");
+            assert!(!profile.log_passwords);
+            assert_eq!(profile.log_rotate_mb, 0);
+            assert!(!profile.log_rotate_daily);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ProfileStore::open(dir.path().join("sessions.json"));
+        let profile =
+            Profile { name: "Lab".into(), host: "192.0.2.3".into(), log_passwords: true, ..Default::default() };
+        store.put(profile.clone()).unwrap();
+        let loaded = ProfileStore::open(store.path.clone());
+        assert_eq!(loaded.get("Lab").unwrap(), &profile);
+        let export = export_profiles(&[profile]).unwrap();
+        assert!(!parse_import(export.as_bytes()).unwrap().profiles[0].log_passwords);
+        let imported = parse_import(
+            br#"{"version":1,"sessions":[{"name":"Imported","kind":"ssh","host":"192.0.2.3","log_passwords":true}]}"#,
+        )
+        .unwrap();
+        assert!(!imported.profiles[0].log_passwords);
+        assert!(imported.warnings.iter().any(|note| note.contains("password logging disabled")));
     }
 
     #[test]

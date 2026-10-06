@@ -121,4 +121,8 @@ impl Link {
             self.send(Command::Write(bytes));
         }
     }
+
+    pub fn try_write(&self, bytes: Vec<u8>) -> bool {
+        bytes.is_empty() || self.commands.send(Command::Write(bytes)).is_ok()
+    }
 }

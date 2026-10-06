@@ -298,6 +298,19 @@ impl Preferences {
         );
 
         ui.add_space(6.0);
+        ui.checkbox(&mut self.settings.right_click_paste, "Right-click pastes (PuTTY style)").on_hover_text(
+            "Enabled by default. Turn off to open the terminal context menu on right-click and choose Paste there. Ctrl+right-click opens the menu in either mode.",
+        );
+        ui.checkbox(&mut self.settings.preview_multiline_paste, "Preview multiline paste")
+            .on_hover_text("Review the destination and edit text before sending. Single-line paste stays immediate.");
+        ui.horizontal(|ui| {
+            ui.label("Paste delay between lines");
+            ui.add(
+                egui::DragValue::new(&mut self.settings.paste_delay_ms)
+                    .range(0..=crate::paste::MAX_DELAY_MS)
+                    .suffix(" ms"),
+            );
+        });
         ui.checkbox(&mut self.settings.auto_paging, "Automatically page through show commands").on_hover_text(
             "Press Space at Cisco More prompts during show commands. Off by default. q or Ctrl+C stops it.",
         );

@@ -8,6 +8,12 @@ Snekkie is built in Rust and runs on Windows and Linux. The Windows installer wo
 
 **New in 2.5.0:** Terminal text search, full app themes including E-Ink Super, expanded animations, network privacy controls, PuTTY session import, saved-session filtering and favorites, persistent profile tab colors, JSON profile import/export, logging status, highlighting intensity controls, additional device platforms and more export formats. See the [feature guide](docs/new-features.md) and [2.5.0 release notes](docs/releases/2.5.0.md). Download [Snekkie 2.5.0](https://github.com/Dynamitecrown/Snekkie/releases/tag/v2.5.0).
 
+**2.6.0, available in source builds:** [Saved command snippets](docs/command-snippets.md) with vendor groups, temporary variables, a destination preview, an editable local draft and selected-template import/export. Open **Edit → Command snippets…** or press **Ctrl+Shift+S**. See the [2.6.0 release notes](docs/releases/2.6.0.md) for the complete changes; packaged downloads remain at 2.5.0 until publication.
+
+Source builds also add [multiline paste preview and pacing](docs/paste-behavior.md), with destination review, editable text, progress and Stop. The right-click preference chooses direct paste or the context menu. **Settings → Preferences → General** controls both choices and the default delay.
+
+[Local session logging](docs/session-logging.md) in source builds records input and output per profile, with readable timestamps, raw output, automatic filenames and rotation. **Log passwords** defaults off; recognized sensitive input is redacted, and **Private input** covers unusual prompts. Configure it under **Advanced → Logging options**.
+
 ---
 
 ## Features
@@ -17,7 +23,7 @@ Snekkie is built in Rust and runs on Windows and Linux. The Windows installer wo
 - **SSH:** Password (including keyboard-interactive, as most network gear uses), private key, and SSH agent (Pageant or the Windows OpenSSH agent) auth, with `known_hosts` verification. Older gear that only speaks SHA-1 key exchange, CBC ciphers or `ssh-rsa` host keys still connects; modern algorithms are always preferred.
 - **Telnet & raw TCP:** For older gear, lab consoles (GNS3, EVE-NG) and console servers. Telnet negotiates window size and terminal type, and sends break through to the device's console line; raw TCP passes bytes through untouched.
 - **Keepalives:** Idle SSH, telnet and raw sessions send a keepalive every 60 seconds (adjustable per session, or off) so firewalls don't drop them, and an SSH session whose server stops answering is closed with a clear reason instead of hanging.
-- **Serial:** Auto-detects COM ports and lists them in a drop-down, labelled by adapter serial number so several identical console cables can be told apart. Full baud/data/parity/stop-bit control, flow control, and Cisco break signals.
+- **Serial:** Auto-detects COM ports and lists them in a drop-down, labelled by adapter serial number so several identical console cables can be told apart. At startup, Type defaults to Serial when a port is detected, or SSH otherwise. A single port is selected automatically; with several ports, choose the one to use. Full baud/data/parity/stop-bit control, flow control, and Cisco break signals.
 - **Tabs & profiles:** Multi-tab sessions (reconnect, duplicate, drag to reorder) and zero-secret JSON profiles. Connecting happens in the background, so a slow or dead host never freezes the window.
 - **Saved-session search & favorites:** Filter the sidebar by session name, hostname/IP, serial device or protocol. Use the clear button to show every session again. Star profiles and enable **Favorites only** to narrow the list; favorites survive restart.
 - **VT100 / truecolor:** Full 24-bit color, ANSI styles, cursor addressing, and smooth scrollback (works with `htop`, `nano`, `vim`). Terminal emulation is [alacritty_terminal](https://crates.io/crates/alacritty_terminal), the engine inside the Alacritty terminal.
@@ -125,6 +131,7 @@ tar -xzf snekkie-linux-x86_64.tar.gz
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste (selecting also copies, right-click also pastes) |
 | Ctrl+F | Find in terminal output; Enter: older match, Shift+Enter: newer match, Escape: close |
+| Ctrl+Shift+S | Command snippets (source builds; next update) |
 | Shift+PgUp / Shift+PgDn | Scroll back through history |
 | Ctrl+Shift+L | Clear screen and scrollback |
 | Ctrl+Shift+B | Send break (serial and telnet) |
@@ -167,6 +174,7 @@ src/
 ├── main.rs            # Window setup; startup error reporting on Windows
 ├── config.rs          # Configuration locations and atomic file writes
 ├── profiles.rs        # Saved sessions (sessions.json)
+├── snippets.rs        # Command templates and JSON transfer (snippets.json)
 ├── settings.rs        # App preferences and color themes (settings.json)
 ├── update.rs          # Checking GitHub for a new release; downloading and running its installer
 ├── session.rs         # One tab: transport + emulator + log file

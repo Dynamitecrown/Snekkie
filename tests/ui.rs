@@ -29,8 +29,13 @@ fn harness(dir: &tempfile::TempDir) -> Harness<'static, SnekkieApp> {
 
 fn harness_sized(dir: &tempfile::TempDir, size: [f32; 2]) -> Harness<'static, SnekkieApp> {
     let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
-    let mut harness =
-        Harness::builder().with_size(size).build_eframe(move |_cc| SnekkieApp::with_port_lister(paths, two_cables));
+    let mut harness = Harness::builder().with_size(size).build_eframe(move |_cc| {
+        let mut app = SnekkieApp::with_port_lister(paths, two_cables);
+        // General UI tests use the network form; startup detection has its
+        // own coverage with zero, one and several detected ports.
+        app.set_form_kind(Kind::Ssh);
+        app
+    });
     harness.run_ok();
     harness
 }
@@ -46,6 +51,266 @@ fn starts_empty() {
     harness.get_by_label("Connect");
     harness.get_by_label_contains("No session open.");
     assert!(harness.state().tab_titles().is_empty());
+}
+
+#[test]
+fn startup_uses_serial_when_ports_are_detected_and_ssh_otherwise() {
+    fn one_cable() -> Vec<PortInfo> {
+        two_cables().into_iter().take(1).collect()
+    }
+    type PortLister = fn() -> Vec<PortInfo>;
+    let cases: [(PortLister, Kind, &str); 3] =
+        [(Vec::new, Kind::Ssh, ""), (one_cable, Kind::Serial, "COM3"), (two_cables, Kind::Serial, "")];
+    for (list_ports, expected, device) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = Harness::builder()
+            .with_size([1000.0, 640.0])
+            .build_eframe(move |_| SnekkieApp::with_port_lister(paths, list_ports));
+        app.run_ok();
+        assert_eq!(app.state_mut().sidebar_draft().kind(), expected);
+        assert_eq!(app.state_mut().sidebar_draft().device, device);
+        app.get_by_value(expected.label());
+        if expected == Kind::Serial {
+            app.get_by_label("Speed");
+            // Detecting hardware must not override a user's later choice.
+            app.state_mut().set_form_kind(Kind::Ssh);
+            app.run_ok();
+            app.get_by_value("SSH");
+        } else {
+            app.get_by_label("Username");
+        }
+        assert!(app.state().tab_titles().is_empty());
+        app.key_press_modifiers(egui::Modifiers { ctrl: true, shift: true, ..Default::default() }, egui::Key::N);
+        app.run_ok();
+        assert_eq!(app.state_mut().sidebar_draft().kind(), Kind::Ssh, "detection applies only at startup");
+    }
+}
+
+fn seed_snippet(dir: &tempfile::TempDir, name: &str, template: &str) -> u64 {
+    let mut store = snekkie::snippets::SnippetStore::open(dir.path().join("snippets.json"));
+    store
+        .put(snekkie::snippets::Snippet {
+            name: name.into(),
+            group: "Cisco IOS".into(),
+            template: template.into(),
+            ..Default::default()
+        })
+        .unwrap()
+}
+
+fn open_snippets(app: &mut Harness<'static, SnekkieApp>) {
+    app.key_press_modifiers(egui::Modifiers { ctrl: true, shift: true, ..Default::default() }, egui::Key::S);
+    app.run_ok();
+    app.get_by_label("Command snippets");
+}
+
+fn set_snippet_text(app: &mut Harness<'static, SnekkieApp>, label: &str, value: &str) {
+    let role =
+        if matches!(label, "Draft commands" | "Command template") { Role::MultilineTextInput } else { Role::TextInput };
+    app.get_by_role_and_label(role, label).scroll_to_me();
+    app.run_ok();
+    app.get_by_role_and_label(role, label).focus();
+    app.run_ok();
+    app.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    app.event(egui::Event::Text(value.into()));
+    app.run_ok();
+}
+
+#[test]
+fn snippets_review_insert_edit_and_cancel_send_nothing_and_values_never_persist() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_snippet(&dir, "Interface status", "show interface {{interface}}\nshow vlan {{vlan}}");
+    let original = std::fs::read(dir.path().join("snippets.json")).unwrap();
+    let mut app = harness(&dir);
+    let mut device = open_raw_tab(&mut app, "core");
+    app.get_by_label("Terminal output").click();
+    app.run_ok();
+    open_snippets(&mut app);
+    app.get_by_label("Interface status").click();
+    app.run_ok();
+    app.get_by_label("Use snippet").click();
+    app.run_ok();
+    app.get_by_label_contains("Destination: core");
+    app.get_by_label("Enter a value for: interface, vlan.");
+    assert!(app.get_by_label("Send commands").accesskit_node().is_disabled());
+    set_snippet_text(&mut app, "Variable: interface", "Gi0/1");
+    set_snippet_text(&mut app, "Variable: vlan", "20");
+    app.key_press(egui::Key::Enter);
+    app.run_ok();
+    assert_device_received_nothing(&mut device);
+    app.get_by_label("Insert into draft").click();
+    app.run_ok();
+    assert_eq!(
+        app.get_by_role_and_label(Role::MultilineTextInput, "Draft commands").value().as_deref(),
+        Some("show interface Gi0/1\nshow vlan 20")
+    );
+    set_snippet_text(&mut app, "Draft commands", "show version\nshow inventory");
+    app.key_press(egui::Key::Enter);
+    app.run_ok();
+    assert_device_received_nothing(&mut device);
+    app.get_by_label("Cancel").click();
+    app.run_ok();
+    assert_device_received_nothing(&mut device);
+    assert_eq!(std::fs::read(dir.path().join("snippets.json")).unwrap(), original);
+}
+
+#[test]
+fn snippets_send_reviewed_commands_once_with_paste_line_endings() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    seed_snippet(&dir, "Version", "show version\r\nshow inventory\n");
+    let mut app = harness(&dir);
+    let mut device = open_raw_tab(&mut app, "core");
+    open_snippets(&mut app);
+    app.get_by_label("Version").click();
+    app.run_ok();
+    app.get_by_label("Use snippet").click();
+    app.run_ok();
+    app.get_by_label("Send commands").click();
+    app.run_ok();
+    wait_for_paste(&mut app);
+    device.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    let expected = b"show version\rshow inventory\r";
+    let mut bytes = vec![0; expected.len()];
+    device.read_exact(&mut bytes).unwrap();
+    assert_eq!(bytes, expected);
+    assert_device_received_nothing(&mut device);
+    assert!(app.query_by_label("Review commands").is_none());
+    open_snippets(&mut app);
+    app.get_by_label("Version").click();
+    app.run_ok();
+    app.get_by_label("Use snippet").click();
+    app.run_ok();
+    app.get_by_label("Insert into draft").click();
+    app.run_ok();
+    set_snippet_text(&mut app, "Draft commands", "show clock");
+    app.get_by_label("Send commands").click();
+    app.run_ok();
+    let mut bytes = [0; 11];
+    device.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"show clock\r");
+    assert_device_received_nothing(&mut device);
+}
+
+#[test]
+fn snippets_library_edits_preserve_identity_and_unrelated_templates_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = seed_snippet(&dir, "Version", "show version");
+    let second = seed_snippet(&dir, "Clock", "show clock");
+    let mut app = harness(&dir);
+    open_snippets(&mut app);
+    app.get_by_label("Version").click();
+    app.run_ok();
+    app.get_by_label("Edit snippet").click();
+    app.run_ok();
+    set_snippet_text(&mut app, "Snippet name", "Platform");
+    set_snippet_text(&mut app, "Group (optional)", "Juniper");
+    set_snippet_text(&mut app, "Command template", "show chassis hardware");
+    app.get_by_label("Save snippet").click();
+    app.run_ok();
+    app.get_by_label("New").click();
+    app.run_ok();
+    set_snippet_text(&mut app, "Snippet name", "Canceled");
+    set_snippet_text(&mut app, "Command template", "show clock");
+    app.get_by_label("Cancel").click();
+    app.run_ok();
+    app.get_by_label("Delete snippet").click();
+    app.run_ok();
+    app.key_press(egui::Key::Escape);
+    app.run_ok();
+    app.get_by_label("Platform");
+    app.get_by_label("Close").click();
+    app.run_ok();
+    drop(app);
+    let store = snekkie::snippets::SnippetStore::open(dir.path().join("snippets.json"));
+    assert!(store.error.is_none());
+    assert_eq!(store.snippets.len(), 2);
+    assert_eq!(store.get(first).unwrap().name, "Platform");
+    assert_eq!(store.get(first).unwrap().group, "Juniper");
+    assert_eq!(store.get(second).unwrap().template, "show clock");
+    let mut app = harness(&dir);
+    open_snippets(&mut app);
+    app.get_by_label("Platform").click();
+    app.run_ok();
+    app.get_by_label("Delete snippet").click();
+    app.run_ok();
+    app.get_by_label("Yes").click();
+    app.run_ok();
+    let store = snekkie::snippets::SnippetStore::open(dir.path().join("snippets.json"));
+    assert!(store.get(first).is_none());
+    assert_eq!(store.get(second).unwrap().template, "show clock");
+}
+
+#[test]
+fn snippets_import_previews_selection_and_preserves_existing_templates_without_sending() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = seed_snippet(&dir, "Version", "show version");
+    let mut app = harness(&dir);
+    let mut device = open_raw_tab(&mut app, "core");
+    open_snippets(&mut app);
+    app.state_mut().preview_snippet_import(br#"{"version":1,"snippets":[{"name":"Version","group":"Cisco IOS","template":"show {{command}}"},{"name":"Clock","template":"show clock"},{"name":"Invalid"}]}"#).unwrap();
+    app.run_ok();
+    app.get_by_label_contains("Skipped entry 3");
+    app.get_by_label("General / Clock").click();
+    app.run_ok();
+    app.get_by_label("Import selected").click();
+    app.run_ok();
+    assert_device_received_nothing(&mut device);
+    let store = snekkie::snippets::SnippetStore::open(dir.path().join("snippets.json"));
+    assert_eq!(store.snippets.len(), 2);
+    assert_eq!(store.get(id).unwrap().template, "show version");
+    assert_eq!(store.snippets[1].name, "Version (Imported 1)");
+    app.get_by_label("Export…").click();
+    app.run_ok();
+    app.get_by_label("Select none").click();
+    app.run_ok();
+    assert!(app.get_by_label("Export selected…").accesskit_node().is_disabled());
+    app.get_by_label("Cancel").click();
+    app.run_ok();
+    app.key_press(egui::Key::Escape);
+    app.run_ok();
+    assert_device_received_nothing(&mut device);
+}
+
+#[test]
+fn snippets_controls_fit_minimum_window_and_closed_destinations_disable_send() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_snippet(&dir, "Version", "show version");
+    let mut app = harness_sized(&dir, [520.0, 320.0]);
+    let device = open_raw_tab(&mut app, "core");
+    open_snippets(&mut app);
+    for label in ["New", "Edit snippet", "Delete snippet", "Use snippet", "Import…", "Export…", "Close"] {
+        let rect = app.get_by_label(label).rect();
+        assert!(
+            rect.min.x >= 0.0 && rect.min.y >= 0.0 && rect.max.x <= 520.0 && rect.max.y <= 320.0,
+            "{label}: {rect:?}"
+        );
+    }
+    app.get_by_label("Version").click();
+    app.run_ok();
+    app.get_by_label("Use snippet").click();
+    app.run_ok();
+    for label in ["Insert into draft", "Send commands", "Back", "Cancel"] {
+        let rect = app.get_by_label(label).rect();
+        assert!(
+            rect.min.x >= 0.0 && rect.min.y >= 0.0 && rect.max.x <= 520.0 && rect.max.y <= 320.0,
+            "{label}: {rect:?}"
+        );
+    }
+    drop(device);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !app.get_by_label("Send commands").accesskit_node().is_disabled() {
+        assert!(std::time::Instant::now() < deadline);
+        app.run_ok();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.get_by_label_contains("Connection changed or closed");
+    app.key_press(egui::Key::Enter);
+    app.run_ok();
+    assert!(app.get_by_label("Send commands").accesskit_node().is_disabled());
+    app.get_by_label("Cancel").click();
+    app.run_ok();
 }
 
 #[test]
@@ -612,6 +877,148 @@ fn assert_device_received_nothing(device: &mut std::net::TcpStream) {
     }
 }
 
+fn wait_for_paste(app: &mut Harness<'static, SnekkieApp>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.state().paste_running() {
+        assert!(std::time::Instant::now() < deadline);
+        app.run_ok();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.run_ok();
+}
+
+#[test]
+fn multiline_paste_reviews_edits_and_cancels_without_sending_or_retargeting() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    let mut original = open_raw_tab(&mut app, "Original");
+    app.get_by_label("Terminal output").focus();
+    app.run_ok();
+    app.event(egui::Event::Paste("one\r\ntwo\r\r".into()));
+    app.event(egui::Event::Text("must stay local".into()));
+    app.run_ok();
+    app.get_by_label("Review paste");
+    assert_device_received_nothing(&mut original);
+    app.get_by_role_and_label(Role::MultilineTextInput, "Paste text").focus();
+    app.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    app.event(egui::Event::Text("edited\n\nlast".into()));
+    app.run_ok();
+    app.get_by_label("Cancel").click();
+    app.run_ok();
+    assert_device_received_nothing(&mut original);
+    let ctx = app.ctx.clone();
+    app.state_mut().paste_clipboard_text(&ctx, "edited\n\nlast");
+    let mut other = open_raw_tab(&mut app, "Other");
+    app.get_by_label("Send paste").click();
+    app.run_ok();
+    wait_for_paste(&mut app);
+    original.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    let mut bytes = [0; 12];
+    original.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"edited\r\rlast");
+    assert_device_received_nothing(&mut other);
+}
+
+#[test]
+fn paced_paste_stop_discards_remaining_lines_and_preview_fits_small_window() {
+    use snekkie::settings::{AppSettings, SettingsStore};
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    SettingsStore::new(dir.path().join("settings.json"))
+        .save(&AppSettings { paste_delay_ms: 5000, ..Default::default() })
+        .unwrap();
+    let mut app = harness_sized(&dir, [520.0, 320.0]);
+    let mut device = open_raw_tab(&mut app, "Lab");
+    let ctx = app.ctx.clone();
+    app.state_mut().paste_clipboard_text(&ctx, "first\nsecond\nthird\n");
+    app.run_ok();
+    for label in ["Send paste", "Cancel"] {
+        let rect = app.get_by_label(label).rect();
+        assert!(rect.bottom() < 320.0 && rect.left() >= 0.0 && rect.right() <= 520.0, "{label}: {rect:?}");
+    }
+    app.get_by_label("Send paste").click();
+    app.run_ok();
+    device.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    let mut bytes = [0; 6];
+    device.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"first\r");
+    app.event(egui::Event::Text("must not interleave".into()));
+    app.run_ok();
+    app.get_by_label("Stop paste").click();
+    app.run_ok();
+    assert!(!app.state().paste_running());
+    assert_device_received_nothing(&mut device);
+    app.get_by_label("Terminal output").click();
+    app.run_ok();
+    app.event(egui::Event::Paste("single line".into()));
+    app.run_ok();
+    let mut bytes = [0; 11];
+    device.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"single line");
+    app.state_mut().paste_clipboard_text(&ctx, "stale\ncommands");
+    app.run_ok();
+    device.shutdown(std::net::Shutdown::Both).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !app.state().tab_titles().iter().any(|title| title.ends_with("(closed)")) {
+        assert!(std::time::Instant::now() < deadline);
+        app.run_ok();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.run_ok();
+    assert!(app.get_by_label("Send paste").accesskit_node().is_disabled());
+    assert!(app.get_by_label("Cancel").rect().bottom() < 320.0);
+    app.get_by_label("Cancel").click();
+    app.run_ok();
+}
+
+#[test]
+fn opening_find_keeps_text_in_the_same_frame_off_the_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    let mut device = open_raw_tab(&mut app, "fast find");
+    device_prints(&mut app, &mut device, "needle\r\nready");
+    app.get_by_label("Terminal output").focus();
+    app.run_ok();
+    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+    app.event(egui::Event::Text("needle".into()));
+    app.run_ok();
+    assert_device_received_nothing(&mut device);
+    assert_eq!(app.get_by_label("Find in terminal").value().as_deref(), Some("needle"));
+    wait_for_search(&mut app, "1 of 1");
+}
+
+#[test]
+fn find_keeps_a_current_result_after_the_terminal_reflows() {
+    let dir = tempfile::tempdir().unwrap();
+    snekkie::settings::SettingsStore::new(dir.path().join("settings.json"))
+        .save(&snekkie::settings::AppSettings {
+            theme: "CRT Super".into(),
+            check_for_updates: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut app = harness_sized(&dir, [520.0, 320.0]);
+    let mut device = open_raw_tab(&mut app, "reflow");
+    device_prints(&mut app, &mut device, "R1#show ip interface brief\r\nGi0/0 192.0.2.1 up up\r\nR1#");
+    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+    app.run_ok();
+    app.run_ok();
+    app.event(egui::Event::Text("192.0.2.1".into()));
+    wait_for_search(&mut app, "1 of 1");
+    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::B);
+    for _ in 0..5 {
+        app.run_ok();
+    }
+    assert_eq!(app.state().active_search_status().as_deref(), Some("1 of 1"));
+    app.set_size(egui::vec2(1000.0, 640.0));
+    for _ in 0..5 {
+        app.run_ok();
+    }
+    assert_eq!(app.state().active_search_status().as_deref(), Some("1 of 1"));
+    assert_device_received_nothing(&mut device);
+}
+
 #[test]
 fn find_bar_steps_through_history_without_sending_anything_and_escape_restores_typing() {
     use std::io::Read;
@@ -970,6 +1377,66 @@ fn terminal_context_menu_keeps_navigation_and_escape_off_the_wire_and_restores_t
     let mut byte = [0];
     device.read_exact(&mut byte).unwrap();
     assert_eq!(&byte, b"x");
+}
+
+#[test]
+fn right_click_preference_defaults_to_paste_cancel_discards_and_menu_mode_persists() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    let mut peer = open_raw_tab(&mut app, "router");
+    let label = "Right-click pastes (PuTTY style)";
+    open_preferences(&mut app);
+    app.get_by_role_and_label(Role::CheckBox, label).scroll_to_me();
+    app.run_ok();
+    assert_eq!(app.get_by_role_and_label(Role::CheckBox, label).accesskit_node().toggled(), Some(Toggled::True));
+    app.get_by_role_and_label(Role::CheckBox, label).click();
+    app.run_ok();
+    app.get_by_label("Cancel").click();
+    app.run_ok();
+    open_preferences(&mut app);
+    app.get_by_role_and_label(Role::CheckBox, label).scroll_to_me();
+    app.run_ok();
+    assert_eq!(app.get_by_role_and_label(Role::CheckBox, label).accesskit_node().toggled(), Some(Toggled::True));
+    app.get_by_role_and_label(Role::CheckBox, label).click();
+    app.run_ok();
+    app.get_by_label("OK").click();
+    app.run_ok();
+    assert_eq!(saved_settings(&dir).unwrap()["right_click_paste"], false);
+    app.get_by_label("Filter saved sessions").click();
+    app.run_ok();
+    app.get_by_label("Terminal output").click_secondary();
+    app.run_ok();
+    app.get_by_label("Copy all");
+    assert_device_received_nothing(&mut peer);
+    app.key_press(egui::Key::ArrowDown);
+    app.key_press(egui::Key::Escape);
+    app.run_ok();
+    assert_device_received_nothing(&mut peer);
+    app.event(egui::Event::Text("x".into()));
+    app.run_ok();
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    let mut byte = [0];
+    peer.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"x");
+    drop(app);
+    let mut app = harness(&dir);
+    let mut peer = open_raw_tab(&mut app, "restarted");
+    app.get_by_label("Terminal output").click_secondary();
+    app.run_ok();
+    app.get_by_label("Copy all");
+    assert_device_received_nothing(&mut peer);
+    app.key_press(egui::Key::Escape);
+    app.run_ok();
+    open_preferences(&mut app);
+    app.get_by_role_and_label(Role::CheckBox, label).scroll_to_me();
+    app.run_ok();
+    assert_eq!(app.get_by_role_and_label(Role::CheckBox, label).accesskit_node().toggled(), Some(Toggled::False));
+    app.get_by_role_and_label(Role::CheckBox, label).click();
+    app.run_ok();
+    app.get_by_label("OK").click();
+    app.run_ok();
+    assert_eq!(saved_settings(&dir).unwrap()["right_click_paste"], true);
 }
 
 #[test]
@@ -1882,7 +2349,9 @@ fn automatic_paging_defaults_off_and_both_toggles_save_the_same_setting() {
     open_preferences(&mut harness);
     let checkbox = harness.get_by_role_and_label(Role::CheckBox, "Automatically page through show commands");
     assert_eq!(checkbox.accesskit_node().toggled(), Some(Toggled::True));
-    checkbox.click();
+    checkbox.scroll_to_me();
+    harness.run_ok();
+    harness.get_by_role_and_label(Role::CheckBox, "Automatically page through show commands").click();
     harness.run_ok();
     harness.get_by_label("OK").click();
     harness.run_ok();

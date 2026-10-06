@@ -104,6 +104,8 @@ fn draw(ui: &mut Ui, view: &mut TerminalView, emulator: &Mutex<Emulator>, theme:
         regular: font.clone(),
         bold: font,
         keyboard: false,
+        mouse_input: false,
+        right_click_paste: true,
         animations,
     };
     egui::Frame::new().stroke(Stroke::new(1.0, style::border(ui))).show(ui, |ui| {

@@ -119,7 +119,7 @@ impl SearchBar {
     /// query.
     pub fn open(&mut self, prefill: Option<String>) {
         if let Some(text) = prefill {
-            self.query = if self.regex { regex::escape(&text) } else { text };
+            self.query = if self.regex { Pattern::literal_source(&text) } else { text };
         }
         if !self.open {
             self.restart = true;
@@ -202,6 +202,8 @@ impl SearchBar {
             self.restart = true;
         }
 
+        self.follow_current(emulator, &pattern);
+
         if std::mem::take(&mut self.restart) {
             let emu = emulator.lock();
             // Up from the bottom of what's on screen, taking a match right
@@ -214,8 +216,6 @@ impl SearchBar {
             self.tally = None;
             self.not_found = None;
         }
-
-        self.follow_current(emulator, &pattern);
 
         let mut slices = 0;
         while slices < SLICES_PER_FRAME
@@ -288,8 +288,8 @@ impl SearchBar {
         })
     }
 
-    /// Output arrived: find the current match where its row went, and drop
-    /// it if its text isn't there any more.
+    /// Output arrived: find the current match where its row went. Reflow or
+    /// replaced text can invalidate its cells; pick a result again then.
     fn follow_current(&mut self, emulator: &Mutex<Emulator>, pattern: &Pattern) {
         let Some(current) = self.current else { return };
         let emu = emulator.lock();
@@ -303,7 +303,10 @@ impl SearchBar {
         });
         match found.filter(|&f| still_matches(&emu, pattern, f)) {
             Some(found) => self.current = Some(Current { found, revision: emu.revision(), ..current }),
-            None => self.current = None,
+            None => {
+                self.current = None;
+                self.restart = true;
+            }
         }
     }
 
@@ -565,4 +568,21 @@ pub fn colors(theme: &Theme) -> (Color32, Color32, Color32) {
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let channel = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgb(channel(a.r(), b.r()), channel(a.g(), b.g()), channel(a.b(), b.b()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_text_prefill_escapes_metacharacters_and_tab_gaps_in_regex_mode() {
+        let mut emu = Emulator::new(20, 3, 10, std::sync::Arc::new(|_| {}));
+        emu.feed(b"a+\tb");
+        let emulator = Mutex::new(emu);
+        let mut search = SearchBar { regex: true, ..Default::default() };
+        search.open(Some("a+\tb".into()));
+        search.work(&egui::Context::default(), &emulator, 3);
+        assert_eq!(search.status(), "1 of 1");
+        assert!(search.current().is_some());
+    }
 }
