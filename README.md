@@ -38,7 +38,7 @@ Linux serial access may require membership in `dialout`. On Windows, install you
 
 ## Build and test
 
-Install [Rust stable](https://rustup.rs) and, on Linux, `pkg-config` and libudev development headers. Then:
+Install [Rust stable](https://rustup.rs), then:
 
 ```bash
 cargo run --release
