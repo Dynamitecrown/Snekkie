@@ -93,6 +93,11 @@ production **Update now** button through the UI test harness. The checks refuse
 to run on local or self-hosted machines. Installation logs are retained as the
 `master-installation-logs` workflow artifact.
 
+After publication, run the workflow manually with `verify_published` selected
+and `sign` left off. It downloads the public master and checksum, then runs the
+same installation and Update-button checks against those published bytes.
+Manual verification does not publish or replace the master release.
+
 For a live download check without installing anything:
 
 ```powershell

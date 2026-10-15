@@ -58,10 +58,12 @@ $logDirectory = Join-Path $testRoot 'logs'
 $freshInstall = Join-Path $testRoot 'Fresh install with spaces'
 $upgradeInstall = Join-Path $testRoot 'Older install with spaces'
 $conflictingInstall = Join-Path $testRoot 'Must not install here'
+$cancelledInstall = Join-Path $testRoot 'Cancelled install with spaces'
+$cancellationFixture = Join-Path $testRoot 'native-cancellation-fixture'
 $settingsPath = Join-Path $dataDirectory 'settings.json'
 $networkPath = Join-Path $dataDirectory 'network.ini'
 $sessionPath = Join-Path $dataDirectory 'sessions.json'
-$script:ownedInstallDirectories = @($freshInstall, $upgradeInstall, $conflictingInstall)
+$script:ownedInstallDirectories = @($freshInstall, $upgradeInstall, $conflictingInstall, $cancelledInstall)
 $mutex = $null
 $handler = $null
 $client = $null
@@ -210,6 +212,34 @@ try {
     $client.DefaultRequestHeaders.UserAgent.ParseAdd('Snekkie-Windows-Installation-Tests/1.0')
     $client.DefaultRequestHeaders.Accept.ParseAdd('application/vnd.github+json')
     $shell = New-Object -ComObject WScript.Shell
+
+    # Build the exact native wrapper around a harmless exit-only PowerShell
+    # payload. This checks cancellation propagation through real nsExec and
+    # PowerShell processes without downloading or installing any app files.
+    $fixtureInstaller = Join-Path $cancellationFixture 'installer'
+    $fixtureAssets = Join-Path $cancellationFixture 'assets'
+    $null = [IO.Directory]::CreateDirectory($fixtureInstaller)
+    $null = [IO.Directory]::CreateDirectory($fixtureAssets)
+    Copy-Item -LiteralPath "$PSScriptRoot/../installer/master.nsi" -Destination (Join-Path $fixtureInstaller 'master.nsi')
+    Copy-Item -LiteralPath "$PSScriptRoot/../installer/welcome.bmp" -Destination (Join-Path $fixtureInstaller 'welcome.bmp')
+    Copy-Item -LiteralPath "$PSScriptRoot/../assets/icon.ico" -Destination (Join-Path $fixtureAssets 'icon.ico')
+    [IO.File]::WriteAllText((Join-Path $fixtureInstaller 'master-installer.ps1'), "exit 1`r`n")
+    $masterVersion = (Get-Content -LiteralPath "$PSScriptRoot/../installer/master-version.txt" -Raw).Trim()
+    if ($masterVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        throw 'Invalid master installer version for cancellation fixture.'
+    }
+    $compiler = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+    if (-not $compiler) { $compiler = "${env:ProgramFiles(x86)}/NSIS/makensis.exe" }
+    if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw 'NSIS is required to test native wrapper cancellation.' }
+    $fixtureExe = Join-Path $cancellationFixture 'cancelled-master.exe'
+    & $compiler '/V2' "/DVERSION=$masterVersion" "/DOUTFILE=$fixtureExe" (Join-Path $fixtureInstaller 'master.nsi')
+    Assert-Installation ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $fixtureExe -PathType Leaf)) 'Built the production native wrapper with a cancellation-only payload'
+    $process = Start-TestInstaller $fixtureExe "/S /D=$cancelledInstall" 'Native master cancellation'
+    Complete-TestInstaller $process 'Native master cancellation' 1
+    foreach ($path in @($registryPaths) + @($cancelledInstall, $defaultInstall,
+            $dataDirectory, $startShortcut, $desktopShortcut)) {
+        Assert-Installation (-not (Test-Path -LiteralPath $path)) "Cancellation left no installation or user state: $path"
+    }
 
     $latest = Get-SnekkieLatestAsset $client
     Assert-Installation ([version] $latest.Version -gt [version] '2.5.0') 'Latest stable app is newer than the upgrade fixture'
@@ -362,6 +392,7 @@ try {
     # All of these were absent in the clean-profile preflight. Resolve absolute
     # targets and reject junctions before any recursive removal.
     foreach ($path in @($dataDirectory, $freshInstall, $upgradeInstall, $conflictingInstall,
+            $cancelledInstall, $cancellationFixture,
             (Join-Path $testRoot 'latest-download'), (Join-Path $testRoot 'old-download'))) {
         try {
             if (Test-Path -LiteralPath $path) {

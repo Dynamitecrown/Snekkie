@@ -34,6 +34,10 @@ on:
         description: Sign the master installer with the free SignPath OSS service.
         type: boolean
         default: false
+      verify_published:
+        description: Test the already published master download instead of the new build.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -57,6 +61,7 @@ jobs:
         env:
           SIGNPATH_ENABLED: ${{ vars.SIGNPATH_ENABLED }}
           REQUEST_SIGNING: ${{ inputs.sign }}
+          VERIFY_PUBLISHED: ${{ inputs.verify_published }}
         run: |
           $version = (Get-Content installer/master-version.txt -Raw).Trim()
           if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
@@ -67,6 +72,9 @@ jobs:
             throw 'Installer tag must match installer/master-version.txt.'
           }
           $requested = $env:REQUEST_SIGNING -eq 'true'
+          if ($requested -and $env:VERIFY_PUBLISHED -eq 'true') {
+            throw 'Published-download verification cannot also request a new signing operation.'
+          }
           if ($requested -and $env:SIGNPATH_ENABLED -ne 'true') {
             throw 'Configure free SignPath signing first. See docs/code-signing.md.'
           }
@@ -119,6 +127,25 @@ jobs:
         run: |
           ./scripts/verify-signatures.ps1 -Path master-signed/Snekkie-Setup.exe
           Copy-Item -LiteralPath master-signed/Snekkie-Setup.exe -Destination dist/Snekkie-Setup.exe -Force
+
+      - name: Use the published download for verification
+        if: github.event_name == 'workflow_dispatch' && inputs.verify_published
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MASTER_VERSION: ${{ steps.settings.outputs.version }}
+        run: |
+          gh release download "installer-v$env:MASTER_VERSION" --repo $env:GITHUB_REPOSITORY `
+            --pattern Snekkie-Setup.exe --pattern SHA256SUMS --dir published-master
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the published master and checksum.' }
+          $sums = Get-Content published-master/SHA256SUMS -Raw
+          if ($sums -cnotmatch '\A([0-9a-f]{64})  Snekkie-Setup\.exe\r?\n?\z') {
+            throw 'The published master checksum has an unexpected format.'
+          }
+          $expected = $Matches[1]
+          $actual = (Get-FileHash published-master/Snekkie-Setup.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -cne $expected) { throw 'Published master checksum mismatch.' }
+          Copy-Item published-master/Snekkie-Setup.exe dist/Snekkie-Setup.exe -Force
 
       - name: Hash the final master installer
         shell: pwsh
