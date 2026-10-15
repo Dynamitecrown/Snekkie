@@ -23,7 +23,11 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/snekkie-macos-smoke.XXXXXXXX")
 mount=$work/mount
 pid=
 cleanup() {
-    [[ -n $pid ]] && kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null
+    # wait reports the stopped app's SIGTERM status; that is not a failure.
+    if [[ -n $pid ]]; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
     hdiutil detach "$mount" -quiet -force 2>/dev/null || true
     rm -rf -- "$work"
 }

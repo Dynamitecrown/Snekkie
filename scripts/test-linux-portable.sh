@@ -17,8 +17,9 @@ done
 mkdir -p "$logs"
 logs=$(realpath "$logs")
 test -s "$artifact"
-mkdir -p "$repo/target"
-work=$(mktemp -d "$repo/target/portable-smoke.XXXXXXXX")
+# Keep the scratch HOME and XDG_RUNTIME_DIR short: Flatpak's session helper
+# puts sockets there, and a deep checkout path exceeds the 108-byte limit.
+work=$(mktemp -d "${TMPDIR:-/tmp}/snekkie-smoke.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 # Fresh HOME/settings keeps startup update checks offline and prevents touching
 # any real SSH keys or user settings. Flatpak's scoped SSH permission sees only
