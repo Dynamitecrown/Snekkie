@@ -105,7 +105,8 @@ USB serial adapters appear as `/dev/ttyUSB0` or `/dev/ttyACM0` on Linux and as
 sudo usermod -aG dialout "$USER"
 ```
 
-The Flatpak can open serial devices too; the group membership still applies.
+The Flatpak can open serial devices too; the group membership still applies. Virtual
+serial ports (pseudo-terminals, such as those `socat` creates) work on both systems.
 
 ## Settings and updates
 
