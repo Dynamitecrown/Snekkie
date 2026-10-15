@@ -127,11 +127,11 @@ if [[ $mode == inside ]]; then
     elif command -v dnf >/dev/null; then
         family=rpm
         dnf install -y -q sudo findutils util-linux diffutils >/dev/null
-        package_version() { rpm -q snekkie >/dev/null 2>&1 && rpm -q --queryformat '%{VERSION}-%{RELEASE}' snekkie || true; }
+        package_version() { if rpm -q snekkie >/dev/null 2>&1; then rpm -q --queryformat '%{VERSION}-%{RELEASE}' snekkie; fi; }
     elif command -v zypper >/dev/null; then
         family=rpm
         zypper --non-interactive --quiet install sudo findutils gawk util-linux diffutils >/dev/null
-        package_version() { rpm -q snekkie >/dev/null 2>&1 && rpm -q --queryformat '%{VERSION}-%{RELEASE}' snekkie || true; }
+        package_version() { if rpm -q snekkie >/dev/null 2>&1; then rpm -q --queryformat '%{VERSION}-%{RELEASE}' snekkie; fi; }
     else
         fail 'unsupported container image'
     fi
@@ -160,7 +160,7 @@ if [[ $mode == inside ]]; then
     chown -R tester:tester "$home"
     (cd "$home/.config/snekkie" && sha256sum ./*) >/tmp/config-before
     config_kept() { (cd "$home/.config/snekkie" && sha256sum --check --quiet /tmp/config-before) || fail 'settings changed'; }
-    # shellcheck disable=SC2329 # invoked through run_installer "$@"
+    # shellcheck disable=SC2317,SC2329 # invoked through run_installer "$@"
     as_tester() {
         runuser -u tester -- env -i HOME="$home" USER=tester LANG=C.UTF-8 \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$@"
