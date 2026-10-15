@@ -1,0 +1,58 @@
+name: Sign with SignPath Foundation
+description: Submit a GitHub artifact to the free OSS signing service and retrieve the signed files.
+inputs:
+  api-token:
+    description: SignPath submitter API token.
+    required: true
+  organization-id:
+    description: SignPath organization ID.
+    required: true
+  project-slug:
+    description: SignPath project slug.
+    required: true
+  signing-policy-slug:
+    description: SignPath production signing policy slug.
+    required: true
+  artifact-configuration-slug:
+    description: Artifact configuration checked into this repository.
+    required: true
+  artifact-id:
+    description: ID returned by actions/upload-artifact in the calling job.
+    required: true
+  version:
+    description: Cargo package version to enforce in PE metadata.
+    required: true
+  output-directory:
+    description: Directory into which SignPath extracts the signed artifact.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Check SignPath configuration
+      shell: pwsh
+      env:
+        SIGNPATH_API_TOKEN: ${{ inputs.api-token }}
+        SIGNPATH_ORGANIZATION_ID: ${{ inputs.organization-id }}
+        SIGNPATH_PROJECT_SLUG: ${{ inputs.project-slug }}
+        SIGNPATH_SIGNING_POLICY_SLUG: ${{ inputs.signing-policy-slug }}
+      run: |
+        foreach ($name in @('SIGNPATH_API_TOKEN', 'SIGNPATH_ORGANIZATION_ID', 'SIGNPATH_PROJECT_SLUG', 'SIGNPATH_SIGNING_POLICY_SLUG')) {
+          if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+            throw "Missing $name. See docs/code-signing.md. Signed builds cannot fall back to unsigned files."
+          }
+        }
+
+    - name: Request signing and wait for approval
+      uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+      with:
+        api-token: ${{ inputs.api-token }}
+        organization-id: ${{ inputs.organization-id }}
+        project-slug: ${{ inputs.project-slug }}
+        signing-policy-slug: ${{ inputs.signing-policy-slug }}
+        artifact-configuration-slug: ${{ inputs.artifact-configuration-slug }}
+        github-artifact-id: ${{ inputs.artifact-id }}
+        wait-for-completion: true
+        wait-for-completion-timeout-in-seconds: 7200
+        output-artifact-directory: ${{ inputs.output-directory }}
+        parameters: |
+          version: ${{ toJSON(inputs.version) }}

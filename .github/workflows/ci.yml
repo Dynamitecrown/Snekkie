@@ -6,6 +6,14 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      sign:
+        description: Sign this manual build with SignPath (requires enrollment and SIGNPATH_ENABLED).
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,6 +57,7 @@ jobs:
 
     outputs:
       version: ${{ steps.version.outputs.version }}
+      signing: ${{ steps.signing.outputs.enabled }}
 
     steps:
       - uses: actions/checkout@v7
@@ -73,6 +82,27 @@ jobs:
           }
           "version=$version" >> $env:GITHUB_OUTPUT
 
+      - name: Select signing mode
+        id: signing
+        shell: pwsh
+        env:
+          SIGNPATH_ENABLED: ${{ vars.SIGNPATH_ENABLED }}
+          REQUEST_SIGNING: ${{ inputs.sign }}
+        run: |
+          $isTag = $env:GITHUB_REF -like 'refs/tags/v*'
+          $requested = $env:REQUEST_SIGNING -eq 'true'
+          if ($requested -and $env:SIGNPATH_ENABLED -ne 'true') {
+            throw 'Enroll with SignPath and set SIGNPATH_ENABLED=true first. See docs/code-signing.md.'
+          }
+          $enabled = $env:SIGNPATH_ENABLED -eq 'true' -and ($isTag -or $requested)
+          if ($enabled -and -not ($isTag -or $env:GITHUB_REF -eq 'refs/heads/main')) {
+            throw 'Signed manual builds must run from main; signed releases must use a v* tag.'
+          }
+          "enabled=$($enabled.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if (-not $enabled) {
+            Write-Host 'Building unsigned Windows artifacts. See docs/code-signing.md to enable free SignPath signing.'
+          }
+
       - name: Build
         run: cargo build --release
 
@@ -81,7 +111,7 @@ jobs:
           name: snekkie-windows-exe
           path: target/release/snekkie.exe
 
-  installer:
+  prepare-windows:
     # Linux's NSIS package can build a 64-bit installer (the official Windows
     # one can't), and it's the build the installer was tested with.
     needs: build-windows
@@ -98,19 +128,173 @@ jobs:
       - name: Install NSIS
         run: sudo apt-get update && sudo apt-get install -y nsis
 
-      - name: Build the installer
+      - name: Export the uninstaller and stage the app
+        env:
+          VERSION: ${{ needs.build-windows.outputs.version }}
+        run: |
+          mkdir -p dist payload
+          makensis -V2 -DVERSION="$VERSION" -DEXE=../exe/snekkie.exe \
+            -DEXPORT_UNINSTALLER=../payload/uninstall.exe \
+            -DOUTFILE=../dist/export-only.exe installer/snekkie.nsi
+          cp exe/snekkie.exe payload/snekkie.exe
+          test -s payload/uninstall.exe
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-payload-unsigned
+          path: payload/*.exe
+          if-no-files-found: error
+
+  sign-payload:
+    needs: [build-windows, prepare-windows]
+    runs-on: windows-latest
+    timeout-minutes: 150
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-payload-unsigned
+          path: payload-unsigned
+
+      # Re-upload in this job so SignPath can verify the request's provenance.
+      - uses: actions/upload-artifact@v7
+        if: needs.build-windows.outputs.signing == 'true'
+        id: unsigned-payload
+        with:
+          name: signpath-payload-input
+          path: payload-unsigned/*.exe
+          if-no-files-found: error
+
+      - name: Sign app and uninstaller
+        if: needs.build-windows.outputs.signing == 'true'
+        uses: ./.github/actions/signpath
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: windows-payload-v1
+          artifact-id: ${{ steps.unsigned-payload.outputs.artifact-id }}
+          version: ${{ needs.build-windows.outputs.version }}
+          output-directory: payload
+
+      - name: Stage unsigned payload for a build without signing
+        if: needs.build-windows.outputs.signing != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path payload | Out-Null
+          Copy-Item payload-unsigned/*.exe payload/
+
+      - name: Verify payload signatures and timestamps
+        if: needs.build-windows.outputs.signing == 'true'
+        shell: pwsh
+        run: ./scripts/verify-signatures.ps1 -Path @('payload/snekkie.exe', 'payload/uninstall.exe')
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-payload
+          path: payload/*.exe
+          if-no-files-found: error
+
+  installer:
+    # Keep the existing Linux NSIS build and its 64-bit installer stubs.
+    needs: [build-windows, sign-payload]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-payload
+          path: payload
+
+      - name: Install NSIS
+        run: sudo apt-get update && sudo apt-get install -y nsis
+
+      - name: Package the verified payload
         env:
           VERSION: ${{ needs.build-windows.outputs.version }}
         run: |
           mkdir -p dist
-          makensis -V2 -DVERSION="$VERSION" -DEXE=../exe/snekkie.exe installer/snekkie.nsi
-          # The bare exe too, for anyone who'd rather not install.
-          cp exe/snekkie.exe "dist/snekkie-$VERSION-portable.exe"
+          makensis -V2 -DVERSION="$VERSION" -DEXE=../payload/snekkie.exe \
+            -DSIGNED_UNINSTALLER=../payload/uninstall.exe installer/snekkie.nsi
+          cp payload/snekkie.exe "dist/snekkie-$VERSION-portable.exe"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-packaged
+          path: dist/*.exe
+          if-no-files-found: error
+
+  sign-windows:
+    needs: [build-windows, sign-payload, installer]
+    runs-on: windows-latest
+    timeout-minutes: 150
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-packaged
+          path: dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-payload
+          path: payload
+
+      - uses: actions/upload-artifact@v7
+        if: needs.build-windows.outputs.signing == 'true'
+        id: unsigned-installer
+        with:
+          name: signpath-installer-input
+          path: dist/Snekkie-Setup-*.exe
+          if-no-files-found: error
+
+      - name: Sign the finished installer
+        if: needs.build-windows.outputs.signing == 'true'
+        uses: ./.github/actions/signpath
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: windows-installer-v1
+          artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          version: ${{ needs.build-windows.outputs.version }}
+          output-directory: installer-signed
+
+      - name: Use the signed installer
+        if: needs.build-windows.outputs.signing == 'true'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.build-windows.outputs.version }}
+        run: Copy-Item -LiteralPath "installer-signed/Snekkie-Setup-$env:VERSION.exe" -Destination dist/ -Force
+
+      - name: Verify the final Windows package
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.build-windows.outputs.version }}
+          REQUIRE_SIGNATURES: ${{ needs.build-windows.outputs.signing }}
+        run: |
+          ./scripts/verify-windows-package.ps1 -Version $env:VERSION -DistDirectory dist -PayloadDirectory payload `
+            -RequireSignatures:($env:REQUIRE_SIGNATURES -eq 'true')
 
       - uses: actions/upload-artifact@v7
         with:
           name: snekkie-windows
           path: dist/*.exe
+          if-no-files-found: error
 
   build-linux:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
@@ -143,7 +327,7 @@ jobs:
     # with a suffix (v2.1.0-beta.1) becomes a pre-release, so testers can
     # try it without it showing up as the latest version.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [installer, build-linux]
+    needs: [build-windows, sign-windows, build-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write  # needed to create the release
@@ -153,22 +337,41 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          merge-multiple: true
+          name: snekkie-windows
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: snekkie-linux
+
+      - name: Calculate checksums of the final release files
+        run: sha256sum Snekkie-Setup-*.exe snekkie-*-portable.exe snekkie-linux-x86_64.tar.gz > SHA256SUMS
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          SIGNING_ENABLED: ${{ needs.build-windows.outputs.signing }}
         run: |
           version="${GITHUB_REF_NAME#v}"
           release_args=(--title "Snekkie $version")
           case "$GITHUB_REF_NAME" in *-*) release_args+=(--prerelease) ;; esac
           notes_file="docs/releases/$version.md"
           if [ -f "$notes_file" ]; then
+            cp "$notes_file" "$RUNNER_TEMP/release-notes.md"
+            notes_file="$RUNNER_TEMP/release-notes.md"
             release_args+=(--notes-file "$notes_file")
           else
             release_args+=(--generate-notes)
+            notes_file="$RUNNER_TEMP/release-notes.md"
+            : > "$notes_file"
+            if [ "$SIGNING_ENABLED" = true ]; then
+              release_args+=(--notes-file "$notes_file")
+            fi
+          fi
+          if [ "$SIGNING_ENABLED" = true ]; then
+            printf '\n\nFree code signing provided by SignPath.io, certificate by SignPath Foundation.\n\n[Code signing policy](https://github.com/%s/blob/%s/docs/code-signing.md)\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_SHA" >> "$notes_file"
           fi
           gh release create "$GITHUB_REF_NAME" \
-            Snekkie-Setup-*.exe snekkie-*-portable.exe snekkie-linux-x86_64.tar.gz \
+            Snekkie-Setup-*.exe snekkie-*-portable.exe snekkie-linux-x86_64.tar.gz SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             "${release_args[@]}"

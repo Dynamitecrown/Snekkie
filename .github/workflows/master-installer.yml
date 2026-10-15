@@ -1,0 +1,179 @@
+name: Master installer
+
+on:
+  push:
+    tags: ['installer-v*']
+    branches: [main]
+    paths:
+      - 'assets/icon.ico'
+      - 'installer/welcome.bmp'
+      - 'installer/master*'
+      - 'installer/signpath/windows-master-v1.xml'
+      - 'scripts/build-master-installer.ps1'
+      - 'scripts/test-master-installer.ps1'
+      - 'scripts/test-windows-installation.ps1'
+      - 'tests/windows_update.rs'
+      - 'scripts/verify-signatures.ps1'
+      - '.github/workflows/master-installer.yml'
+      - '.github/actions/signpath/**'
+  pull_request:
+    paths:
+      - 'assets/icon.ico'
+      - 'installer/welcome.bmp'
+      - 'installer/master*'
+      - 'installer/signpath/windows-master-v1.xml'
+      - 'scripts/*master-installer.ps1'
+      - 'scripts/test-windows-installation.ps1'
+      - 'tests/windows_update.rs'
+      - 'scripts/verify-signatures.ps1'
+      - '.github/workflows/master-installer.yml'
+      - '.github/actions/signpath/**'
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: Sign the master installer with the free SignPath OSS service.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      version: ${{ steps.settings.outputs.version }}
+      signing: ${{ steps.settings.outputs.signing }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check independent installer version and signing mode
+        id: settings
+        shell: pwsh
+        env:
+          SIGNPATH_ENABLED: ${{ vars.SIGNPATH_ENABLED }}
+          REQUEST_SIGNING: ${{ inputs.sign }}
+        run: |
+          $version = (Get-Content installer/master-version.txt -Raw).Trim()
+          if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'Invalid master installer version.'
+          }
+          $isTag = $env:GITHUB_REF -like 'refs/tags/installer-v*'
+          if ($isTag -and $env:GITHUB_REF_NAME -ne "installer-v$version") {
+            throw 'Installer tag must match installer/master-version.txt.'
+          }
+          $requested = $env:REQUEST_SIGNING -eq 'true'
+          if ($requested -and $env:SIGNPATH_ENABLED -ne 'true') {
+            throw 'Configure free SignPath signing first. See docs/code-signing.md.'
+          }
+          $signing = $env:SIGNPATH_ENABLED -eq 'true' -and ($isTag -or $requested)
+          if ($signing -and -not ($isTag -or $env:GITHUB_REF -eq 'refs/heads/main')) {
+            throw 'Signed master builds must use main or an installer-v* tag.'
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "signing=$($signing.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: Test downloader and verification before setup
+        # Exercise the same Windows PowerShell 5.1 runtime used by the EXE.
+        shell: powershell
+        run: ./scripts/test-master-installer.ps1
+
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis --yes --no-progress
+
+      - name: Build the stable master installer
+        shell: pwsh
+        env:
+          REQUIRE_SIGNED_RELEASE: ${{ steps.settings.outputs.signing }}
+        run: ./scripts/build-master-installer.ps1 -RequireSignedRelease:($env:REQUIRE_SIGNED_RELEASE -eq 'true')
+
+      - uses: actions/upload-artifact@v7
+        if: steps.settings.outputs.signing == 'true'
+        id: unsigned-master
+        with:
+          name: signpath-master-input
+          path: dist/Snekkie-Setup.exe
+          if-no-files-found: error
+
+      - name: Sign the master installer
+        if: steps.settings.outputs.signing == 'true'
+        uses: ./.github/actions/signpath
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: windows-master-v1
+          artifact-id: ${{ steps.unsigned-master.outputs.artifact-id }}
+          version: ${{ steps.settings.outputs.version }}
+          output-directory: master-signed
+
+      - name: Verify and use the signed master
+        if: steps.settings.outputs.signing == 'true'
+        shell: pwsh
+        run: |
+          ./scripts/verify-signatures.ps1 -Path master-signed/Snekkie-Setup.exe
+          Copy-Item -LiteralPath master-signed/Snekkie-Setup.exe -Destination dist/Snekkie-Setup.exe -Force
+
+      - name: Hash the final master installer
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist/Snekkie-Setup.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  Snekkie-Setup.exe" | Set-Content dist/SHA256SUMS -Encoding ascii
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test installation and the Update button on a disposable Windows runner
+        shell: powershell
+        timeout-minutes: 30
+        run: ./scripts/test-windows-installation.ps1 -MasterInstaller dist/Snekkie-Setup.exe
+
+      - name: Keep installation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: master-installation-logs
+          path: ${{ runner.temp }}/snekkie-windows-e2e-*/logs/
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: snekkie-master-installer
+          path: |
+            dist/Snekkie-Setup.exe
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/installer-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: snekkie-master-installer
+
+      - name: Publish the master independently of app updates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MASTER_VERSION: ${{ needs.build.outputs.version }}
+          SIGNING_ENABLED: ${{ needs.build.outputs.signing }}
+        run: |
+          notes_file="$RUNNER_TEMP/master-release-notes.md"
+          printf 'This stable online installer downloads and verifies the latest full Snekkie release, then opens its normal setup. Internet access is required.\n\nThe master has its own version; app updates do not replace this download. This release is marked prerelease only to keep GitHub latest-release checks pointed at the application.\n' > "$notes_file"
+          if [ "$SIGNING_ENABLED" = true ]; then
+            printf '\nFree code signing provided by SignPath.io, certificate by SignPath Foundation.\n\n[Code signing policy](https://github.com/%s/blob/%s/docs/code-signing.md)\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_SHA" >> "$notes_file"
+          fi
+          gh release create "$GITHUB_REF_NAME" Snekkie-Setup.exe SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "Snekkie master installer $MASTER_VERSION" \
+            --notes-file "$notes_file" --prerelease --latest=false --verify-tag

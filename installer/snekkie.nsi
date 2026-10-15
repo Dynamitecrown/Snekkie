@@ -38,6 +38,19 @@
 !ifndef OUTFILE
   !define OUTFILE "..\dist\Snekkie-Setup-${VERSION}.exe"
 !endif
+; SignPath signs the app and uninstaller before the final installer is built.
+; Export once with /DEXPORT_UNINSTALLER=<path>, then rebuild with
+; /DSIGNED_UNINSTALLER=<path>. A normal local build still uses WriteUninstaller.
+!ifdef EXPORT_UNINSTALLER
+  !ifdef SIGNED_UNINSTALLER
+    !error "EXPORT_UNINSTALLER and SIGNED_UNINSTALLER are mutually exclusive"
+  !endif
+  !ifdef NSIS_WIN32_MAKENSIS
+    !uninstfinalize 'cmd /c copy /Y "%1" "${EXPORT_UNINSTALLER}" >nul' = 0
+  !else
+    !uninstfinalize 'cp "%1" "${EXPORT_UNINSTALLER}"' = 0
+  !endif
+!endif
 ; Windows version resources need four numbers; drop any "-beta.1" suffix.
 !searchparse /noerrors "${VERSION}" "" VERSION_MAJOR "." VERSION_MINOR "." VERSION_PATCH "-"
 !ifndef VERSION_PATCH
@@ -119,8 +132,10 @@ Page custom NetworkOptionsCreate NetworkOptionsLeave
 !define MUI_PAGE_CUSTOMFUNCTION_PRE SkipOnUpdate
 !insertmacro MUI_PAGE_FINISH
 
-!insertmacro MUI_UNPAGE_CONFIRM
-!insertmacro MUI_UNPAGE_INSTFILES
+!ifndef SIGNED_UNINSTALLER
+  !insertmacro MUI_UNPAGE_CONFIRM
+  !insertmacro MUI_UNPAGE_INSTFILES
+!endif
 
 !insertmacro MUI_LANGUAGE "English"
 
@@ -163,7 +178,9 @@ Function ${UN}WaitForAppToClose
 FunctionEnd
 !macroend
 !insertmacro WAIT_FOR_APP_TO_CLOSE ""
+!ifndef SIGNED_UNINSTALLER
 !insertmacro WAIT_FOR_APP_TO_CLOSE "un."
+!endif
 
 Function .onInit
   StrCpy $IsUpgrade 0
@@ -339,7 +356,11 @@ Section "Install"
   SetOverwrite on
   File "/oname=snekkie.exe" "${EXE}"
   File "/oname=LICENSE.txt" "..\LICENSE"
+!ifdef SIGNED_UNINSTALLER
+  File "/oname=uninstall.exe" "${SIGNED_UNINSTALLER}"
+!else
   WriteUninstaller "$INSTDIR\uninstall.exe"
+!endif
 
   CreateShortcut "$SMPROGRAMS\${APP_NAME}.lnk" "$INSTDIR\snekkie.exe"
   ; Keep an existing desktop shortcut pointing at the new exe.
@@ -365,6 +386,7 @@ Section "Install"
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "EstimatedSize" "$0"
 SectionEnd
 
+!ifndef SIGNED_UNINSTALLER
 Function un.onInit
   ; Nothing extra; confirmation happens on the uninstall page.
 FunctionEnd
@@ -385,3 +407,4 @@ Section "Uninstall"
   ; %APPDATA%\snekkie (saved sessions, settings) is left in place on
   ; purpose, so reinstalling later picks up where you left off.
 SectionEnd
+!endif
