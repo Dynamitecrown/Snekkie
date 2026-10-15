@@ -221,6 +221,72 @@ pub fn installed_here() -> bool {
     false
 }
 
+/// How a copy that can't update itself was installed, so the update dialog
+/// can say what to do instead of pointing everyone at a portable download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallKind {
+    /// A .deb or .rpm package in /usr.
+    LinuxPackage,
+    Flatpak,
+    AppImage,
+    /// Snekkie.app, from the disk image.
+    MacApp,
+    /// A portable exe, the Linux tarball or a build from source.
+    Portable,
+}
+
+impl InstallKind {
+    /// What to do to update this copy.
+    pub fn update_instructions(self) -> &'static str {
+        match self {
+            InstallKind::LinuxPackage => {
+                "Snekkie was installed as a .deb or .rpm package. To update, run the Snekkie install script \
+                 again, or install the new package from the release page. Saved sessions and settings are kept."
+            }
+            InstallKind::Flatpak => {
+                "To update this Flatpak, run the Snekkie install script again, or install the new .flatpak \
+                 bundle from the release page. Saved sessions and settings are kept."
+            }
+            InstallKind::AppImage => {
+                "To update this AppImage, run the Snekkie install script again, or download the new AppImage \
+                 from the release page. Saved sessions and settings are kept."
+            }
+            InstallKind::MacApp => {
+                "To update, run the Snekkie install script again, or download the new disk image from the \
+                 release page and replace Snekkie in Applications. Saved sessions and settings are kept."
+            }
+            InstallKind::Portable => {
+                "This copy of Snekkie wasn't installed with the installer, so it can't update itself. \
+                 Download the new version from its release page."
+            }
+        }
+    }
+}
+
+/// Classify a copy from its executable path and the environment its
+/// launcher sets: the AppImage runtime sets APPIMAGE, Flatpak sets FLATPAK_ID.
+fn classify_install(exe: &Path, appimage: bool, flatpak: bool) -> InstallKind {
+    if flatpak {
+        InstallKind::Flatpak
+    } else if appimage {
+        InstallKind::AppImage
+    } else if exe.to_string_lossy().contains(".app/Contents/MacOS/") {
+        InstallKind::MacApp
+    } else if exe == Path::new("/usr/bin/snekkie") {
+        InstallKind::LinuxPackage
+    } else {
+        InstallKind::Portable
+    }
+}
+
+/// How this copy was installed. Only meaningful when it can't update itself:
+/// a Windows copy outside the installer's folder is always Portable.
+pub fn install_kind() -> InstallKind {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let flatpak = std::env::var_os("FLATPAK_ID").is_some() || Path::new("/.flatpak-info").exists();
+    classify_install(&exe, std::env::var_os("APPIMAGE").is_some(), flatpak)
+}
+
 /// A string value under HKEY_CURRENT_USER.
 #[cfg(windows)]
 fn registry_string(key: &str, value: &str) -> Option<String> {
@@ -317,6 +383,29 @@ mod tests {
         let installer = release.installer.expect("no installer");
         assert!(installer.url.starts_with("https://"));
         assert_eq!(installer.sha256.map(|d| d.len()), Some(64));
+    }
+
+    #[test]
+    fn update_instructions_follow_how_snekkie_was_installed() {
+        let kind = |exe: &str, appimage, flatpak| classify_install(Path::new(exe), appimage, flatpak);
+        assert_eq!(kind("/usr/bin/snekkie", false, false), InstallKind::LinuxPackage);
+        assert_eq!(kind("/app/bin/snekkie", false, true), InstallKind::Flatpak);
+        // The AppImage runtime mounts the image and runs usr/bin inside it.
+        assert_eq!(kind("/tmp/.mount_SnekkiXYZ/usr/bin/snekkie", true, false), InstallKind::AppImage);
+        assert_eq!(kind("/Applications/Snekkie.app/Contents/MacOS/snekkie", false, false), InstallKind::MacApp);
+        assert_eq!(
+            kind("/Users/jane/Applications/Snekkie.app/Contents/MacOS/snekkie", false, false),
+            InstallKind::MacApp
+        );
+        for portable in ["/home/jane/snekkie", "/usr/local/bin/snekkie", "/home/jane/src/target/release/snekkie"] {
+            assert_eq!(kind(portable, false, false), InstallKind::Portable, "{portable}");
+        }
+        for installed in [InstallKind::LinuxPackage, InstallKind::Flatpak, InstallKind::AppImage, InstallKind::MacApp] {
+            let text = installed.update_instructions();
+            assert!(text.contains("install script again") && text.contains("release page"), "{text}");
+            assert!(!text.contains("wasn't installed"), "{text}");
+        }
+        assert!(InstallKind::Portable.update_instructions().contains("wasn't installed with the installer"));
     }
 
     #[test]

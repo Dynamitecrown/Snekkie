@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.Dynamitecrown.Snekkie</id>
+  <name>Snekkie</name>
+  <summary>A tabbed SSH and serial terminal</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.dynamitecrown">
+    <name>Dynamitecrown</name>
+  </developer>
+  <description>
+    <p>Connect to SSH, serial, Telnet and raw TCP devices in one desktop application.
+    Keep saved connections, terminal themes and session logs together.</p>
+    <p>This Flatpak bundle is distributed through GitHub releases. To update,
+    install a newer bundle or run the Snekkie installer script again. The
+    application does not replace files inside its Flatpak installation.</p>
+  </description>
+  <launchable type="desktop-id">io.github.Dynamitecrown.Snekkie.desktop</launchable>
+  <url type="homepage">https://github.com/Dynamitecrown/Snekkie</url>
+  <url type="bugtracker">https://github.com/Dynamitecrown/Snekkie/issues</url>
+  <url type="vcs-browser">https://github.com/Dynamitecrown/Snekkie</url>
+  <provides><binary>snekkie</binary></provides>
+  <content_rating type="oars-1.1"/>
+  <releases><release version="@VERSION@" date="@DATE@"/></releases>
+</component>

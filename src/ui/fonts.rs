@@ -15,7 +15,9 @@ use egui::{FontData, FontDefinitions, FontFamily, FontId};
 /// Tried in order when a session doesn't name a font.
 #[cfg(windows)]
 const PREFERRED: [&str; 3] = ["Cascadia Mono", "Consolas", "Lucida Console"];
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+const PREFERRED: [&str; 2] = ["Menlo", "Monaco"];
+#[cfg(not(any(windows, target_os = "macos")))]
 const PREFERRED: [&str; 4] = ["DejaVu Sans Mono", "Liberation Mono", "Ubuntu Mono", "Noto Sans Mono"];
 
 /// Qt measured the old app's font sizes in points; egui works in logical

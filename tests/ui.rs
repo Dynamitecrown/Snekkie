@@ -27,6 +27,16 @@ fn harness(dir: &tempfile::TempDir) -> Harness<'static, SnekkieApp> {
     harness_sized(dir, [1000.0, 640.0])
 }
 
+fn app_modifiers(shift: bool) -> egui::Modifiers {
+    egui::Modifiers {
+        ctrl: !cfg!(target_os = "macos"),
+        mac_cmd: cfg!(target_os = "macos"),
+        command: true,
+        shift,
+        ..egui::Modifiers::NONE
+    }
+}
+
 fn harness_sized(dir: &tempfile::TempDir, size: [f32; 2]) -> Harness<'static, SnekkieApp> {
     let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
     let mut harness = Harness::builder().with_size(size).build_eframe(move |_cc| {
@@ -81,7 +91,7 @@ fn startup_uses_serial_when_ports_are_detected_and_ssh_otherwise() {
             app.get_by_label("Username");
         }
         assert!(app.state().tab_titles().is_empty());
-        app.key_press_modifiers(egui::Modifiers { ctrl: true, shift: true, ..Default::default() }, egui::Key::N);
+        app.key_press_modifiers(app_modifiers(true), egui::Key::N);
         app.run_ok();
         assert_eq!(app.state_mut().sidebar_draft().kind(), Kind::Ssh, "detection applies only at startup");
     }
@@ -100,7 +110,7 @@ fn seed_snippet(dir: &tempfile::TempDir, name: &str, template: &str) -> u64 {
 }
 
 fn open_snippets(app: &mut Harness<'static, SnekkieApp>) {
-    app.key_press_modifiers(egui::Modifiers { ctrl: true, shift: true, ..Default::default() }, egui::Key::S);
+    app.key_press_modifiers(app_modifiers(true), egui::Key::S);
     app.run_ok();
     app.get_by_label("Command snippets");
 }
@@ -477,6 +487,7 @@ fn putty_import_is_selectable_cancelable_and_preserves_existing_profiles() {
 [HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\Sessions\Switch]
 "HostName"="192.0.2.1"
 "Protocol"="ssh"
+"TryAgent"=dword:00000001
 [HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\Sessions\Console]
 "Protocol"="serial"
 "SerialLine"="COM7"
@@ -507,6 +518,7 @@ fn putty_import_is_selectable_cancelable_and_preserves_existing_profiles() {
     assert_eq!(imported.profiles.len(), 2);
     assert_eq!(imported.get("Switch").unwrap().host, "original");
     assert_eq!(imported.get("Switch (PuTTY 1)").unwrap().host, "192.0.2.1");
+    assert_eq!(imported.get("Switch (PuTTY 1)").unwrap().auth, "password");
     assert!(harness.state().tab_titles().is_empty(), "import must not connect");
     drop(harness);
     let restarted = harness_sized(&dir, [1000.0, 640.0]);
@@ -660,7 +672,7 @@ fn sidebar_filter_keys_stay_local_and_hiding_sidebar_restores_terminal_input() {
     app.run_ok();
     let error = peer.read(&mut [0; 64]).unwrap_err();
     assert!(matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
-    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::B);
+    app.key_press_modifiers(app_modifiers(false), egui::Key::B);
     app.run_ok();
     app.get_by_label("Terminal output").click();
     app.run_ok();
@@ -694,7 +706,7 @@ fn profile_colors_persist_and_tab_overrides_target_the_inactive_session() {
     app.run_ok();
     assert_eq!(app.state().tab_colors()[0].1, snekkie::settings::parse_hex("#509ce7"));
     let _other_peer = open_raw_tab(&mut app, "Other");
-    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::B);
+    app.key_press_modifiers(app_modifiers(false), egui::Key::B);
     app.run_ok();
     pick_tab_color(&mut app, "Saved", "Red");
     let red = app.state().tab_colors()[0].1.unwrap();
@@ -980,7 +992,7 @@ fn opening_find_keeps_text_in_the_same_frame_off_the_wire() {
     device_prints(&mut app, &mut device, "needle\r\nready");
     app.get_by_label("Terminal output").focus();
     app.run_ok();
-    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+    app.key_press_modifiers(app_modifiers(false), egui::Key::F);
     app.event(egui::Event::Text("needle".into()));
     app.run_ok();
     assert_device_received_nothing(&mut device);
@@ -1001,12 +1013,12 @@ fn find_keeps_a_current_result_after_the_terminal_reflows() {
     let mut app = harness_sized(&dir, [520.0, 320.0]);
     let mut device = open_raw_tab(&mut app, "reflow");
     device_prints(&mut app, &mut device, "R1#show ip interface brief\r\nGi0/0 192.0.2.1 up up\r\nR1#");
-    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+    app.key_press_modifiers(app_modifiers(false), egui::Key::F);
     app.run_ok();
     app.run_ok();
     app.event(egui::Event::Text("192.0.2.1".into()));
     wait_for_search(&mut app, "1 of 1");
-    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::B);
+    app.key_press_modifiers(app_modifiers(false), egui::Key::B);
     for _ in 0..5 {
         app.run_ok();
     }
@@ -1031,7 +1043,7 @@ fn find_bar_steps_through_history_without_sending_anything_and_escape_restores_t
     device_prints(&mut app, &mut device, &output);
     assert_eq!(app.state().active_display_offset(), Some(0));
 
-    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+    app.key_press_modifiers(app_modifiers(false), egui::Key::F);
     app.run_ok();
     app.run_ok();
     assert!(app.get_by_label("Find in terminal").is_focused());
@@ -1119,7 +1131,7 @@ fn find_bar_refreshes_after_no_matches_and_after_clearing_history() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = harness(&dir);
     let mut device = open_raw_tab(&mut app, "live");
-    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+    app.key_press_modifiers(app_modifiers(false), egui::Key::F);
     app.run_ok();
     app.run_ok();
     app.event(egui::Event::Text("needle".into()));
@@ -1127,7 +1139,7 @@ fn find_bar_refreshes_after_no_matches_and_after_clearing_history() {
 
     device_prints(&mut app, &mut device, "\r\nneedle\r\nready");
     wait_for_search(&mut app, "1 of 1");
-    app.key_press_modifiers(egui::Modifiers { ctrl: true, shift: true, ..Default::default() }, egui::Key::L);
+    app.key_press_modifiers(app_modifiers(true), egui::Key::L);
     wait_for_search(&mut app, "No matches");
     device_prints(&mut app, &mut device, "\r\nnew needle\r\nready again");
     wait_for_search(&mut app, "1 of 1");
@@ -1140,7 +1152,7 @@ fn find_bar_escape_closes_from_controls_and_terminal_without_reaching_the_device
     let mut app = harness(&dir);
     let mut device = open_raw_tab(&mut app, "escape");
     for focus in ["Match case", "Previous match", "Terminal output"] {
-        app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+        app.key_press_modifiers(app_modifiers(false), egui::Key::F);
         app.run_ok();
         app.run_ok();
         app.get_by_label(focus).focus();
@@ -1160,7 +1172,7 @@ fn find_queries_and_options_stay_with_each_tab() {
     let mut app = harness(&dir);
     let mut first = open_raw_tab(&mut app, "first");
     device_prints(&mut app, &mut first, "\r\nneedle\r\nready");
-    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+    app.key_press_modifiers(app_modifiers(false), egui::Key::F);
     app.run_ok();
     app.run_ok();
     app.event(egui::Event::Text("needle".into()));
@@ -1169,7 +1181,7 @@ fn find_queries_and_options_stay_with_each_tab() {
     let mut second = open_raw_tab(&mut app, "second");
     device_prints(&mut app, &mut second, "\r\nVLAN10\r\nvlan20\r\nready");
     assert_eq!(app.state().active_search_status(), None);
-    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+    app.key_press_modifiers(app_modifiers(false), egui::Key::F);
     app.run_ok();
     app.run_ok();
     app.event(egui::Event::Text("VLAN".into()));
@@ -1182,7 +1194,7 @@ fn find_queries_and_options_stay_with_each_tab() {
     {
         app.key_press_modifiers(modifiers, egui::Key::Tab);
         app.run_ok();
-        app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+        app.key_press_modifiers(app_modifiers(false), egui::Key::F);
         app.run_ok();
         app.run_ok();
         assert_eq!(app.get_by_label("Find in terminal").value().as_deref(), Some(query));
@@ -1208,7 +1220,7 @@ fn find_bar_fits_the_minimum_window_with_sidebar_and_keeps_its_match_visible() {
         // Start the IP at column zero: platform fonts can wrap this narrow
         // pane differently, and the visibility check needs it on one row.
         device_prints(&mut app, &mut device, "\r\nR1#show ip interface brief\r\n192.0.2.1 up up\r\nready");
-        app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+        app.key_press_modifiers(app_modifiers(false), egui::Key::F);
         app.run_ok();
         app.run_ok();
         assert!(
@@ -1270,13 +1282,13 @@ fn find_bar_keeps_its_query_but_drops_old_results_after_reconnect_and_reset() {
     );
     let (mut old_device, _) = listener.accept().unwrap();
     device_prints(&mut app, &mut old_device, "old needle\r\nready");
-    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+    app.key_press_modifiers(app_modifiers(false), egui::Key::F);
     app.run_ok();
     app.run_ok();
     app.event(egui::Event::Text("needle".into()));
     wait_for_search(&mut app, "1 of 1");
 
-    app.key_press_modifiers(egui::Modifiers { ctrl: true, shift: true, ..Default::default() }, egui::Key::R);
+    app.key_press_modifiers(app_modifiers(true), egui::Key::R);
     app.run_ok();
     let (mut new_device, _) = listener.accept().unwrap();
     device_prints(&mut app, &mut new_device, "new connection\r\nready after reconnect");
@@ -1322,7 +1334,7 @@ fn selected_text_on_one_line_becomes_the_query() {
     }
     app.event(button(to, false));
     app.run_ok();
-    app.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::F);
+    app.key_press_modifiers(app_modifiers(false), egui::Key::F);
     app.run_ok();
     app.run_ok();
     let query = app.get_by_label("Find in terminal").value().unwrap_or_default();
@@ -1488,7 +1500,7 @@ fn new_connections_with_other_tabs_open_do_not_inherit_the_last_saved_session_na
         .unwrap()
         .click();
     harness.run_ok();
-    harness.key_press_modifiers(egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE }, egui::Key::A);
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
     harness.event(egui::Event::Text("second console".into()));
     harness.run_ok();
     harness.get_by_label("OK").click();
@@ -1504,7 +1516,7 @@ fn new_connections_with_other_tabs_open_do_not_inherit_the_last_saved_session_na
     assert_eq!(saved.get("saved console").unwrap().port, first_listener.local_addr().unwrap().port());
     assert_eq!(saved.get("second console").unwrap().port, port);
 
-    harness.key_press_modifiers(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::N);
+    harness.key_press_modifiers(app_modifiers(true), egui::Key::N);
     harness.run_ok();
     assert_eq!(harness.state_mut().sidebar_draft().name, "New session");
     assert_eq!(harness.state_mut().sidebar_draft().host, "");
@@ -1805,7 +1817,7 @@ fn confirming_a_dialog_sends_nothing_to_the_device() {
     assert_eq!(device.read(&mut buf).unwrap_or(0), 1, "Enter should reach the device");
 
     // Answering No to closing it hands the keyboard back to the terminal.
-    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::W);
+    harness.key_press_modifiers(app_modifiers(false), egui::Key::W);
     harness.run_ok();
     harness.key_press(egui::Key::Escape);
     harness.run_ok();
@@ -1815,7 +1827,7 @@ fn confirming_a_dialog_sends_nothing_to_the_device() {
     assert_eq!(device.read(&mut buf).unwrap_or(0), 1, "the terminal should have the keyboard back");
 
     // ...and the Enter that confirms closing the tab doesn't reach the device.
-    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::W);
+    harness.key_press_modifiers(app_modifiers(false), egui::Key::W);
     harness.run_ok();
     assert_eq!(harness.state().dialog_texts(), ["“console” is still connected. Close it?"]);
     harness.key_press(egui::Key::Enter);
@@ -2006,7 +2018,7 @@ fn telnet_local_echo_follows_the_device() {
 }
 
 fn open_preferences(harness: &mut Harness<'static, SnekkieApp>) {
-    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Comma);
+    harness.key_press_modifiers(app_modifiers(false), egui::Key::Comma);
     harness.run_ok();
     harness.get_by_label("Preferences");
 }
@@ -2032,7 +2044,7 @@ fn edit_cursor_red(harness: &mut Harness<'static, SnekkieApp>, from: u8, to: u8)
     harness.run_ok();
     harness.get_by_value(&format!("R {from}")).click();
     harness.run_ok();
-    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::A);
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
     harness.run_ok();
     harness.event(egui::Event::Text(to.to_string()));
     harness.run_ok();
@@ -2046,7 +2058,7 @@ fn edit_cursor_red(harness: &mut Harness<'static, SnekkieApp>, from: u8, to: u8)
 fn save_theme_as(harness: &mut Harness<'static, SnekkieApp>, name: &str) {
     harness.get_by_label("Save as…").click();
     harness.run_ok();
-    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::A);
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
     harness.run_ok();
     harness.event(egui::Event::Text(name.into()));
     harness.run_ok();

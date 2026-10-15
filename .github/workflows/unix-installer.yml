@@ -1,0 +1,125 @@
+name: Linux and macOS installer
+
+on:
+  push:
+    tags: ['unix-installer-v*']
+    branches: [main]
+    paths:
+      - 'installer/unix/**'
+      - 'scripts/test-install-script*.sh'
+      - '.github/workflows/unix-installer.yml'
+  pull_request:
+    paths:
+      - 'installer/unix/**'
+      - 'scripts/test-install-script*.sh'
+      - '.github/workflows/unix-installer.yml'
+  workflow_dispatch:
+    inputs:
+      live_check:
+        description: Download and verify each format from the latest app release (needs a release with Linux and macOS packages).
+        type: boolean
+        default: false
+      verify_published:
+        description: Check the already published installer download instead of the checkout's copy.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the independent installer version
+        id: version
+        run: |
+          version=$(sed -n 's/^INSTALLER_VERSION=\([0-9][0-9.]*\)$/\1/p' installer/unix/snekkie-install.sh)
+          [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo '::error::Invalid INSTALLER_VERSION.'; exit 1; }
+          if [[ $GITHUB_REF == refs/tags/unix-installer-v* && $GITHUB_REF_NAME != "unix-installer-v$version" ]]; then
+            echo "::error::The tag must match INSTALLER_VERSION ($version)."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Use the published installer
+        if: github.event_name == 'workflow_dispatch' && inputs.verify_published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release download "unix-installer-v$VERSION" --repo "$GITHUB_REPOSITORY" \
+            --pattern snekkie-install.sh --pattern SHA256SUMS --dir published
+          (cd published && shasum -a 256 -c SHA256SUMS)
+          cp published/snekkie-install.sh installer/unix/snekkie-install.sh
+
+      - name: Lint
+        if: runner.os == 'Linux'
+        run: shellcheck installer/unix/snekkie-install.sh scripts/test-install-script.sh scripts/test-install-script-unit.sh
+
+      - name: Unit checks with every shell users may have as sh
+        run: |
+          if [[ $RUNNER_OS == Linux ]]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends dash busybox zsh
+            shells=(dash 'bash --posix' 'busybox sh' 'zsh --emulate sh')
+          else
+            shells=(/bin/sh /bin/dash /bin/bash 'zsh --emulate sh')
+          fi
+          for shell in "${shells[@]}"; do
+            SNEKKIE_TEST_SHELL=$shell $shell scripts/test-install-script-unit.sh
+          done
+
+      # Exercises the GitHub path: release lookup, SHA256SUMS and download.
+      # A tag also requires it, so the installer can't be published before an
+      # app release that contains its packages.
+      - name: Download and verify from the latest app release
+        if: startsWith(github.ref, 'refs/tags/unix-installer-v') || (github.event_name == 'workflow_dispatch' && (inputs.live_check || inputs.verify_published))
+        run: |
+          if [[ $RUNNER_OS == Linux ]]; then formats=(deb rpm appimage flatpak); else formats=(dmg); fi
+          for format in "${formats[@]}"; do
+            mkdir -p "live/$format"
+            sh installer/unix/snekkie-install.sh --download-only --format "$format" --dir "live/$format" --yes
+            test -s "$(ls "live/$format"/*)"
+          done
+
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Linux'
+        with:
+          name: snekkie-unix-installer
+          path: installer/unix/snekkie-install.sh
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/unix-installer-v')
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: snekkie-unix-installer
+
+      - name: Publish the installer independently of app updates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          sha256sum snekkie-install.sh > SHA256SUMS
+          notes_file="$RUNNER_TEMP/notes.md"
+          # shellcheck disable=SC2016 # the notes contain literal Markdown backticks
+          printf 'This stable install script downloads the latest full Snekkie release for Linux or macOS from GitHub, checks it against that release'"'"'s SHA256SUMS and installs the package that suits the computer: .deb, .rpm, Flatpak, AppImage or the macOS app. Run it again to update.\n\n```bash\ncurl -fsSLO https://github.com/%s/releases/download/%s/snekkie-install.sh\nsh snekkie-install.sh\n```\n\nThe script has its own version; app updates do not replace this download. This release is marked prerelease only to keep GitHub latest-release checks pointed at the application.\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" > "$notes_file"
+          gh release create "$GITHUB_REF_NAME" snekkie-install.sh SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "Snekkie installer for Linux and macOS $VERSION" \
+            --notes-file "$notes_file" --prerelease --latest=false --verify-tag

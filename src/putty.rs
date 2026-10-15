@@ -31,7 +31,6 @@ const NUMBERS: &[&str] = &[
     "FontHeight",
     "LocalEcho",
     "BackspaceIsDelete",
-    "TryAgent",
     "ProxyMethod",
     "SSH2DES",
     "SshNoAuth",
@@ -124,7 +123,9 @@ fn convert(sessions: BTreeMap<String, Values>, defaults: &crate::settings::AppSe
         }
         if protocol == "ssh" {
             let key = get("PublicKeyFile");
-            profile.auth = if number("TryAgent", 1) != 0 { "agent" } else { "password" }.into();
+            // PuTTY enables agent attempts by default; imported sessions should
+            // ask for a password unless they explicitly select a usable key file.
+            profile.auth = "password".into();
             if !key.is_empty() {
                 if key.to_ascii_lowercase().ends_with(".ppk") {
                     batch.warnings.push(format!("{}: PuTTY .ppk key is not imported. Use Pageant or export the key to OpenSSH format, then select it in Snekkie.", profile.name));
@@ -405,7 +406,7 @@ mod tests {
             assert_eq!(ssh.local_echo, "on");
             assert_eq!(ssh.backspace, "ctrl-h");
             assert!(ssh.key_file.is_empty());
-            assert_eq!(ssh.auth, "agent");
+            assert_eq!(ssh.auth, "password");
             let serial = &batch.profiles[0];
             assert_eq!(serial.device, "COM7");
             assert_eq!(serial.baud, 115200);
@@ -417,6 +418,25 @@ mod tests {
         }
         assert!(parse_export(b"not a registry export", &settings).is_err());
         assert!(parse_export(&[0xff, 0xfe, 0], &settings).is_err());
+    }
+
+    #[test]
+    fn ssh_import_defaults_to_password_unless_an_openssh_key_is_configured() {
+        let settings = crate::settings::AppSettings::default();
+        for agent_setting in ["", "\"TryAgent\"=dword:00000000\n", "\"TryAgent\"=dword:00000001\n"] {
+            for (key, auth) in
+                [("", "password"), ("router.ppk", "password"), ("router.PPK", "password"), ("id_ed25519", "key")]
+            {
+                let export = format!(
+                    "Windows Registry Editor Version 5.00\n\n[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\SSH]\n\"HostName\"=\"192.0.2.1\"\n{agent_setting}\"PublicKeyFile\"=\"{key}\"\n"
+                );
+                let batch = parse_export(export.as_bytes(), &settings).unwrap();
+                assert_eq!(batch.profiles.len(), 1);
+                let profile = &batch.profiles[0];
+                assert_eq!(profile.auth, auth, "agent={agent_setting:?}, key={key:?}");
+                assert_eq!(profile.key_file, if auth == "key" { key } else { "" });
+            }
+        }
     }
 
     #[test]

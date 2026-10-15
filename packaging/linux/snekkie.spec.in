@@ -1,0 +1,53 @@
+# The payload was built on Ubuntu 22.04. Package it without rebuilding or
+# stripping it, retaining RPM's automatic ELF dependency generation.
+%global debug_package %{nil}
+%global _build_id_links none
+%global __os_install_post %{nil}
+
+Name: snekkie
+Version: %{snekkie_version}
+Release: %{snekkie_revision}
+Summary: A tabbed SSH and serial terminal
+License: GPL-3.0-or-later
+URL: https://github.com/Dynamitecrown/Snekkie
+BuildArch: x86_64
+Requires: glibc >= 2.35
+Requires: ca-certificates
+Requires: xdg-utils
+# winit, wgpu, arboard and rfd load these at runtime with dlopen, so the
+# automatic ELF scanner cannot discover them. Use SONAMEs across RPM distros.
+Requires: libX11.so.6()(64bit)
+Requires: libX11-xcb.so.1()(64bit)
+Requires: libXcursor.so.1()(64bit)
+Requires: libXrandr.so.2()(64bit)
+Requires: libXi.so.6()(64bit)
+Requires: libxcb.so.1()(64bit)
+Requires: libxkbcommon.so.0()(64bit)
+Requires: libxkbcommon-x11.so.0()(64bit)
+Requires: libwayland-client.so.0()(64bit)
+Requires: libwayland-cursor.so.0()(64bit)
+Requires: libwayland-egl.so.1()(64bit)
+Requires: libEGL.so.1()(64bit)
+Requires: libGL.so.1()(64bit)
+Requires: libvulkan.so.1()(64bit)
+Requires: libdbus-1.so.3()(64bit)
+Recommends: xdg-desktop-portal
+
+%description
+Snekkie is a tabbed SSH, serial, Telnet and raw TCP terminal.
+
+%prep
+
+%build
+
+%install
+mkdir -p "%{buildroot}"
+cp -a "%{snekkie_payload}/." "%{buildroot}/"
+
+%files
+%attr(0755,root,root) /usr/bin/snekkie
+%attr(0644,root,root) /usr/share/applications/snekkie.desktop
+%attr(0644,root,root) /usr/share/icons/hicolor/512x512/apps/snekkie.png
+%dir /usr/share/doc/snekkie
+%license /usr/share/doc/snekkie/copyright
+%doc /usr/share/doc/snekkie/README.md

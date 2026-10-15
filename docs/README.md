@@ -15,6 +15,7 @@ Installed Windows users on 2.5.0 can choose **Help → Check for updates…**, t
 | [Paste behavior](paste-behavior.md) | Multiline review, pacing, Stop, destination binding and right-click preferences |
 | [Session logging](session-logging.md) | Per-profile TX/RX logs, timestamps, raw format, password controls, Private input and rotation |
 | [Master installer](master-installer.md) | Download-once Windows installation, updates, verification, silent setup and independent releases |
+| [Linux and macOS](linux-and-macos.md) | Install script, `.deb`, `.rpm`, Flatpak, AppImage and macOS app (from the release after 2.6.0), serial permissions and settings locations |
 | [Syntax highlighting](syntax-highlighting.md) | Device platforms, intensity levels and display behavior |
 | [2.5.0 feature guide](new-features.md) | Themes, animations, search, session organization, imports and network privacy retained in 2.6.0 |
 

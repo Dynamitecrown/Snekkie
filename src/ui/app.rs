@@ -36,6 +36,7 @@ use crate::update::{self, Release};
 /// How long a status bar message stays up, in seconds.
 const FLASH_SECONDS: f64 = 4.0;
 
+#[cfg(not(target_os = "macos"))]
 const SHORTCUTS: &str = "\
 Ctrl+Shift+N    New session
 Ctrl+Shift+D    Duplicate current session
@@ -55,6 +56,29 @@ Ctrl+Shift+B    Send break (serial, telnet)
 
 Ctrl+B          Toggle sidebar
 Ctrl+,          Preferences";
+
+#[cfg(target_os = "macos")]
+const SHORTCUTS: &str = "\
+Cmd+Shift+N     New session
+Cmd+Shift+D     Duplicate current session
+Cmd+Shift+R     Reconnect
+Cmd+W           Close tab
+Ctrl+Tab        Next tab (Ctrl+Shift+Tab: previous)
+Cmd+Q           Quit
+
+Cmd+C / Cmd+X   Copy      (selecting also copies)
+Cmd+V           Paste     (right-click pastes by default; configurable)
+Cmd+A           Select all
+Cmd+F           Find in output (Enter: older, Shift+Enter: newer)
+Cmd+Shift+S     Command snippets
+Ctrl+Right-click  Terminal context menu (copy, save text, selection)
+Shift+PgUp/Dn   Scroll back through history
+Cmd+Shift+L     Clear screen and scrollback
+Cmd+Shift+B     Send break (serial, telnet)
+
+Cmd+B           Toggle sidebar
+Cmd+,           Preferences
+Ctrl+C/X/V      Send terminal control characters";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -128,6 +152,53 @@ enum Command {
     About,
     NextTab,
     PreviousTab,
+}
+
+/// Match physical modifiers explicitly: macOS Command belongs to the app,
+/// while Control still belongs to the remote terminal. Ctrl+Tab remains a
+/// tab switch on every platform; Cmd+Tab is reserved by macOS.
+fn shortcut_command(key: Key, modifiers: Modifiers, macos: bool) -> Option<Command> {
+    if modifiers.alt {
+        return None;
+    }
+    if modifiers.ctrl && !modifiers.mac_cmd && key == Key::Tab {
+        return Some(if modifiers.shift { Command::PreviousTab } else { Command::NextTab });
+    }
+    let app_modifier = if macos { modifiers.mac_cmd && !modifiers.ctrl } else { modifiers.ctrl && !modifiers.mac_cmd };
+    if !app_modifier {
+        return None;
+    }
+    let table = [
+        (true, Key::N, Command::NewSession),
+        (true, Key::D, Command::Duplicate),
+        (true, Key::R, Command::Reconnect),
+        (false, Key::W, Command::CloseTab),
+        (false, Key::Q, Command::Quit),
+        (!macos, Key::A, Command::SelectAll),
+        (false, Key::F, Command::Find),
+        (true, Key::S, Command::Snippets),
+        (true, Key::L, Command::ClearScreen),
+        (true, Key::B, Command::SendBreak),
+        (false, Key::B, Command::ToggleSidebar),
+        (false, Key::Comma, Command::Preferences),
+        (false, Key::PageDown, Command::NextTab),
+        (false, Key::PageUp, Command::PreviousTab),
+    ];
+    table
+        .into_iter()
+        .find_map(|(shift, candidate, command)| (key == candidate && modifiers.shift == shift).then_some(command))
+}
+
+fn shortcut_label(shortcut: &str, macos: bool) -> std::borrow::Cow<'_, str> {
+    if !macos || matches!(shortcut, "Ctrl+Tab" | "Ctrl+Shift+Tab") {
+        return shortcut.into();
+    }
+    match shortcut {
+        "Ctrl+Shift+C" => "Cmd+C".into(),
+        "Ctrl+Shift+V" => "Cmd+V".into(),
+        "Ctrl+Shift+A" => "Cmd+A".into(),
+        _ => shortcut.replacen("Ctrl+", "Cmd+", 1).into(),
+    }
 }
 
 struct Tab {
@@ -671,35 +742,16 @@ impl SnekkieApp {
     /// Keyboard shortcuts, taken out of the event queue before the
     /// terminal sees them.
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Command> {
-        const CTRL: Modifiers = Modifiers::CTRL;
-        const CTRL_SHIFT: Modifiers = Modifiers { ctrl: true, shift: true, ..Modifiers::NONE };
-        let table: [(Modifiers, Key, Command); 16] = [
-            (CTRL_SHIFT, Key::N, Command::NewSession),
-            (CTRL_SHIFT, Key::D, Command::Duplicate),
-            (CTRL_SHIFT, Key::R, Command::Reconnect),
-            (CTRL, Key::W, Command::CloseTab),
-            (CTRL, Key::Q, Command::Quit),
-            (CTRL_SHIFT, Key::A, Command::SelectAll),
-            (CTRL, Key::F, Command::Find),
-            (CTRL_SHIFT, Key::S, Command::Snippets),
-            (CTRL_SHIFT, Key::L, Command::ClearScreen),
-            (CTRL_SHIFT, Key::B, Command::SendBreak),
-            (CTRL, Key::B, Command::ToggleSidebar),
-            (CTRL, Key::Comma, Command::Preferences),
-            (CTRL, Key::Tab, Command::NextTab),
-            (CTRL_SHIFT, Key::Tab, Command::PreviousTab),
-            (CTRL, Key::PageDown, Command::NextTab),
-            (CTRL, Key::PageUp, Command::PreviousTab),
-        ];
+        let terminal_had_focus = self.terminal_had_focus;
         ctx.input_mut(|input| {
             let mut commands = Vec::new();
             input.events.retain(|event| {
                 let Event::Key { key, pressed: true, modifiers, .. } = event else { return true };
-                let exact =
-                    |m: Modifiers| m.ctrl == modifiers.ctrl && m.shift == modifiers.shift && m.alt == modifiers.alt;
-                match table.iter().find(|(m, k, _)| k == key && exact(*m)) {
-                    Some((_, _, command)) => {
-                        commands.push(*command);
+                match shortcut_command(*key, *modifiers, cfg!(target_os = "macos")) {
+                    // Cmd+A also belongs to every native text editor.
+                    Some(Command::SelectAll) if cfg!(target_os = "macos") && !terminal_had_focus => true,
+                    Some(command) => {
+                        commands.push(command);
                         false
                     }
                     None => true,
@@ -800,7 +852,7 @@ impl SnekkieApp {
             let mut item = |ui: &mut Ui, text: &str, shortcut: &str, command: Command| {
                 let mut button = egui::Button::new(text);
                 if !shortcut.is_empty() {
-                    button = button.shortcut_text(shortcut);
+                    button = button.shortcut_text(shortcut_label(shortcut, cfg!(target_os = "macos")));
                 }
                 if ui.add(button).clicked() {
                     commands.push(command);
@@ -1571,8 +1623,7 @@ impl SnekkieApp {
                         "Snekkie downloads it, then restarts to install it, asking first if any sessions \
                          are connected. Saved sessions and settings are kept."
                     } else {
-                        "This copy of Snekkie wasn't installed with the installer, so it can't update \
-                         itself. Download the new version from its release page."
+                        update::install_kind().update_instructions()
                     };
                     ui.add(egui::Label::new(RichText::new(how).color(style::secondary(ui))).wrap());
                     if *installable {
@@ -2352,6 +2403,67 @@ impl eframe::App for SnekkieApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mac_shortcuts_use_command_and_preserve_physical_control_keys() {
+        let command = Modifiers { mac_cmd: true, command: true, ..Modifiers::NONE };
+        let control = Modifiers { ctrl: true, ..Modifiers::NONE };
+        for (key, expected) in [
+            (Key::W, Command::CloseTab),
+            (Key::Q, Command::Quit),
+            (Key::A, Command::SelectAll),
+            (Key::F, Command::Find),
+            (Key::B, Command::ToggleSidebar),
+            (Key::Comma, Command::Preferences),
+        ] {
+            assert_eq!(shortcut_command(key, command, true), Some(expected));
+            assert_eq!(shortcut_command(key, control, true), None, "Ctrl+{key:?} belongs to the device");
+        }
+        let shifted = Modifiers { shift: true, ..command };
+        for (key, expected) in [
+            (Key::N, Command::NewSession),
+            (Key::D, Command::Duplicate),
+            (Key::R, Command::Reconnect),
+            (Key::S, Command::Snippets),
+            (Key::L, Command::ClearScreen),
+            (Key::B, Command::SendBreak),
+        ] {
+            assert_eq!(shortcut_command(key, shifted, true), Some(expected));
+            assert_eq!(shortcut_command(key, Modifiers { shift: true, ..control }, true), None);
+        }
+        assert_eq!(shortcut_command(Key::Tab, command, true), None, "Cmd+Tab belongs to macOS");
+        assert_eq!(shortcut_command(Key::Tab, control, true), Some(Command::NextTab));
+        assert_eq!(shortcut_command(Key::Tab, Modifiers { shift: true, ..control }, true), Some(Command::PreviousTab));
+        assert_eq!(shortcut_command(Key::W, Modifiers { ctrl: true, ..command }, true), None);
+    }
+
+    #[test]
+    fn windows_and_linux_shortcuts_keep_their_control_bindings() {
+        let control = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
+        assert_eq!(shortcut_command(Key::W, control, false), Some(Command::CloseTab));
+        assert_eq!(shortcut_command(Key::F, control, false), Some(Command::Find));
+        assert_eq!(shortcut_command(Key::A, control, false), None, "plain Ctrl+A belongs to the device");
+        assert_eq!(shortcut_command(Key::A, Modifiers { shift: true, ..control }, false), Some(Command::SelectAll));
+        assert_eq!(shortcut_command(Key::PageDown, control, false), Some(Command::NextTab));
+        assert_eq!(shortcut_command(Key::PageUp, control, false), Some(Command::PreviousTab));
+        assert_eq!(shortcut_command(Key::F, Modifiers { alt: true, ..control }, false), None);
+    }
+
+    #[test]
+    fn menu_shortcut_labels_match_each_platform() {
+        for (original, macos) in [
+            ("Ctrl+Shift+N", "Cmd+Shift+N"),
+            ("Ctrl+F", "Cmd+F"),
+            ("Ctrl+Shift+C", "Cmd+C"),
+            ("Ctrl+Shift+V", "Cmd+V"),
+            ("Ctrl+Shift+A", "Cmd+A"),
+            ("Ctrl+Tab", "Ctrl+Tab"),
+            ("Ctrl+Shift+Tab", "Ctrl+Shift+Tab"),
+        ] {
+            assert_eq!(shortcut_label(original, true), macos);
+            assert_eq!(shortcut_label(original, false), original);
+        }
+    }
 
     #[test]
     fn profile_metadata_updates_matching_sessions_and_rolls_back_on_write_failure() {

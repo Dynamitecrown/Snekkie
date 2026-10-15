@@ -126,6 +126,31 @@ fn ctrl_secondary_click(ui: &Ui) -> bool {
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ClipboardAction<'a> {
+    Copy,
+    Paste(&'a str),
+    Terminal(&'static [u8]),
+}
+
+/// egui converts the platform's clipboard shortcuts to dedicated events.
+/// On macOS those use Command; physical Ctrl+C/X/V arrive as ordinary
+/// keys and still go to the remote terminal. A terminal has no local text
+/// to cut, so Command+X copies the selection without deleting remote text.
+fn clipboard_action(event: &Event, modifiers: egui::Modifiers, macos: bool) -> Option<ClipboardAction<'_>> {
+    match event {
+        Event::Copy if macos || modifiers.shift => Some(ClipboardAction::Copy),
+        Event::Copy => Some(ClipboardAction::Terminal(b"\x03")),
+        Event::Cut if macos => Some(ClipboardAction::Copy),
+        Event::Cut if modifiers.ctrl => Some(ClipboardAction::Terminal(b"\x18")),
+        // Shift+Delete on Windows also arrives as Cut.
+        Event::Cut => Some(ClipboardAction::Terminal(b"\x1b[3;2~")),
+        Event::Paste(_) if !macos && modifiers.ctrl && !modifiers.shift => Some(ClipboardAction::Terminal(b"\x16")),
+        Event::Paste(text) => Some(ClipboardAction::Paste(text)),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 pub struct TerminalView {
     selecting: bool,
@@ -559,16 +584,37 @@ impl TerminalView {
     }
 
     fn handle_keys(&mut self, ui: &mut Ui, session: &Session, now: f64, animations: &Animations, out: &mut ViewOutput) {
-        let (events, mods_now) = ui.input(|i| (i.events.clone(), i.modifiers));
+        let (events, mut mods_now) = ui.input(|i| (i.events.clone(), i.modifiers));
         let app_cursor = session.shared.emulator.lock().application_cursor_keys();
         let backspace = session.profile.backspace();
         for event in events {
+            if let Some(action) = clipboard_action(&event, mods_now, cfg!(target_os = "macos")) {
+                match action {
+                    ClipboardAction::Copy => out.copy = session.shared.emulator.lock().selection_text(),
+                    ClipboardAction::Terminal(bytes) => self.typed(session, bytes.to_vec(), now, 0, animations),
+                    ClipboardAction::Paste(text) => {
+                        out.paste_text = Some(text.to_owned());
+                        // The app may open a review dialog this frame.
+                        break;
+                    }
+                }
+                continue;
+            }
             match event {
+                // A modifier can be pressed and released in this frame.
+                // Clipboard events need its state at the time of the event.
+                Event::ModifiersChanged(modifiers) => mods_now = modifiers,
                 Event::Text(text) => {
+                    if cfg!(target_os = "macos") && mods_now.mac_cmd {
+                        continue;
+                    }
                     let printable = text.chars().count();
                     self.typed(session, keys::encode_text(&text, mods_now), now, printable, animations);
                 }
                 Event::Key { key, pressed: true, modifiers, .. } => {
+                    if cfg!(target_os = "macos") && modifiers.mac_cmd {
+                        continue;
+                    }
                     // Shift+PgUp/PgDn scroll locally instead of going out.
                     if modifiers.shift && !modifiers.ctrl && matches!(key, Key::PageUp | Key::PageDown) {
                         let mut emu = session.shared.emulator.lock();
@@ -581,31 +627,6 @@ impl TerminalView {
                     }
                     if let Some(bytes) = keys::encode_key(key, modifiers, app_cursor, backspace) {
                         self.typed(session, bytes, now, 0, animations);
-                    }
-                }
-                // egui turns Ctrl+C/X/V into clipboard events before they are
-                // keys. Only the Shift variants are clipboard commands here;
-                // the plain ones are control characters the far end needs
-                // (Ctrl+C interrupts a ping, Ctrl+V quotes the next key).
-                Event::Copy => {
-                    if mods_now.shift {
-                        out.copy = session.shared.emulator.lock().selection_text();
-                    } else {
-                        self.typed(session, vec![0x03], now, 0, animations);
-                    }
-                }
-                Event::Cut => {
-                    // Shift+Delete on Windows also arrives as Cut.
-                    let bytes = if mods_now.ctrl { vec![0x18] } else { b"\x1b[3;2~".to_vec() };
-                    self.typed(session, bytes, now, 0, animations);
-                }
-                Event::Paste(text) => {
-                    if mods_now.ctrl && !mods_now.shift {
-                        self.typed(session, vec![0x16], now, 0, animations);
-                    } else {
-                        out.paste_text = Some(text);
-                        // The app may open a review dialog this frame.
-                        break;
                     }
                 }
                 _ => {}
@@ -1429,6 +1450,42 @@ mod tests {
 
     use super::*;
     use crate::settings::{CursorBlink, NewText, Reveal, Scrolling};
+
+    #[test]
+    fn mac_clipboard_commands_copy_and_paste_without_sending_control_bytes() {
+        let command = egui::Modifiers { mac_cmd: true, command: true, ..egui::Modifiers::NONE };
+        let paste = Event::Paste("show version".into());
+        for modifiers in [command, egui::Modifiers { shift: true, ..command }, egui::Modifiers::NONE] {
+            assert_eq!(clipboard_action(&Event::Copy, modifiers, true), Some(ClipboardAction::Copy));
+            assert_eq!(clipboard_action(&Event::Cut, modifiers, true), Some(ClipboardAction::Copy));
+            assert_eq!(clipboard_action(&paste, modifiers, true), Some(ClipboardAction::Paste("show version")));
+        }
+        // These arrive as ordinary keys on macOS, rather than clipboard events.
+        let control = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
+        for (key, byte) in [(Key::C, 0x03), (Key::X, 0x18), (Key::V, 0x16)] {
+            assert_eq!(keys::encode_key(key, control, false, keys::Backspace::Del), Some(vec![byte]));
+        }
+    }
+
+    #[test]
+    fn windows_and_linux_clipboard_events_keep_terminal_control_sequences() {
+        let control = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE };
+        let shifted = egui::Modifiers { shift: true, ..control };
+        let paste = Event::Paste("show version".into());
+        assert_eq!(clipboard_action(&Event::Copy, control, false), Some(ClipboardAction::Terminal(b"\x03")));
+        assert_eq!(clipboard_action(&Event::Copy, shifted, false), Some(ClipboardAction::Copy));
+        assert_eq!(clipboard_action(&Event::Cut, control, false), Some(ClipboardAction::Terminal(b"\x18")));
+        assert_eq!(clipboard_action(&paste, control, false), Some(ClipboardAction::Terminal(b"\x16")));
+        assert_eq!(clipboard_action(&paste, shifted, false), Some(ClipboardAction::Paste("show version")));
+        assert_eq!(
+            clipboard_action(&Event::Cut, egui::Modifiers::SHIFT, false),
+            Some(ClipboardAction::Terminal(b"\x1b[3;2~"))
+        );
+        assert_eq!(
+            clipboard_action(&paste, egui::Modifiers::SHIFT, false),
+            Some(ClipboardAction::Paste("show version"))
+        );
+    }
 
     fn metrics() -> Metrics {
         Metrics { origin: pos2(10.0, 20.0), cell: vec2(8.0, 16.0), columns: 80, lines: 24 }

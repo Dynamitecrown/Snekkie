@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Snekkie
+Comment=A tabbed SSH and serial terminal
+Exec=snekkie
+Icon=io.github.Dynamitecrown.Snekkie
+Terminal=false
+Categories=Network;TerminalEmulator;
+Keywords=SSH;Serial;Telnet;Terminal;Console;
+StartupNotify=true
+StartupWMClass=snekkie

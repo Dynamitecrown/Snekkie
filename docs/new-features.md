@@ -75,7 +75,7 @@ Review the listed destinations and import notes, select the sessions you want, t
 
 Supported settings include SSH/Telnet/raw TCP destinations, ports, usernames, keepalives, supported serial line settings, font, scrollback, local echo and Backspace behavior. PuTTY's Default Settings entry and unsupported protocols or serial configurations are skipped with notes. Passwords and host-key trust are not imported. PuTTY colors, proxies, forwarding, remote commands and other unsupported options are not imported. The preview reports proxy/forwarding/command dependencies so you can review them before connecting.
 
-Snekkie uses Pageant/default SSH keys when the imported PuTTY profile allows an agent. A `.ppk` path is not imported as an OpenSSH key: load it into Pageant, or export it to OpenSSH format and select that file in Snekkie. Other saved key paths are imported as paths only; no private-key contents are read during import. Field mappings follow [PuTTY's settings implementation](https://raw.githubusercontent.com/github/putty/master/settings.c).
+Imported SSH sessions default to **Password**, regardless of PuTTY's agent setting. An explicit non-`.ppk` key path selects **Private key file** instead; only the path is imported, and no private-key contents are read during import. A `.ppk` path is not imported as an OpenSSH key: to use it, select **SSH agent / default keys** and load it into Pageant, or export it to OpenSSH format and select that file in Snekkie. Field mappings follow [PuTTY's settings implementation](https://raw.githubusercontent.com/github/putty/master/settings.c).
 
 ## Find and favorite saved sessions
 
