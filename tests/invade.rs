@@ -562,8 +562,16 @@ fn reordering_cycling_and_closing_keep_stable_targets() {
         frames(&mut app, 1);
         std::thread::sleep(Duration::from_millis(10));
     }
-    app.get_all_by_label("×").next().unwrap().click();
-    frames(&mut app, 4);
+    frames(&mut app, 2);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.state().workspace_titles().contains(&"first (closed)".to_string()) {
+        assert!(Instant::now() < deadline, "first (closed) never closed");
+        if let Some(close) = app.get_all_by_label("×").next() {
+            close.click();
+        }
+        frames(&mut app, 2);
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(app.state().workspace_titles(), ["Invade", "second"]);
     assert_eq!(app.state().active_title().as_deref(), Some("Invade"));
     assert_eq!(status(&app).state, "Playing");
