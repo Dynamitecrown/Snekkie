@@ -159,7 +159,7 @@ impl ProgressStore {
         let result = (|| {
             let file = match fs::File::open(&store.path) {
                 Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Progress::default()),
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(Progress::default()),
                 Err(error) => return Err(format!("it could not be read ({error})")),
             };
             let mut bytes = Vec::new();
