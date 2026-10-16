@@ -1,0 +1,7 @@
+# Scripts and packaging files run on Linux and macOS (and in WSL or Docker
+# from a Windows checkout), so keep LF endings even with core.autocrlf.
+*.sh text eol=lf
+*.py text eol=lf
+*.swift text eol=lf
+packaging/** text eol=lf
+installer/unix/** text eol=lf

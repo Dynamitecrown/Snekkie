@@ -20,10 +20,10 @@ pub const THEME_KEYS: [&str; 4] = ["fg", "bg", "cursor", "selection"];
 pub const DEFAULT_THEME: &str = "Snekkie Dark";
 
 /// Built-in presets: foreground, background, cursor, selection.
-pub const THEMES: [(&str, [&str; 4]); 18] = [
+pub const THEMES: [(&str, [&str; 4]); 21] = [
     ("Snekkie Dark", ["#d0d0d0", "#1a1a1a", "#3ad900", "#3a5a80"]),
-    ("Solarized Dark", ["#839496", "#002b36", "#268bd2", "#073642"]),
-    ("Solarized Light", ["#657b83", "#fdf6e3", "#268bd2", "#eee8d5"]),
+    ("Solarized Dark", ["#93a1a1", "#002b36", "#268bd2", "#073642"]),
+    ("Solarized Light", ["#52676f", "#fdf6e3", "#268bd2", "#eee8d5"]),
     ("Monokai", ["#f8f8f2", "#272822", "#a6e22e", "#49483e"]),
     ("Classic Green", ["#33ff33", "#0c0c0c", "#33ff33", "#1f4d1f"]),
     ("High Contrast", ["#ffffff", "#000000", "#ffff00", "#444444"]),
@@ -39,6 +39,9 @@ pub const THEMES: [(&str, [&str; 4]); 18] = [
     ("Purple Haze", ["#e8dcf5", "#21182d", "#c19aff", "#4b3665"]),
     ("Soft Grey", ["#dddddd", "#242424", "#f0f0f0", "#505050"]),
     ("Paper Light", ["#303642", "#f5f2e9", "#356d92", "#c9dce8"]),
+    ("Frost Light", ["#26364a", "#eff5fb", "#245c98", "#c3d7ec"]),
+    ("Copper Night", ["#f3dfcb", "#211812", "#eeac76", "#59402c"]),
+    ("Forest Night", ["#d8eadc", "#111f19", "#84d6a5", "#304f3c"]),
 ];
 
 /// Themes that have been renamed. A settings.json written before the app
@@ -137,6 +140,7 @@ fn preset(name: &str) -> Option<Theme> {
                     | "CRT Super"
                     | "Amber Terminal"
                     | "Paper Light"
+                    | "Frost Light"
                     | "E-Ink Super"
                     | "Blueprint Super"
                     | "Amber Super"
@@ -357,6 +361,7 @@ animation_kind! {
         Fade = "fade", "Fade", "The cursor fades out and back in.";
         Pulse = "pulse", "Pulse", "The cursor dims and brightens without ever disappearing.";
         Glow = "glow", "Glow", "The cursor stays on, with a soft halo that swells and fades around it.";
+        Steady = "steady", "Steady", "The cursor stays fully visible without blinking or a halo.";
     }
 }
 
@@ -411,6 +416,7 @@ animation_kind! {
         Heat = "heat", "Heat", "New text arrives in the cursor color and cools to its own color.";
         Hologram = "hologram", "Hologram", "New text materializes with a gentle holographic shimmer.";
         Matrix = "matrix", "Binary decode", "A shower of binary digits resolves into the actual output.";
+        Focus = "focus", "Focus", "New text fades in at almost full size and gently settles into focus.";
     }
 }
 
@@ -446,6 +452,8 @@ animation_kind! {
         Shimmer = "shimmer", "Shimmer", "A band of light passes across new lines.";
         Laser = "laser", "Laser sweep", "A glowing laser head sweeps across each new line.";
         Radar = "radar", "Radar pulse", "An expanding radar ring marks fresh output.";
+        Bookends = "bookends", "Bookends", "Short brackets mark the ends of fresh output and quickly fade without moving the text.";
+        Outline = "outline", "Outline", "A thin outline briefly frames fresh output, then fades without covering the text.";
     }
 }
 
@@ -502,6 +510,23 @@ impl Default for Animations {
 }
 
 impl Animations {
+    /// A quiet preset: immediate input, a steady cursor, and opacity-only output.
+    pub fn reduced_motion() -> Self {
+        Self {
+            enabled: true,
+            speed: 1.0,
+            cursor_motion: CursorMotion::Off,
+            cursor_blink: CursorBlink::Steady,
+            typed_text: TypedText::Off,
+            keystroke_burst: KeystrokeBurst::Off,
+            shake: Shake::Off,
+            new_text: NewText::Fade,
+            reveal: Reveal::Instant,
+            scrolling: Scrolling::Off,
+            new_lines: NewLines::Off,
+        }
+    }
+
     /// The speed, kept within the range Preferences offers. A hand-edited
     /// or unreadable value plays at normal speed.
     pub fn pace(&self) -> f32 {
@@ -947,6 +972,53 @@ mod tests {
         assert!(NewLines::ALL.contains(&NewLines::default()));
         assert_eq!(Reveal::default(), Reveal::Instant);
         assert_eq!(Shake::default(), Shake::Off);
+    }
+
+    #[test]
+    fn every_preset_has_readable_base_text_selection_and_cursor() {
+        fn luminance(color: Color32) -> f64 {
+            let linear = |v: u8| {
+                let v = f64::from(v) / 255.0;
+                if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+        }
+        let contrast = |a, b| {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        };
+        for (name, _) in THEMES {
+            let theme = preset(name).unwrap();
+            for (label, bg) in [("text", theme.bg), ("selected text", theme.selection)] {
+                let ratio = contrast(theme.fg, bg);
+                assert!(ratio >= 4.5, "{name} {label}: {ratio:.2}:1");
+            }
+            assert!(contrast(theme.cursor, theme.bg) >= 3.0, "{name} cursor");
+        }
+    }
+
+    #[test]
+    fn new_presets_and_motion_choices_survive_saving_and_named_theme_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path().join("settings.json"));
+        for name in ["Frost Light", "Copper Night", "Forest Night"] {
+            for new_lines in [NewLines::Bookends, NewLines::Outline] {
+                let settings = AppSettings {
+                    theme: name.into(),
+                    animations: Animations { new_text: NewText::Focus, new_lines, ..Animations::reduced_motion() },
+                    ..Default::default()
+                };
+                store.save(&settings).unwrap();
+                assert_eq!(store.load(), settings);
+                assert_eq!(store.load().colors(), preset(name).unwrap());
+            }
+            let mut settings = store.load();
+            settings.saved_themes.insert(name.into(), Theme::default().to_scheme());
+            store.save(&settings).unwrap();
+            let loaded = store.load();
+            assert_eq!(loaded.colors(), Theme::default(), "a new preset overwrote a saved theme");
+            assert_eq!(loaded.theme_names().iter().filter(|n| *n == name).count(), 1);
+        }
     }
 
     #[test]

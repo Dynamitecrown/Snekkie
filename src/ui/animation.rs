@@ -179,6 +179,8 @@ impl LineMark {
             }
             NewLines::Laser => (1.0 - t, start as f32 + width * ease_out_cubic(t)),
             NewLines::Radar => (0.6 * (1.0 - t), width.min(12.0) * ease_out_quad(t)),
+            NewLines::Bookends => (0.8 * (1.0 - ease_out_cubic(t)), 0.0),
+            NewLines::Outline => (0.45 * (1.0 - ease_out_quad(t)), 0.0),
         };
         LineMark { style, t, start, end, alpha, reach }
     }
@@ -1121,7 +1123,7 @@ pub fn blink_level(style: CursorBlink, now: f64, epoch: f64) -> f32 {
             }
         }
         CursorBlink::Pulse => 0.675 + 0.325 * (std::f64::consts::TAU * elapsed / PULSE).cos() as f32,
-        CursorBlink::Glow => 1.0,
+        CursorBlink::Glow | CursorBlink::Steady => 1.0,
     }
 }
 
@@ -1136,6 +1138,7 @@ pub fn blink_halo(style: CursorBlink, now: f64, epoch: f64) -> f32 {
 /// Seconds until the blink next needs drawing.
 pub fn blink_wake(style: CursorBlink, now: f64, epoch: f64) -> f64 {
     match style {
+        CursorBlink::Steady => f64::INFINITY,
         CursorBlink::Classic => BLINK - (now + BLINK_SLACK - epoch).max(0.0) % BLINK + BLINK_SLACK,
         CursorBlink::Fade => {
             let phase = (now - epoch).max(0.0) % (2.0 * BLINK);
@@ -1220,6 +1223,7 @@ fn new_text_duration(style: NewText) -> f32 {
         NewText::Heat => 0.5,
         NewText::Hologram => 0.32,
         NewText::Matrix => 0.38,
+        NewText::Focus => 0.20,
     }
 }
 
@@ -1233,6 +1237,8 @@ fn line_duration(style: NewLines) -> f32 {
         NewLines::Shimmer => 0.5,
         NewLines::Laser => 0.55,
         NewLines::Radar => 0.65,
+        NewLines::Bookends => 0.20,
+        NewLines::Outline => 0.25,
     }
 }
 
@@ -1293,6 +1299,7 @@ fn output_look(style: NewText, age: f32, seed: u32) -> Option<CellLook> {
         NewText::Rise => CellLook { alpha, offset_y: in_steps(0.35 * away), ..CellLook::PLAIN },
         NewText::Drop => CellLook { alpha, offset_y: in_steps(-0.35 * away), ..CellLook::PLAIN },
         NewText::Zoom => CellLook { alpha, scale: 1.0 - 0.6 * away, ..CellLook::PLAIN },
+        NewText::Focus => CellLook { alpha: ease_out_cubic(t), scale: 1.0 - 0.04 * away, ..CellLook::PLAIN },
         NewText::Decode | NewText::Matrix => {
             // Cells settle at slightly different moments, like they're being
             // cracked one by one. The tint goes by age alone, so cells shown
@@ -3233,6 +3240,84 @@ mod tests {
         assert!(typed_look(TypedText::Pop, 0.05).unwrap().moves());
         assert!(!output_look(NewText::Heat, 0.05, 7).unwrap().moves());
         assert!(output_look(NewText::Decode, 0.05, 7).unwrap().moves());
+    }
+
+    #[test]
+    fn gentle_output_styles_settle_and_reduced_motion_keeps_text_in_place() {
+        let focus = output_look(NewText::Focus, 0.0, 7).unwrap();
+        assert_eq!(focus.scale, 0.96);
+        assert_eq!(focus.offset_y, 0.0);
+        assert_eq!(focus.glyph, None);
+        assert_eq!(output_look(NewText::Focus, 0.2, 7), None);
+        for style in [NewLines::Bookends, NewLines::Outline] {
+            let settings = Animations { new_text: NewText::Focus, new_lines: style, ..Animations::reduced_motion() };
+            let mut anim = at_prompt(&settings);
+            let cells = grid(30, 3, &["Switch#", "Gi0/1 192.0.2.1 up", "Switch#"]);
+            anim.update(1.0, &settings, &snap(&cells, 30, 0, (2, 7)));
+            let mark = anim.line_mark(1.02, 1).unwrap();
+            assert_eq!(mark.style, style);
+            assert!(mark.alpha > 0.0 && mark.alpha < 1.0);
+            assert_eq!(anim.scroll_offset(1.02), 0.0);
+            assert_still(&anim, 1.26);
+        }
+        let settings = Animations::reduced_motion();
+        let mut anim = at_prompt(&settings);
+        anim.keystroke(1.0, &settings, 1, false, (0, 7));
+        let echo = grid(30, 3, &["Switch#s"]);
+        anim.update(1.01, &settings, &snap(&echo, 30, 0, (0, 8)));
+        assert_eq!(anim.cell(1.01, 0, 7), None, "typed input should be immediate");
+        let cells = grid(30, 3, &["Switch#s", "Status: up"]);
+        anim.update(1.02, &settings, &snap(&cells, 30, 0, (1, 10)));
+        for age in [0.0, 0.05, 0.10, 0.17] {
+            let look = output_look(settings.new_text, age, 7).unwrap();
+            assert!(!look.moves());
+            assert!(!look.hidden);
+            assert_eq!(look.flash, 0.0);
+        }
+        assert_eq!(anim.particles(1.02).count(), 0);
+        assert_still(&anim, 1.21);
+    }
+
+    #[test]
+    fn every_animation_choice_preserves_output_and_transient_effects_come_to_rest() {
+        let quiet = Animations { speed: 0.5, new_text: NewText::Off, ..Animations::reduced_motion() };
+        let mut choices = Vec::new();
+        choices.extend(CursorMotion::ALL.iter().map(|&cursor_motion| Animations { cursor_motion, ..quiet }));
+        choices.extend(CursorBlink::ALL.iter().map(|&cursor_blink| Animations { cursor_blink, ..quiet }));
+        choices.extend(TypedText::ALL.iter().map(|&typed_text| Animations { typed_text, ..quiet }));
+        choices.extend(KeystrokeBurst::ALL.iter().map(|&keystroke_burst| Animations { keystroke_burst, ..quiet }));
+        choices.extend(Shake::ALL.iter().map(|&shake| Animations { shake, ..quiet }));
+        choices.extend(NewText::ALL.iter().map(|&new_text| Animations { new_text, ..quiet }));
+        choices.extend(Reveal::ALL.iter().map(|&reveal| Animations { reveal, ..quiet }));
+        choices.extend(Scrolling::ALL.iter().map(|&scrolling| Animations { scrolling, ..quiet }));
+        choices.extend(NewLines::ALL.iter().map(|&new_lines| Animations { new_lines, ..quiet }));
+        for settings in choices {
+            let mut emu = Emulator::new(30, 3, 100, Arc::new(|_| {}));
+            let mut cells = Vec::new();
+            let mut anim = Animator::default();
+            emu.feed(b"Switch#");
+            anim.update(0.0, &settings, &capture(&emu, &mut cells));
+            anim.keystroke(1.0, &settings, 1, false, (0, 7));
+            emu.feed(b"s");
+            anim.update(1.02, &settings, &capture(&emu, &mut cells));
+            anim.keystroke(1.03, &settings, 0, true, (0, 8));
+            emu.feed("\r\nGi0/1 up\r\n日本語 ready\r\nStatus: up\r\nSwitch#".as_bytes());
+            anim.update(1.04, &settings, &capture(&emu, &mut cells));
+            let output = emu.all_text();
+            let mut now = 1.04;
+            while anim.next_wake(now).is_some() {
+                assert!(now < 7.0, "never settled: {settings:?}");
+                now += 0.02;
+                anim.update(now, &settings, &capture(&emu, &mut cells));
+            }
+            assert_still(&anim, now);
+            assert_eq!(emu.all_text(), output, "{settings:?}");
+            assert_eq!(anim.cursor(now, capture(&emu, &mut cells).cursor).cell(), Some((2, 7)));
+            for sample in 0..200 {
+                let level = blink_level(settings.cursor_blink, f64::from(sample) * 0.02, 0.0);
+                assert!(level.is_finite() && (0.0..=1.0).contains(&level), "{settings:?}: {level}");
+            }
+        }
     }
 
     #[test]

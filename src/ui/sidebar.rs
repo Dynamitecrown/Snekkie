@@ -109,6 +109,7 @@ pub struct Sidebar {
     favorites_only: bool,
     blocks_terminal_input: bool,
     focus_host: bool,
+    expand_form: bool,
     list_ports: fn() -> Vec<PortInfo>,
 }
 
@@ -131,6 +132,7 @@ impl Sidebar {
             favorites_only: false,
             blocks_terminal_input: false,
             focus_host: false,
+            expand_form: false,
             list_ports,
         };
         sidebar.reset(settings);
@@ -155,6 +157,7 @@ impl Sidebar {
 
     /// Fill the form from a profile.
     pub fn load(&mut self, profile: Profile) {
+        self.expand_form = true;
         self.page = Page::for_kind(profile.kind());
         self.draft = profile;
         self.refresh_ports();
@@ -265,8 +268,23 @@ impl Sidebar {
         accent: egui::Color32,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
-        style::section_heading(ui, "New session");
+        let expand = std::mem::take(&mut self.expand_form);
+        let form =
+            egui::CollapsingHeader::new(RichText::new("New session").color(style::secondary(ui)).size(12.0).strong())
+                .id_salt("new_session_form")
+                .default_open(true)
+                .open(expand.then_some(true))
+                .show_unindented(ui, |ui| self.form_ui(ui, monospace_fonts, accent, &mut actions));
+        self.blocks_terminal_input |= form.header_response.has_focus() || form.header_response.lost_focus();
+        if expand {
+            form.header_response.scroll_to_me(Some(egui::Align::TOP));
+        }
+        ui.add_space(12.0);
+        self.saved_ui(ui, store, &mut actions);
+        actions
+    }
 
+    fn form_ui(&mut self, ui: &mut Ui, monospace_fonts: &[String], accent: egui::Color32, actions: &mut Vec<Action>) {
         row(ui, "Type", |ui| {
             let mut kind = self.draft.kind();
             ComboBox::from_id_salt("kind").width(ui.available_width()).truncate().selected_text(kind.label()).show_ui(
@@ -281,7 +299,7 @@ impl Sidebar {
                 self.set_kind(kind);
             }
         });
-        row(ui, "Device", |ui| {
+        row(ui, "Highlighting", |ui| {
             ComboBox::from_id_salt("device_syntax")
                 .width(ui.available_width())
                 .truncate()
@@ -309,9 +327,9 @@ impl Sidebar {
             |ui| {
                 ui.set_width(ui.available_width());
                 match self.page {
-                    Page::Network => self.network_page(ui, &mut actions),
-                    Page::Serial => self.serial_page(ui, &mut actions),
-                    Page::Advanced => self.advanced_page(ui, monospace_fonts, &mut actions),
+                    Page::Network => self.network_page(ui, actions),
+                    Page::Serial => self.serial_page(ui, actions),
+                    Page::Advanced => self.advanced_page(ui, monospace_fonts, actions),
                 }
             },
         );
@@ -325,10 +343,6 @@ impl Sidebar {
                 Err(message) => actions.push(Action::Warn(message)),
             }
         }
-
-        ui.add_space(12.0);
-        self.saved_ui(ui, store, &mut actions);
-        actions
     }
 
     fn network_page(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -342,6 +356,9 @@ impl Sidebar {
         if self.draft.kind() == Kind::Ssh {
             self.ssh_login(ui, actions);
         }
+    }
+
+    fn keepalive_ui(&mut self, ui: &mut Ui) {
         row(ui, "Keepalive", |ui| {
             ui.add(
                 DragValue::new(&mut self.draft.keepalive)
@@ -376,14 +393,14 @@ impl Sidebar {
             );
         });
         self.draft.auth = auth.as_str().to_string();
-        row(ui, "Key file", |ui| {
-            ui.add_enabled_ui(auth == Auth::Key, |ui| {
+        if auth == Auth::Key {
+            row(ui, "Key file", |ui| {
                 with_trailing_button(ui, "Browse…", |ui, width| {
                     ui.add(text_field(&mut self.draft.key_file, "~/.ssh/id_ed25519", width));
                 })
                 .then(|| actions.push(Action::BrowseKey));
             });
-        });
+        }
     }
 
     fn serial_page(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -514,6 +531,9 @@ impl Sidebar {
     }
 
     fn advanced_page(&mut self, ui: &mut Ui, monospace_fonts: &[String], actions: &mut Vec<Action>) {
+        if self.draft.kind().is_network() {
+            self.keepalive_ui(ui);
+        }
         row(ui, "Scrollback lines", |ui| {
             ui.add(DragValue::new(&mut self.draft.scrollback).range(0..=200_000).speed(100.0))
         });
@@ -636,8 +656,12 @@ impl Sidebar {
         let query = self.saved_filter.trim().to_lowercase();
         let visible: Vec<&Profile> =
             store.profiles.iter().filter(|p| matches_saved_filter(p, &query, self.favorites_only)).collect();
-        let button_row = 34.0;
-        let list_height = (ui.available_height() - button_row).max(60.0);
+        let stacked =
+            button_width(ui, "Connect selected") + button_width(ui, "Edit connection") + ui.spacing().item_spacing.x
+                > ui.available_width();
+        let button_row =
+            (if stacked { 3.0 } else { 2.0 }) * (ui.spacing().interact_size.y + ui.spacing().item_spacing.y) + 8.0;
+        let list_height = (ui.available_height() - button_row).max(34.0);
         egui::Frame::new()
             .fill(ui.visuals().faint_bg_color)
             .stroke(egui::Stroke::new(1.0, style::border(ui)))
@@ -645,9 +669,11 @@ impl Sidebar {
             .inner_margin(4.0)
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                egui::ScrollArea::vertical().max_height(list_height - 10.0).auto_shrink([false, false]).show(
-                    ui,
-                    |ui| {
+                egui::ScrollArea::vertical()
+                    .min_scrolled_height(24.0)
+                    .max_height(list_height - 10.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                         if store.profiles.is_empty() {
                             ui.label(RichText::new("No saved sessions yet").color(style::secondary(ui)));
                         } else if visible.is_empty() {
@@ -675,8 +701,14 @@ impl Sidebar {
                                             actions.push(Action::ToggleFavorite(profile.name.clone()));
                                         }
                                         ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                                            let name = RichText::new(&profile.name);
+                                            let name = if selected {
+                                                name.color(ui.visuals().selection.stroke.color)
+                                            } else {
+                                                name
+                                            };
                                             ui.add(
-                                                egui::Button::selectable(selected, &profile.name)
+                                                egui::Button::selectable(selected, name)
                                                     .truncate()
                                                     .min_size(egui::vec2(0.0, 22.0)),
                                             )
@@ -710,34 +742,67 @@ impl Sidebar {
                                 }
                                 if response.double_clicked() {
                                     self.selected_saved = Some(profile.name.clone());
-                                    self.load((*profile).clone());
-                                    actions.push(Action::Connect(self.collect()));
+                                    actions.push(Action::Connect((*profile).clone()));
                                 }
                             });
                         }
-                    },
-                );
+                    });
             });
+        let selected = self
+            .selected_saved
+            .as_deref()
+            .and_then(|name| store.get(name))
+            .filter(|p| matches_saved_filter(p, &query, self.favorites_only))
+            .cloned();
+        let width = if stacked {
+            ui.available_width()
+        } else {
+            ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).floor()
+        };
+        let selected_actions = |ui: &mut Ui| {
+            let connect = ui
+                .add_enabled(selected.is_some(), egui::Button::new("Connect selected").min_size([width, 24.0].into()));
+            self.blocks_terminal_input |= connect.has_focus() || connect.lost_focus();
+            if connect
+                .on_hover_text(selected.as_ref().map_or_else(
+                    || "Select a saved session to connect.".to_string(),
+                    |p| format!("Connect to {} using its saved settings.", p.name),
+                ))
+                .clicked()
+                && let Some(profile) = &selected
+            {
+                match validate(profile) {
+                    Ok(()) => actions.push(Action::Connect(profile.clone())),
+                    Err(message) => actions.push(Action::Warn(message)),
+                }
+            }
+            let edit =
+                ui.add_enabled(selected.is_some(), egui::Button::new("Edit connection").min_size([width, 24.0].into()));
+            self.blocks_terminal_input |= edit.has_focus() || edit.lost_focus();
+            if edit.on_hover_text("Load the selected saved session into the form without connecting.").clicked()
+                && let Some(profile) = &selected
+            {
+                self.load(profile.clone());
+                self.focus_host = true;
+                ui.ctx().request_repaint();
+            }
+        };
+        if stacked {
+            ui.vertical(selected_actions);
+        } else {
+            ui.horizontal(selected_actions);
+        }
         ui.horizontal(|ui| {
             let more_width = button_width(ui, MORE);
             // Rounded down: even a fraction too wide would grow the resizable panel.
-            let width = ((ui.available_width() - more_width - ui.spacing().item_spacing.x * 3.0) / 3.0).floor();
-            let selected = self
-                .selected_saved
-                .clone()
-                .filter(|name| store.get(name).is_some_and(|p| matches_saved_filter(p, &query, self.favorites_only)));
-            if ui.add_enabled(selected.is_some(), egui::Button::new("Load").min_size([width, 0.0].into())).clicked()
-                && let Some(profile) = selected.as_deref().and_then(|n| store.get(n))
-            {
-                self.load(profile.clone());
-            }
+            let width = ((ui.available_width() - more_width - ui.spacing().item_spacing.x * 2.0) / 2.0).floor();
             if ui.add(egui::Button::new("Save…").min_size([width, 0.0].into())).clicked() {
                 actions.push(Action::Save(self.collect()));
             }
             if ui.add_enabled(selected.is_some(), egui::Button::new("Delete").min_size([width, 0.0].into())).clicked()
-                && let Some(name) = selected
+                && let Some(profile) = selected
             {
-                actions.push(Action::Delete(name));
+                actions.push(Action::Delete(profile.name));
             }
             // Import/export are also under Settings; here they share a menu so
             // the list keeps its height.
@@ -831,11 +896,14 @@ fn with_trailing_button(ui: &mut Ui, button: &str, add: impl FnOnce(&mut Ui, f32
 
 /// Combo of installed monospace fonts, with "(system monospace)" for the
 /// default. A font the profile names that isn't installed stays listed.
-pub fn font_picker(ui: &mut Ui, id: &str, family: &mut String, monospace_fonts: &[String]) {
+pub fn font_picker(ui: &mut Ui, id: &str, family: &mut String, monospace_fonts: &[String]) -> egui::Response {
     let label = if family.is_empty() { "(system monospace)".to_string() } else { family.clone() };
-    ComboBox::from_id_salt(id).width(ui.available_width()).truncate().selected_text(label).height(300.0).show_ui(
-        ui,
-        |ui| {
+    ComboBox::from_id_salt(id)
+        .width(ui.available_width())
+        .truncate()
+        .selected_text(label)
+        .height(300.0)
+        .show_ui(ui, |ui| {
             ui.selectable_value(family, String::new(), "(system monospace)");
             if !family.is_empty() && !monospace_fonts.contains(family) {
                 let current = family.clone();
@@ -844,8 +912,8 @@ pub fn font_picker(ui: &mut Ui, id: &str, family: &mut String, monospace_fonts: 
             for name in monospace_fonts {
                 ui.selectable_value(family, name.clone(), name);
             }
-        },
-    );
+        })
+        .response
 }
 
 #[cfg(test)]
@@ -926,15 +994,16 @@ mod tests {
         harness.run_ok();
         assert!(harness.query_by_label("Alpha").is_none());
         harness.get_by_label("Beta");
-        assert!(harness.get_by_label("Load").accesskit_node().is_disabled());
+        assert!(harness.get_by_label("Edit connection").accesskit_node().is_disabled());
+        assert!(harness.get_by_label("Connect selected").accesskit_node().is_disabled());
         assert!(harness.get_by_label("Delete").accesskit_node().is_disabled());
         assert_eq!(harness.state().sidebar.selected_saved(), Some("Alpha"));
         assert!(harness.state().sidebar.blocks_terminal_input());
         assert!(harness.state().actions.is_empty());
         harness.get_by_label("Clear session filter").click();
         harness.run_ok();
-        assert!(!harness.get_by_label("Load").accesskit_node().is_disabled());
-        harness.get_by_label("Load").click();
+        assert!(!harness.get_by_label("Edit connection").accesskit_node().is_disabled());
+        harness.get_by_label("Edit connection").click();
         harness.run_ok();
         assert_eq!(harness.state().sidebar.draft.host, "192.0.2.10");
         assert_eq!(harness.state().sidebar.collect().name, "Alpha");
@@ -948,7 +1017,7 @@ mod tests {
         harness.get_by_label("Favorites only").click();
         harness.run_ok();
         assert!(harness.query_by_label("Alpha").is_none());
-        assert!(harness.get_by_label("Load").accesskit_node().is_disabled());
+        assert!(harness.get_by_label("Edit connection").accesskit_node().is_disabled());
         harness.get_by_label("Unfavorite Beta").click();
         harness.run_ok();
         assert_eq!(harness.state().actions, [Action::ToggleFavorite("Beta".into())]);
@@ -957,7 +1026,90 @@ mod tests {
         harness.get_by_label("Favorites only").click();
         harness.run_ok();
         harness.get_by_label("Favorite Alpha");
-        assert!(!harness.get_by_label("Load").accesskit_node().is_disabled());
+        assert!(!harness.get_by_label("Edit connection").accesskit_node().is_disabled());
+    }
+
+    #[test]
+    fn connecting_a_saved_profile_preserves_the_draft_and_all_saved_options() {
+        let mut harness = saved_sessions_harness();
+        let saved = harness.state_mut().store.profiles.first_mut().unwrap();
+        saved.port = 2222;
+        saved.keepalive = 123;
+        saved.device_syntax = "cisco_ios".into();
+        saved.font_size = 18;
+        saved.tab_color = "#123456".into();
+        let expected = saved.clone();
+        let draft = harness.state_mut().sidebar.draft.clone();
+        harness.get_by_label("Alpha").click();
+        harness.run_ok();
+        harness.get_by_label("Connect selected").click();
+        harness.run_ok();
+        assert_eq!(harness.state().actions, [Action::Connect(expected.clone())]);
+        assert_eq!(harness.state().sidebar.draft, draft);
+
+        harness.state_mut().actions.clear();
+        // Pointer events normally advance this harness by 250 ms each.
+        // Pin the two clicks 100 ms apart, as they would be in real use.
+        harness.input_mut().time = Some(100.0);
+        harness.get_by_label("Alpha").click();
+        harness.run_ok();
+        harness.input_mut().time = Some(100.1);
+        harness.get_by_label("Alpha").click();
+        harness.run_ok();
+        assert_eq!(harness.state().actions, [Action::Connect(expected)]);
+        assert_eq!(harness.state().sidebar.draft, draft);
+    }
+
+    #[test]
+    fn collapsed_form_leaves_saved_actions_visible_and_editing_reopens_it() {
+        let mut harness = saved_sessions_harness_sized([280.0, 320.0]);
+        harness.get_by_label("New session").click();
+        harness.run_ok();
+        assert!(harness.query_by_label("Host").is_none());
+        for label in ["Alpha", "Beta", "Connect selected", "Edit connection", "Save…", "Delete", "More profile actions"]
+        {
+            let rect = harness.get_by_label(label).rect();
+            assert!(rect.top() >= 0.0 && rect.bottom() <= 320.0 && rect.right() <= 280.0, "{label}: {rect:?}");
+        }
+        harness.get_by_label("Alpha").click();
+        harness.run_ok();
+        harness.get_by_label("Edit connection").click();
+        harness.run_ok();
+        harness.get_by_label("Host");
+        assert_eq!(harness.state().sidebar.draft.host, "192.0.2.10");
+        assert!(harness.state().actions.is_empty());
+        harness.get_by_label("New session").click();
+        harness.run_ok();
+        harness.state_mut().sidebar.reset(&AppSettings::default());
+        harness.run_ok();
+        harness.get_by_label("Host");
+        assert!(harness.state().sidebar.draft.host.is_empty());
+    }
+
+    #[test]
+    fn key_file_is_only_shown_for_key_auth_and_keepalive_is_only_in_network_advanced() {
+        let mut harness = saved_sessions_harness();
+        assert!(harness.query_by_label("Key file").is_none());
+        assert!(harness.query_by_label("Keepalive").is_none());
+        harness.get_by_label("Highlighting");
+        harness.get_by_value("Off");
+        harness.state_mut().sidebar.draft.auth = Auth::Key.as_str().into();
+        harness.run_ok();
+        harness.get_by_label("Key file");
+        harness.state_mut().sidebar.draft.key_file = "lab_key".into();
+        harness.state_mut().sidebar.draft.auth = Auth::Password.as_str().into();
+        harness.run_ok();
+        assert!(harness.query_by_label("Key file").is_none());
+        assert_eq!(harness.state().sidebar.draft.key_file, "lab_key");
+        harness.get_by_label("Advanced").click();
+        harness.run_ok();
+        harness.get_by_label("Keepalive");
+        harness.get_by_value("60 s");
+        harness.state_mut().sidebar.set_kind(Kind::Serial);
+        harness.run_ok();
+        harness.get_by_label("Advanced").click();
+        harness.run_ok();
+        assert!(harness.query_by_label("Keepalive").is_none());
     }
 
     #[test]

@@ -2,6 +2,9 @@
 
 **[Download Snekkie for Windows](https://github.com/Dynamitecrown/Snekkie/releases/download/installer-v1.0.0/Snekkie-Setup.exe)** (`Snekkie-Setup.exe`, master version 1.0.0).
 
+For Linux and macOS, the equivalent is the `snekkie-install.sh` script described in
+[Installing on Linux and macOS](linux-and-macos.md).
+
 `Snekkie-Setup.exe` is a small Windows online installer. It asks GitHub for the
 latest published stable Snekkie release, downloads that release's full installer,
 verifies it, and opens normal setup. The full installer handles installation,

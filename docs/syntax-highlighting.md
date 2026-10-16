@@ -1,8 +1,8 @@
 # Syntax highlighting
 
-Choose the platform in the session form's **Device** menu. The choice is saved with the connection profile; **None** keeps device output in its original colors. Existing `cisco_ios` profiles continue to work with the **Cisco IOS / IOS XE** option.
+Choose the platform in the session form's **Highlighting** menu. The choice is saved with the connection profile; **Off** keeps device output in its original colors. Existing `cisco_ios` profiles continue to work with the **Cisco IOS / IOS XE** option.
 
-Use **Settings → Preferences → Highlighting → Intensity** to control the amount of highlighting. It applies to all open and new sessions when you click **OK**. **Cancel** discards changes. The preview device changes only the sample, so you can compare platforms without changing a session.
+Use **Settings → Preferences → Highlighting → Intensity** to control the amount of highlighting. It applies to all open and new sessions when you click **Save changes**. **Cancel** discards changes. The preview device changes only the sample, so you can compare platforms without changing a session.
 
 | Level | Adds highlighting for |
 | --- | --- |
@@ -14,7 +14,7 @@ Use **Settings → Preferences → Highlighting → Intensity** to control the a
 
 Each level includes the lower levels. Important fields keep their color as detail increases. Addresses are validated to avoid coloring impossible IPs or partial matches inside version strings. Prompts can be recognized before echoed commands, including Cisco configuration prompts, Junos `user@host` prompts and FortiOS contexts. Colors adapt to light terminal backgrounds.
 
-Monochrome themes take precedence over syntax colors. To see syntax colors with a monochrome preset, clear **Monochrome output** under **General → Theme colors** and save the customized theme. CRT glow and the retro interface can remain enabled independently.
+Monochrome themes take precedence over syntax colors. To see syntax colors with a monochrome preset, clear **Monochrome output** under **Appearance → Theme colors** and save the customized theme. CRT glow and the retro interface can remain enabled independently.
 
 Highlighting is a text display overlay, not a complete configuration parser or security audit. It colors recognizable terms in commands, configuration and output; arbitrary names and vendor/version-specific syntax may remain uncolored. It never changes the actual output, transmitted commands, clipboard text, logs or exports.
 

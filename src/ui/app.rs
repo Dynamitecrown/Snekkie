@@ -13,6 +13,7 @@ use egui::{
 use parking_lot::Mutex;
 
 use super::fonts::{self, Fonts};
+use super::invade::{InvadeAction, InvadeOptions, InvadeTab};
 use super::paste::{Action as PasteAction, PastePreview};
 use super::preferences::{self, Preferences};
 use super::profile_transfer::ProfileTransfer;
@@ -22,6 +23,7 @@ use super::snippets::{Action as SnippetAction, SnippetTarget, SnippetWindow};
 use super::style;
 use super::terminal_view::{TerminalView, TextExport, ViewOptions};
 use super::updater::{self, Updater};
+use crate::invade::EndReason;
 use crate::network::{NetworkAccess, NetworkQuestion};
 use crate::paste::{PasteQueue, PasteTarget};
 use crate::profiles::{Auth, Kind, Profile, ProfileStore};
@@ -36,6 +38,7 @@ use crate::update::{self, Release};
 /// How long a status bar message stays up, in seconds.
 const FLASH_SECONDS: f64 = 4.0;
 
+#[cfg(not(target_os = "macos"))]
 const SHORTCUTS: &str = "\
 Ctrl+Shift+N    New session
 Ctrl+Shift+D    Duplicate current session
@@ -55,6 +58,29 @@ Ctrl+Shift+B    Send break (serial, telnet)
 
 Ctrl+B          Toggle sidebar
 Ctrl+,          Preferences";
+
+#[cfg(target_os = "macos")]
+const SHORTCUTS: &str = "\
+Cmd+Shift+N     New session
+Cmd+Shift+D     Duplicate current session
+Cmd+Shift+R     Reconnect
+Cmd+W           Close tab
+Ctrl+Tab        Next tab (Ctrl+Shift+Tab: previous)
+Cmd+Q           Quit
+
+Cmd+C / Cmd+X   Copy      (selecting also copies)
+Cmd+V           Paste     (right-click pastes by default; configurable)
+Cmd+A           Select all
+Cmd+F           Find in output (Enter: older, Shift+Enter: newer)
+Cmd+Shift+S     Command snippets
+Ctrl+Right-click  Terminal context menu (copy, save text, selection)
+Shift+PgUp/Dn   Scroll back through history
+Cmd+Shift+L     Clear screen and scrollback
+Cmd+Shift+B     Send break (serial, telnet)
+
+Cmd+B           Toggle sidebar
+Cmd+,           Preferences
+Ctrl+C/X/V      Send terminal control characters";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -89,6 +115,7 @@ enum InputAction {
 
 enum Dialog {
     Message { title: String, text: String, monospace: bool },
+    About { text: String, focus: bool },
     Confirm { title: String, text: String, action: ConfirmAction },
     Input { title: String, label: String, text: String, secret: bool, action: InputAction, focus: bool },
     HostKey(Box<HostKeyQuestion>),
@@ -130,12 +157,85 @@ enum Command {
     PreviousTab,
 }
 
+impl Command {
+    /// These commands act on the selected connection rather than the app.
+    fn targets_session(self) -> bool {
+        matches!(
+            self,
+            Self::Duplicate
+                | Self::Reconnect
+                | Self::Copy
+                | Self::Paste
+                | Self::SelectAll
+                | Self::Find
+                | Self::ClearScreen
+                | Self::ResetTerminal
+                | Self::SendBreak
+        )
+    }
+}
+
+/// Match physical modifiers explicitly: macOS Command belongs to the app,
+/// while Control still belongs to the remote terminal. Ctrl+Tab remains a
+/// tab switch on every platform; Cmd+Tab is reserved by macOS.
+fn shortcut_command(key: Key, modifiers: Modifiers, macos: bool) -> Option<Command> {
+    if modifiers.alt {
+        return None;
+    }
+    if modifiers.ctrl && !modifiers.mac_cmd && key == Key::Tab {
+        return Some(if modifiers.shift { Command::PreviousTab } else { Command::NextTab });
+    }
+    let app_modifier = if macos { modifiers.mac_cmd && !modifiers.ctrl } else { modifiers.ctrl && !modifiers.mac_cmd };
+    if !app_modifier {
+        return None;
+    }
+    let table = [
+        (true, Key::N, Command::NewSession),
+        (true, Key::D, Command::Duplicate),
+        (true, Key::R, Command::Reconnect),
+        (false, Key::W, Command::CloseTab),
+        (false, Key::Q, Command::Quit),
+        (!macos, Key::A, Command::SelectAll),
+        (false, Key::F, Command::Find),
+        (true, Key::S, Command::Snippets),
+        (true, Key::L, Command::ClearScreen),
+        (true, Key::B, Command::SendBreak),
+        (false, Key::B, Command::ToggleSidebar),
+        (false, Key::Comma, Command::Preferences),
+        (false, Key::PageDown, Command::NextTab),
+        (false, Key::PageUp, Command::PreviousTab),
+    ];
+    table
+        .into_iter()
+        .find_map(|(shift, candidate, command)| (key == candidate && modifiers.shift == shift).then_some(command))
+}
+
+fn shortcut_label(shortcut: &str, macos: bool) -> std::borrow::Cow<'_, str> {
+    if !macos || matches!(shortcut, "Ctrl+Tab" | "Ctrl+Shift+Tab") {
+        return shortcut.into();
+    }
+    match shortcut {
+        "Ctrl+Shift+C" => "Cmd+C".into(),
+        "Ctrl+Shift+V" => "Cmd+V".into(),
+        "Ctrl+Shift+A" => "Cmd+A".into(),
+        _ => shortcut.replacen("Ctrl+", "Cmd+", 1).into(),
+    }
+}
+
 struct Tab {
     session: Session,
     view: TerminalView,
     color: Option<Color32>,
     /// Clearing a color is an explicit override, distinct from using the default.
     color_override: bool,
+}
+
+/// What a tab in the strip shows: a real connection, found by its stable
+/// session ID, or the Invade game. The game is never a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceTabId {
+    Session(u64),
+    Invade,
 }
 
 /// Where the app keeps its files; replaced in tests.
@@ -160,8 +260,25 @@ pub struct SnekkieApp {
     settings_store: SettingsStore,
     settings: AppSettings,
     sidebar: Sidebar,
+    /// Connection tabs, in the order they are shown.
     tabs: Vec<Tab>,
-    active: usize,
+    /// The selected tab, if any.
+    active: Option<WorkspaceTabId>,
+    /// The singleton game tab, and where it sits among the connection tabs.
+    invade: Option<Box<InvadeTab>>,
+    /// Invade's records once its tab has closed, so progress that could not
+    /// be saved is neither lost nor read back stale on reopening.
+    invade_store: Option<crate::invade::ProgressStore>,
+    invade_slot: usize,
+    /// The session sidebar shown on request while Invade is selected; it is
+    /// otherwise hidden there without changing the saved preference.
+    invade_sidebar: bool,
+    /// Keys still held from the game after leaving it, kept from reaching a
+    /// terminal until they are released.
+    suppressed_keys: Vec<Key>,
+    /// Shift used for game mobility must be released before it can modify
+    /// terminal input after leaving the game.
+    suppressed_shift: bool,
     runtime: tokio::runtime::Runtime,
     fonts: Fonts,
     host_keys: Arc<Mutex<VecDeque<HostKeyQuestion>>>,
@@ -219,7 +336,13 @@ impl SnekkieApp {
             settings_store,
             settings,
             tabs: Vec::new(),
-            active: 0,
+            active: None,
+            invade: None,
+            invade_store: None,
+            invade_slot: 0,
+            invade_sidebar: false,
+            suppressed_keys: Vec::new(),
+            suppressed_shift: false,
             runtime,
             fonts: Fonts::new(),
             host_keys: Arc::new(Mutex::new(VecDeque::new())),
@@ -279,12 +402,151 @@ impl SnekkieApp {
         }
     }
 
+    /// The selected connection tab; none while Invade is selected.
     fn current(&self) -> Option<&Tab> {
-        self.tabs.get(self.active)
+        self.active_index().map(|index| &self.tabs[index])
+    }
+
+    fn current_mut(&mut self) -> Option<&mut Tab> {
+        let index = self.active_index()?;
+        self.tabs.get_mut(index)
+    }
+
+    fn active_index(&self) -> Option<usize> {
+        match self.active {
+            Some(WorkspaceTabId::Session(id)) => self.tab_index(id),
+            _ => None,
+        }
     }
 
     fn tab_index(&self, id: u64) -> Option<usize> {
         self.tabs.iter().position(|t| t.session.id == id)
+    }
+
+    fn invade_selected(&self) -> bool {
+        self.active == Some(WorkspaceTabId::Invade) && self.invade.is_some()
+    }
+
+    /// An unfinished game counts as activity, like a connected session.
+    fn invade_unfinished(&self) -> bool {
+        self.invade.as_ref().is_some_and(|game| game.unfinished())
+    }
+
+    /// Every tab in the order the strip shows them.
+    fn workspace_order(&self) -> Vec<WorkspaceTabId> {
+        let mut order: Vec<_> = self.tabs.iter().map(|t| WorkspaceTabId::Session(t.session.id)).collect();
+        if self.invade.is_some() {
+            order.insert(self.invade_slot.min(order.len()), WorkspaceTabId::Invade);
+        }
+        order
+    }
+
+    /// Rearrange the tabs to `order`, which holds the same tabs.
+    fn set_workspace_order(&mut self, order: &[WorkspaceTabId]) {
+        let mut tabs = std::mem::take(&mut self.tabs);
+        let mut sorted = Vec::with_capacity(tabs.len());
+        for id in order {
+            match id {
+                WorkspaceTabId::Invade => self.invade_slot = sorted.len(),
+                WorkspaceTabId::Session(session) => {
+                    if let Some(index) = tabs.iter().position(|t| t.session.id == *session) {
+                        sorted.push(tabs.remove(index));
+                    }
+                }
+            }
+        }
+        sorted.append(&mut tabs);
+        self.tabs = sorted;
+    }
+
+    /// Show a tab. Leaving Invade pauses it; returning takes Resume.
+    fn select_workspace_tab(&mut self, id: WorkspaceTabId) {
+        match id {
+            WorkspaceTabId::Session(session) => {
+                let Some(index) = self.tab_index(session) else { return };
+                if self.invade_selected() {
+                    self.leave_invade();
+                }
+                self.active = Some(id);
+                self.tabs[index].view.focus();
+            }
+            WorkspaceTabId::Invade => {
+                if self.invade.is_some() {
+                    self.active = Some(id);
+                    self.invade_sidebar = false;
+                }
+            }
+        }
+    }
+
+    fn leave_invade(&mut self) {
+        if let Some(game) = &mut self.invade {
+            self.suppressed_keys.extend(game.held_keys());
+            game.pause();
+        }
+        self.invade_sidebar = false;
+    }
+
+    fn invade_path(&self) -> PathBuf {
+        self.settings_store.path.with_file_name(crate::invade::PROGRESS_FILE)
+    }
+
+    /// From About Snekkie, open the game once or show the one that is open.
+    fn open_invade(&mut self) {
+        if self.invade.is_none() {
+            let seed =
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+            let game = match self.invade_store.take() {
+                Some(store) => InvadeTab::with_store(store, seed),
+                None => InvadeTab::open(self.invade_path(), seed),
+            };
+            self.invade = Some(Box::new(game));
+            self.invade_slot = self.tabs.len();
+        }
+        self.select_workspace_tab(WorkspaceTabId::Invade);
+    }
+
+    /// Closing the game's tab ends and records its run.
+    fn close_invade(&mut self, reason: EndReason) {
+        let order = self.workspace_order();
+        let position = order.iter().position(|t| *t == WorkspaceTabId::Invade);
+        let Some(mut game) = self.invade.take() else { return };
+        game.finish(reason);
+        self.invade_sidebar = false;
+        if self.active == Some(WorkspaceTabId::Invade) {
+            self.suppressed_keys.extend(game.held_keys());
+            self.active = None;
+            if let Some(next) = position.and_then(|p| neighbor(&order, p)) {
+                self.select_workspace_tab(next);
+            }
+        }
+        // The game's own warning closes with it; say it here instead.
+        if let Some(warning) = game.save_warning() {
+            self.message("Invade", warning);
+        }
+        self.invade_store = Some(game.into_store());
+    }
+
+    fn close_workspace_tab(&mut self, id: WorkspaceTabId, confirmed: bool) {
+        match id {
+            WorkspaceTabId::Session(session) => self.close_tab(session, confirmed),
+            WorkspaceTabId::Invade => self.close_invade(EndReason::Closed),
+        }
+    }
+
+    /// The active stores an export must never overwrite.
+    fn protected_stores(&self) -> [PathBuf; 5] {
+        [
+            self.store.path.clone(),
+            self.settings_store.path.clone(),
+            self.settings_store.path.with_file_name("network.ini"),
+            self.snippet_store.path.clone(),
+            self.invade_path(),
+        ]
+    }
+
+    fn is_protected_store(&self, path: &Path) -> bool {
+        self.protected_stores().iter().any(|store| same_file_path(path, store))
     }
 
     fn clipboard_text(&mut self) -> Option<String> {
@@ -296,6 +558,10 @@ impl SnekkieApp {
 
     fn finish_text_export(&mut self, ctx: &egui::Context, path: Option<PathBuf>, export: TextExport) {
         let Some(path) = path else { return };
+        if self.is_protected_store(&path) {
+            self.message("Save terminal output", "Choose a different file. Saving terminal text over Snekkie's active profiles, preferences, snippets or Invade progress would replace saved data.");
+            return;
+        }
         let (result, verb) = match export {
             TextExport::Save(text) => (std::fs::write(&path, text), "Saved terminal text to"),
             TextExport::Append(text) => (append_terminal_text(&path, &text), "Appended terminal text to"),
@@ -344,17 +610,19 @@ impl SnekkieApp {
     /// sessions off.
     fn request_install(&mut self, ctx: &egui::Context) {
         let live = self.live_sessions();
-        if live == 0 {
+        let game = self.invade_unfinished();
+        if live == 0 && !game {
             self.install_update(ctx);
         } else {
-            self.confirm(
-                "Restart to update",
-                format!(
-                    "Snekkie will close to install the update, then start again. \
-                     This disconnects {live} session(s). Restart now?"
-                ),
-                ConfirmAction::InstallUpdate,
-            );
+            let mut text = String::from("Snekkie will close to install the update, then start again.");
+            if live > 0 {
+                text.push_str(&format!(" This disconnects {live} session(s)."));
+            }
+            if game {
+                text.push_str(" Your Invade run ends and is recorded.");
+            }
+            text.push_str(" Restart now?");
+            self.confirm("Restart to update", text, ConfirmAction::InstallUpdate);
         }
     }
 
@@ -370,6 +638,12 @@ impl SnekkieApp {
         }
     }
 
+    /// A downloaded update installs by itself only when nothing would be
+    /// cut off: no connected session, no open dialog, no unfinished game.
+    fn can_install_silently(&self) -> bool {
+        self.live_sessions() == 0 && !self.modal_open() && !self.invade_unfinished()
+    }
+
     fn update_events(&mut self, ctx: &egui::Context) {
         self.updater.set_offline(self.settings.offline_mode);
         for event in self.updater.poll(ctx) {
@@ -383,7 +657,7 @@ impl SnekkieApp {
                 updater::Event::Downloaded => {
                     // Straight on to installing, unless that would cut off
                     // a session or something the user is in the middle of.
-                    if self.live_sessions() == 0 && !self.modal_open() {
+                    if self.can_install_silently() {
                         self.install_update(ctx);
                     } else {
                         self.flash(ctx, "Update downloaded. Click “Restart to update” when you're ready.");
@@ -471,8 +745,9 @@ impl SnekkieApp {
                 let mut view = TerminalView::default();
                 view.focus();
                 let color = crate::settings::parse_hex(&session.profile.tab_color);
+                let id = session.id;
                 self.tabs.push(Tab { session, view, color, color_override: false });
-                self.active = self.tabs.len() - 1;
+                self.select_workspace_tab(WorkspaceTabId::Session(id));
             }
             Target::Reconnect(id) => {
                 let Some(index) = self.tab_index(id) else { return };
@@ -483,8 +758,7 @@ impl SnekkieApp {
                 tab.view.clear_highlight_cache();
                 tab.view.reset_animations();
                 tab.session.connect(cx);
-                tab.view.focus();
-                self.active = index;
+                self.select_workspace_tab(WorkspaceTabId::Session(id));
             }
         }
     }
@@ -500,18 +774,26 @@ impl SnekkieApp {
             );
             return;
         }
+        let order = self.workspace_order();
+        let position = order.iter().position(|t| *t == WorkspaceTabId::Session(id));
         let tab = self.tabs.remove(index);
+        if index < self.invade_slot {
+            self.invade_slot -= 1;
+        }
         if self.paste_queue.as_ref().is_some_and(|q| q.target.id == id) {
             self.paste_queue = None;
         }
         tab.session.shutdown();
         self.retired_log_workers.extend(tab.session.take_log_workers());
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len().saturating_sub(1);
-        } else if index < self.active {
-            self.active -= 1;
-        }
-        if let Some(tab) = self.tabs.get_mut(self.active) {
+        if self.active == Some(WorkspaceTabId::Session(id)) {
+            // Its neighbor takes its place.
+            self.active = None;
+            if let Some(next) = position.and_then(|p| neighbor(&order, p)) {
+                self.select_workspace_tab(next);
+            }
+        } else if let Some(tab) = self.current_mut() {
+            // A background tab closed: the selection, and the game if it is
+            // selected, keep the keyboard.
             tab.view.focus();
         }
     }
@@ -522,13 +804,21 @@ impl SnekkieApp {
         if self.settings.offline_mode
             && matches!(command, Command::CheckForUpdates | Command::ShowUpdate | Command::InstallUpdate)
         {
-            self.message("Offline mode", "Online updates are disabled. Turn off Offline mode under Settings → Preferences → General to check or download updates.");
+            self.message("Offline mode", "Online updates are disabled. Turn off Offline mode under Settings → Preferences → Network to check or download updates.");
+            return;
+        }
+        if self.invade_selected() && command.targets_session() {
+            // Terminal commands never reach a connection from the game tab.
+            self.flash(ctx, "Select a connection tab first: Invade is selected.");
             return;
         }
         match command {
             Command::NewSession => {
                 self.settings.show_sidebar = true;
                 self.sidebar.reset(&self.settings);
+                if self.invade_selected() {
+                    self.reveal_sidebar_over_invade();
+                }
             }
             Command::Duplicate => {
                 if let Some(profile) = self.current().map(|t| t.session.profile.clone()) {
@@ -541,8 +831,8 @@ impl SnekkieApp {
                 }
             }
             Command::CloseTab => {
-                if let Some(id) = self.current().map(|t| t.session.id) {
-                    self.close_tab(id, false);
+                if let Some(id) = self.active {
+                    self.close_workspace_tab(id, false);
                 }
             }
             Command::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
@@ -562,7 +852,7 @@ impl SnekkieApp {
                 }
             }
             Command::Find => {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
+                if let Some(tab) = self.current_mut() {
                     // Selected text on one line is probably what to look for.
                     let selected = tab.session.shared.emulator.lock().selection_text();
                     tab.view.open_search(selected.filter(|t| !t.contains('\n') && t.chars().count() <= 200));
@@ -577,13 +867,13 @@ impl SnekkieApp {
                 self.snippets = Some(SnippetWindow::new(target));
             }
             Command::ClearScreen => {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
+                if let Some(tab) = self.current_mut() {
                     tab.session.shared.emulator.lock().clear();
                     tab.view.reset_animations();
                 }
             }
             Command::ResetTerminal => {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
+                if let Some(tab) = self.current_mut() {
                     tab.session.shared.emulator.lock().reset();
                     tab.view.clear_highlight_cache();
                     tab.view.reset_animations();
@@ -595,8 +885,18 @@ impl SnekkieApp {
                 }
             }
             Command::ToggleSidebar => {
-                self.settings.show_sidebar = !self.settings.show_sidebar;
-                self.save_settings();
+                if self.invade_selected() {
+                    // Over the game the sidebar only shows on request; the
+                    // saved preference stays as it is.
+                    if self.invade_sidebar {
+                        self.invade_sidebar = false;
+                    } else {
+                        self.reveal_sidebar_over_invade();
+                    }
+                } else {
+                    self.settings.show_sidebar = !self.settings.show_sidebar;
+                    self.save_settings();
+                }
             }
             Command::ToggleAutoPaging => {
                 self.settings.auto_paging = !self.settings.auto_paging;
@@ -650,56 +950,136 @@ impl SnekkieApp {
                     monospace: true,
                 });
             }
-            Command::About => self.message(
-                "About Snekkie",
-                format!(
+            Command::About => self.dialogs.push(Dialog::About {
+                text: format!(
                     "Snekkie {}\nA tabbed SSH and serial terminal.\n\nFree software under the GNU GPL v3 or later.",
                     env!("CARGO_PKG_VERSION")
                 ),
-            ),
+                focus: true,
+            }),
             Command::NextTab | Command::PreviousTab => {
-                if !self.tabs.is_empty() {
-                    let n = self.tabs.len();
-                    self.active =
-                        if command == Command::NextTab { (self.active + 1) % n } else { (self.active + n - 1) % n };
-                    self.tabs[self.active].view.focus();
+                let order = self.workspace_order();
+                if !order.is_empty() {
+                    let n = order.len();
+                    let at = self.active.and_then(|a| order.iter().position(|t| *t == a)).unwrap_or(0);
+                    let next = if command == Command::NextTab { (at + 1) % n } else { (at + n - 1) % n };
+                    self.select_workspace_tab(order[next]);
                 }
             }
         }
     }
 
+    fn reveal_sidebar_over_invade(&mut self) {
+        self.invade_sidebar = true;
+        if let Some(game) = &mut self.invade {
+            game.pause();
+        }
+    }
+
+    fn sidebar_visible(&self) -> bool {
+        if self.invade_selected() { self.invade_sidebar } else { self.settings.show_sidebar }
+    }
+
+    /// Keys still held from the game never type into a terminal: each is
+    /// dropped, with its text, until it is released.
+    fn suppress_held_game_keys(&mut self, ctx: &egui::Context) {
+        if self.invade_selected() {
+            // A pause clears the game's movement/fire state, but does not
+            // release a physical key. Remember the actual input, including
+            // releases in a frame that may also select or close a tab.
+            self.suppressed_keys = ctx.input(|input| {
+                [
+                    Key::ArrowLeft,
+                    Key::ArrowRight,
+                    Key::ArrowUp,
+                    Key::ArrowDown,
+                    Key::A,
+                    Key::D,
+                    Key::W,
+                    Key::S,
+                    Key::Space,
+                    Key::X,
+                    Key::Escape,
+                    Key::P,
+                    Key::B,
+                    Key::Num1,
+                    Key::Num2,
+                    Key::Num3,
+                ]
+                .into_iter()
+                .filter(|key| {
+                    input.keys_down.contains(key)
+                        || input
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, Event::Key { key: event_key, .. } if event_key == key))
+                })
+                .collect()
+            });
+            self.suppressed_shift = ctx.input(|input| input.modifiers.shift);
+            return;
+        }
+        if self.suppressed_keys.is_empty() && !self.suppressed_shift {
+            return;
+        }
+        let suppressed = std::mem::take(&mut self.suppressed_keys);
+        let text_of = |key: Key| match key {
+            Key::Space => Some(" "),
+            Key::A => Some("a"),
+            Key::D => Some("d"),
+            Key::W => Some("w"),
+            Key::S => Some("s"),
+            Key::X => Some("x"),
+            Key::P => Some("p"),
+            Key::B => Some("b"),
+            Key::Num1 => Some("1"),
+            Key::Num2 => Some("2"),
+            Key::Num3 => Some("3"),
+            _ => None,
+        };
+        let (still_down, suppressed_shift) = ctx.input_mut(|input| {
+            // The frame's final modifier state may already reflect a
+            // release after earlier shifted keys/text. Release in order.
+            let mut suppressed_shift = self.suppressed_shift;
+            input.events.retain(|event| match event {
+                Event::ModifiersChanged(modifiers) => {
+                    if !modifiers.shift {
+                        suppressed_shift = false;
+                    }
+                    true
+                }
+                Event::Key { key, modifiers, .. } => {
+                    let chord = modifiers.ctrl || modifiers.mac_cmd || modifiers.command;
+                    !suppressed.contains(key) && !(suppressed_shift && modifiers.shift && !chord)
+                }
+                Event::Text(text) => {
+                    !suppressed_shift
+                        && !suppressed.iter().filter_map(|k| text_of(*k)).any(|t| text.eq_ignore_ascii_case(t))
+                }
+                _ => true,
+            });
+            (
+                suppressed.iter().copied().filter(|key| input.keys_down.contains(key)).collect::<Vec<_>>(),
+                suppressed_shift && input.modifiers.shift,
+            )
+        });
+        self.suppressed_keys = still_down;
+        self.suppressed_shift = suppressed_shift;
+    }
+
     /// Keyboard shortcuts, taken out of the event queue before the
     /// terminal sees them.
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Command> {
-        const CTRL: Modifiers = Modifiers::CTRL;
-        const CTRL_SHIFT: Modifiers = Modifiers { ctrl: true, shift: true, ..Modifiers::NONE };
-        let table: [(Modifiers, Key, Command); 16] = [
-            (CTRL_SHIFT, Key::N, Command::NewSession),
-            (CTRL_SHIFT, Key::D, Command::Duplicate),
-            (CTRL_SHIFT, Key::R, Command::Reconnect),
-            (CTRL, Key::W, Command::CloseTab),
-            (CTRL, Key::Q, Command::Quit),
-            (CTRL_SHIFT, Key::A, Command::SelectAll),
-            (CTRL, Key::F, Command::Find),
-            (CTRL_SHIFT, Key::S, Command::Snippets),
-            (CTRL_SHIFT, Key::L, Command::ClearScreen),
-            (CTRL_SHIFT, Key::B, Command::SendBreak),
-            (CTRL, Key::B, Command::ToggleSidebar),
-            (CTRL, Key::Comma, Command::Preferences),
-            (CTRL, Key::Tab, Command::NextTab),
-            (CTRL_SHIFT, Key::Tab, Command::PreviousTab),
-            (CTRL, Key::PageDown, Command::NextTab),
-            (CTRL, Key::PageUp, Command::PreviousTab),
-        ];
+        let terminal_had_focus = self.terminal_had_focus;
         ctx.input_mut(|input| {
             let mut commands = Vec::new();
             input.events.retain(|event| {
                 let Event::Key { key, pressed: true, modifiers, .. } = event else { return true };
-                let exact =
-                    |m: Modifiers| m.ctrl == modifiers.ctrl && m.shift == modifiers.shift && m.alt == modifiers.alt;
-                match table.iter().find(|(m, k, _)| k == key && exact(*m)) {
-                    Some((_, _, command)) => {
-                        commands.push(*command);
+                match shortcut_command(*key, *modifiers, cfg!(target_os = "macos")) {
+                    // Cmd+A also belongs to every native text editor.
+                    Some(Command::SelectAll) if cfg!(target_os = "macos") && !terminal_had_focus => true,
+                    Some(command) => {
+                        commands.push(command);
                         false
                     }
                     None => true,
@@ -800,7 +1180,7 @@ impl SnekkieApp {
             let mut item = |ui: &mut Ui, text: &str, shortcut: &str, command: Command| {
                 let mut button = egui::Button::new(text);
                 if !shortcut.is_empty() {
-                    button = button.shortcut_text(shortcut);
+                    button = button.shortcut_text(shortcut_label(shortcut, cfg!(target_os = "macos")));
                 }
                 if ui.add(button).clicked() {
                     commands.push(command);
@@ -908,7 +1288,13 @@ impl SnekkieApp {
                 }
                 ui.separator();
             }
-            let text = self.current().map_or_else(|| "No session".to_string(), |t| t.session.status_text());
+            let text = match (&self.invade, self.invade_selected()) {
+                (Some(game), true) => {
+                    let status = game.status();
+                    format!("Invade — {} · wave {} · score {}", status.state, status.wave, status.score)
+                }
+                _ => self.current().map_or_else(|| "No session".to_string(), |t| t.session.status_text()),
+            };
             if self.settings.offline_mode {
                 ui.label(RichText::new("Offline mode").strong())
                     .on_hover_text("Online updates are disabled; DNS and non-local connections require approval.");
@@ -1056,17 +1442,8 @@ impl SnekkieApp {
 
     fn finish_profile_export(&mut self, ctx: &egui::Context, path: Option<PathBuf>, profiles: &[Profile]) {
         let Some(path) = path else { return };
-        let policy_path = self.settings_store.path.with_file_name("network.ini");
-        if [
-            self.store.path.as_path(),
-            self.settings_store.path.as_path(),
-            policy_path.as_path(),
-            self.snippet_store.path.as_path(),
-        ]
-        .into_iter()
-        .any(|store| same_file_path(&path, store))
-        {
-            self.message("Export profiles", "Choose a different file. Exporting over Snekkie's active profiles, preferences or snippets would replace saved data.");
+        if self.is_protected_store(&path) {
+            self.message("Export profiles", "Choose a different file. Exporting over Snekkie's active profiles, preferences, snippets or Invade progress would replace saved data.");
             return;
         }
         let result = crate::profiles::export_profiles(profiles)
@@ -1077,20 +1454,89 @@ impl SnekkieApp {
         }
     }
 
-    fn tab_strip(&mut self, ui: &mut Ui) -> Option<(u64, TabAction)> {
+    fn tab_strip(&mut self, ui: &mut Ui) -> Option<(WorkspaceTabId, TabAction)> {
         let mut action = None;
-        let mut rects = Vec::with_capacity(self.tabs.len());
+        let order = self.workspace_order();
+        let mut rects = Vec::with_capacity(order.len());
         egui::ScrollArea::horizontal().id_salt("tab_strip").auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                for (index, tab) in self.tabs.iter().enumerate() {
-                    let selected = index == self.active;
+                for (index, &entry) in order.iter().enumerate() {
+                    let selected = self.active == Some(entry);
+                    let WorkspaceTabId::Session(session_id) = entry else {
+                        // The game's tab: game actions and Close, nothing
+                        // about connections or profiles.
+                        let state = self.invade.as_ref().map_or("", |game| game.status().state);
+                        let color = if selected { style::primary(ui) } else { style::secondary(ui) };
+                        let inner = ui.scope_builder(
+                            egui::UiBuilder::new().id(Id::new(("tab", "invade"))).sense(Sense::click_and_drag()),
+                            |ui| {
+                                Frame::new().inner_margin(Margin::symmetric(10, 5)).show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        ui.add(
+                                            egui::Label::new(RichText::new(">_").monospace().color(self.accent))
+                                                .selectable(false),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(RichText::new("Invade").color(color)).selectable(false),
+                                        );
+                                        let close = ui.add(
+                                            egui::Button::new(RichText::new("×").color(style::secondary(ui)))
+                                                .frame(false)
+                                                .small(),
+                                        );
+                                        if close.on_hover_text("Close Invade (ends and records the run)").clicked() {
+                                            action = Some((entry, TabAction::Close));
+                                        }
+                                    });
+                                });
+                            },
+                        );
+                        let response = inner.response.on_hover_text(format!("Invade\n{state}"));
+                        let rect = response.rect;
+                        if selected {
+                            ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(2.0, self.accent));
+                        } else if response.hovered() {
+                            ui.painter().rect_filled(rect, 3.0, Color32::from_white_alpha(8));
+                        }
+                        if response.clicked() {
+                            action = Some((entry, TabAction::Select));
+                        }
+                        if response.middle_clicked() {
+                            action = Some((entry, TabAction::Close));
+                        }
+                        if response.drag_started() {
+                            self.dragging_tab = Some(index);
+                            action = Some((entry, TabAction::Select));
+                        }
+                        response.context_menu(|ui| {
+                            if ui.button("Pause").clicked() {
+                                action = Some((entry, TabAction::Pause));
+                            }
+                            if ui.button("Show build").clicked() {
+                                action = Some((entry, TabAction::Build));
+                            }
+                            ui.separator();
+                            if ui.button("Close").on_hover_text("Ends and records the run").clicked() {
+                                action = Some((entry, TabAction::Close));
+                            }
+                        });
+                        rects.push(rect);
+                        continue;
+                    };
+                    let Some(tab) = self.tabs.iter().find(|t| t.session.id == session_id) else { continue };
                     let state = tab.session.state();
                     let color = if selected { style::primary(ui) } else { style::secondary(ui) };
                     let dot = match state {
                         State::Connected => self.accent,
                         State::Connecting => Color32::from_rgb(0xd0, 0xa0, 0x30),
                         State::Closed(_) => Color32::from_rgb(0xa0, 0x40, 0x40),
+                    };
+                    let status = match state {
+                        State::Connected => "Connected",
+                        State::Connecting => "Connecting",
+                        State::Closed(_) => "Disconnected",
                     };
                     let id = tab.session.id;
                     // Register the tab behind its contents so the close button
@@ -1106,8 +1552,33 @@ impl SnekkieApp {
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
-                                        let (dot_rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                                        ui.painter().circle_filled(dot_rect.center(), 3.5, dot);
+                                        let (dot_rect, indicator) =
+                                            ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                                        match state {
+                                            State::Connected => {
+                                                ui.painter().circle_filled(dot_rect.center(), 3.5, dot);
+                                            }
+                                            State::Connecting => {
+                                                ui.painter().circle_stroke(
+                                                    dot_rect.center(),
+                                                    3.5,
+                                                    Stroke::new(1.5, dot),
+                                                );
+                                            }
+                                            State::Closed(_) => {
+                                                ui.painter().line_segment(
+                                                    [dot_rect.left_top(), dot_rect.right_bottom()],
+                                                    Stroke::new(1.5, dot),
+                                                );
+                                                ui.painter().line_segment(
+                                                    [dot_rect.right_top(), dot_rect.left_bottom()],
+                                                    Stroke::new(1.5, dot),
+                                                );
+                                            }
+                                        }
+                                        indicator.widget_info(|| {
+                                            egui::WidgetInfo::labeled(egui::WidgetType::Label, true, status)
+                                        });
                                         ui.add(
                                             egui::Label::new(RichText::new(tab.session.title()).color(color))
                                                 .selectable(false),
@@ -1118,13 +1589,17 @@ impl SnekkieApp {
                                                 .small(),
                                         );
                                         if close.on_hover_text("Close tab").clicked() {
-                                            action = Some((id, TabAction::Close));
+                                            action = Some((entry, TabAction::Close));
                                         }
                                     });
                                 });
                         },
                     );
-                    let response = inner.response;
+                    let response = inner.response.on_hover_text(format!(
+                        "{}\n{} — {status}",
+                        tab.session.title(),
+                        tab.session.description()
+                    ));
                     let rect = response.rect;
                     if let Some(color) = tab.color {
                         let strip = egui::Rect::from_x_y_ranges(
@@ -1143,41 +1618,41 @@ impl SnekkieApp {
                         ui.painter().rect_filled(rect, 3.0, Color32::from_white_alpha(8));
                     }
                     if response.clicked() {
-                        action = Some((id, TabAction::Select));
+                        action = Some((entry, TabAction::Select));
                     }
                     if response.middle_clicked() {
-                        action = Some((id, TabAction::Close));
+                        action = Some((entry, TabAction::Close));
                     }
                     if response.drag_started() {
                         // Like a browser: the tab you pick up is the one shown.
                         self.dragging_tab = Some(index);
-                        action = Some((id, TabAction::Select));
+                        action = Some((entry, TabAction::Select));
                     }
                     response.context_menu(|ui| {
                         if ui.button("Reconnect").clicked() {
-                            action = Some((id, TabAction::Reconnect));
+                            action = Some((entry, TabAction::Reconnect));
                         }
                         if ui.button("Duplicate").clicked() {
-                            action = Some((id, TabAction::Duplicate));
+                            action = Some((entry, TabAction::Duplicate));
                         }
                         ui.menu_button("Tab color", |ui| {
                             for (name, color) in TAB_COLORS {
                                 if ui.add(egui::Button::new(name).fill(color.gamma_multiply(0.15))).clicked() {
-                                    action = Some((id, TabAction::Color(Some(color))));
+                                    action = Some((entry, TabAction::Color(Some(color))));
                                     ui.close();
                                 }
                             }
                             ui.separator();
                             if ui.button("Custom color…").clicked() {
-                                action = Some((id, TabAction::CustomColor));
+                                action = Some((entry, TabAction::CustomColor));
                                 ui.close();
                             }
                             if ui.button("Clear tab color").clicked() {
-                                action = Some((id, TabAction::Color(None)));
+                                action = Some((entry, TabAction::Color(None)));
                                 ui.close();
                             }
                             if ui.button("Use profile color").clicked() {
-                                action = Some((id, TabAction::UseProfileColor));
+                                action = Some((entry, TabAction::UseProfileColor));
                                 ui.close();
                             }
                             let saved = self
@@ -1189,13 +1664,13 @@ impl SnekkieApp {
                                 .on_hover_text("Save this color for future tabs opened from the profile.")
                                 .clicked()
                             {
-                                action = Some((id, TabAction::SaveProfileColor));
+                                action = Some((entry, TabAction::SaveProfileColor));
                                 ui.close();
                             }
                         });
                         ui.separator();
                         if ui.button("Close").clicked() {
-                            action = Some((id, TabAction::Close));
+                            action = Some((entry, TabAction::Close));
                         }
                     });
                     rects.push(rect);
@@ -1211,31 +1686,85 @@ impl SnekkieApp {
             } else if let Some(pos) = pointer
                 && let Some(to) = rects.iter().position(|r| r.x_range().contains(pos.x))
                 && to != from
-                && from < self.tabs.len()
+                && from < order.len()
             {
-                let tab = self.tabs.remove(from);
-                self.tabs.insert(to, tab);
-                if self.active == from {
-                    self.active = to;
-                } else if from < self.active && to >= self.active {
-                    self.active -= 1;
-                } else if from > self.active && to <= self.active {
-                    self.active += 1;
-                }
+                // Identities move with their tabs, so the selection follows.
+                let mut order = order;
+                let moved = order.remove(from);
+                order.insert(to, moved);
+                self.set_workspace_order(&order);
                 self.dragging_tab = Some(to);
             }
         }
         action
     }
 
+    /// A connection tab's own actions, always aimed at its stable session.
+    fn session_tab_action(&mut self, ctx: &egui::Context, id: u64, action: TabAction) {
+        match action {
+            TabAction::Select | TabAction::Close | TabAction::Pause | TabAction::Build => {}
+            TabAction::Color(color) => {
+                if let Some(index) = self.tab_index(id) {
+                    self.tabs[index].color = color;
+                    self.tabs[index].color_override = true;
+                }
+            }
+            TabAction::UseProfileColor => {
+                if let Some(index) = self.tab_index(id) {
+                    let tab = &mut self.tabs[index];
+                    tab.color = crate::settings::parse_hex(&tab.session.profile.tab_color);
+                    tab.color_override = false;
+                }
+            }
+            TabAction::SaveProfileColor => {
+                if let Some(index) = self.tab_index(id) {
+                    let tab = &self.tabs[index];
+                    if let Some(mut profile) = self
+                        .store
+                        .get(&tab.session.profile.name)
+                        .cloned()
+                        .filter(|p| same_destination(p, &tab.session.profile))
+                    {
+                        profile.tab_color = tab.color.map(crate::settings::to_hex).unwrap_or_default();
+                        self.save_profile_metadata(profile);
+                    }
+                }
+            }
+            TabAction::CustomColor => {
+                if let Some(index) = self.tab_index(id) {
+                    self.dialogs.push(Dialog::TabColor { id, color: self.tabs[index].color.unwrap_or(self.accent) });
+                }
+            }
+            TabAction::Reconnect | TabAction::Duplicate => {
+                if let Some(index) = self.tab_index(id) {
+                    let profile = self.tabs[index].session.profile.clone();
+                    let target = if action == TabAction::Reconnect { Target::Reconnect(id) } else { Target::NewTab };
+                    self.request_connect(ctx, profile, target);
+                }
+            }
+        }
+    }
+
     fn central(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
-        if self.tabs.is_empty() {
+        let game_was_selected = self.invade_selected();
+        let tab_action = ui
+            .horizontal(|ui| {
+                let label = if self.sidebar_visible() { "Hide sessions" } else { "Show sessions" };
+                let shortcut = shortcut_label("Ctrl+B", cfg!(target_os = "macos"));
+                if ui.button(label).on_hover_text(format!("Show or hide the session sidebar ({shortcut})")).clicked() {
+                    self.run_command(&ctx, Command::ToggleSidebar);
+                    ctx.request_repaint();
+                }
+                self.tab_strip(ui)
+            })
+            .inner;
+        if self.tabs.is_empty() && self.invade.is_none() {
             ui.centered_and_justified(|ui| {
                 ui.add(
                     egui::Label::new(
                         RichText::new(
-                            "No session open.\nFill in the form on the left and click Connect,\nor double-click a saved session.",
+                            "No session open.\nOpen New session in the session sidebar,\nor select a saved session and choose Connect selected.",
                         )
                         .color(style::secondary(ui)),
                     )
@@ -1245,67 +1774,61 @@ impl SnekkieApp {
             return;
         }
 
-        if let Some((id, action)) = self.tab_strip(ui) {
-            match action {
-                TabAction::Select => {
-                    if let Some(index) = self.tab_index(id) {
-                        self.active = index;
-                        self.tabs[index].view.focus();
+        if let Some((entry, action)) = tab_action {
+            match (entry, action) {
+                (_, TabAction::Select) => self.select_workspace_tab(entry),
+                (_, TabAction::Close) => self.close_workspace_tab(entry, false),
+                (WorkspaceTabId::Invade, TabAction::Pause) => {
+                    if let Some(game) = &mut self.invade {
+                        game.pause();
                     }
                 }
-                TabAction::Close => self.close_tab(id, false),
-                TabAction::Color(color) => {
-                    if let Some(index) = self.tab_index(id) {
-                        self.tabs[index].color = color;
-                        self.tabs[index].color_override = true;
+                (WorkspaceTabId::Invade, TabAction::Build) => {
+                    self.select_workspace_tab(entry);
+                    if let Some(game) = &mut self.invade {
+                        game.show_build();
                     }
                 }
-                TabAction::UseProfileColor => {
-                    if let Some(index) = self.tab_index(id) {
-                        let tab = &mut self.tabs[index];
-                        tab.color = crate::settings::parse_hex(&tab.session.profile.tab_color);
-                        tab.color_override = false;
-                    }
-                }
-                TabAction::SaveProfileColor => {
-                    if let Some(index) = self.tab_index(id) {
-                        let tab = &self.tabs[index];
-                        if let Some(mut profile) = self
-                            .store
-                            .get(&tab.session.profile.name)
-                            .cloned()
-                            .filter(|p| same_destination(p, &tab.session.profile))
-                        {
-                            profile.tab_color = tab.color.map(crate::settings::to_hex).unwrap_or_default();
-                            self.save_profile_metadata(profile);
-                        }
-                    }
-                }
-                TabAction::CustomColor => {
-                    if let Some(index) = self.tab_index(id) {
-                        self.dialogs
-                            .push(Dialog::TabColor { id, color: self.tabs[index].color.unwrap_or(self.accent) });
-                    }
-                }
-                TabAction::Reconnect | TabAction::Duplicate => {
-                    if let Some(index) = self.tab_index(id) {
-                        let profile = self.tabs[index].session.profile.clone();
-                        let target =
-                            if action == TabAction::Reconnect { Target::Reconnect(id) } else { Target::NewTab };
-                        self.request_connect(&ctx, profile, target);
-                    }
-                }
+                (WorkspaceTabId::Invade, _) | (_, TabAction::Pause | TabAction::Build) => {}
+                (WorkspaceTabId::Session(id), action) => self.session_tab_action(&ctx, id, action),
             }
         }
-        if self.tabs.is_empty() {
+        if self.tabs.is_empty() && self.invade.is_none() {
             return;
         }
-        self.active = self.active.min(self.tabs.len() - 1);
+        let order = self.workspace_order();
+        if self.active.is_none_or(|active| !order.contains(&active))
+            && let Some(first) = order.first()
+        {
+            self.select_workspace_tab(*first);
+        }
+        if self.invade_selected() {
+            self.invade_ui(ui);
+            return;
+        }
+        // Mouse selection and closing happen above, before drawing this
+        // terminal. All keyboard/clipboard events in that frame originated
+        // in the game, including text that is not a gameplay control.
+        if game_was_selected {
+            ctx.input_mut(|input| {
+                input.events.retain(|event| {
+                    !matches!(event, Event::Key { .. } | Event::Text(_) | Event::Paste(_) | Event::Copy | Event::Cut)
+                });
+            });
+            // This frame was laid out for the game, without the sidebar.
+            // Drawing the terminal now would resize the connection twice
+            // and clear its selection; it appears next frame at its size.
+            ctx.request_repaint();
+            return;
+        }
+        // Keys still held after this frame remain quarantined until release.
+        self.suppress_held_game_keys(&ctx);
+        let Some(index) = self.active_index() else { return };
         ui.add_space(2.0);
 
         // Banner: why the session ended, or that it's still connecting.
         let (state, id, description) = {
-            let tab = &self.tabs[self.active];
+            let tab = &self.tabs[index];
             (tab.session.state(), tab.session.id, tab.session.description())
         };
         let banner = match &state {
@@ -1338,13 +1861,19 @@ impl SnekkieApp {
                 );
             });
             if clicked {
-                let profile = self.tabs[self.active].session.profile.clone();
+                let profile = self.tabs[index].session.profile.clone();
                 self.request_connect(&ctx, profile, Target::Reconnect(id));
             }
         }
 
         let theme = self.settings.colors();
-        let tab = &mut self.tabs[self.active];
+        let tab = &mut self.tabs[index];
+        // egui moves keyboard focus on arrow and Tab presses before a newly
+        // focused terminal can claim them, so a key still held from the game
+        // could strand its focus. Keep it here until those keys are let go.
+        if !self.suppressed_keys.is_empty() {
+            tab.view.focus();
+        }
         let family = self.fonts.family(&ctx, &tab.session.profile.font_family);
         let (regular, bold) =
             Fonts::font_ids(family.as_deref(), fonts::points_to_pixels(tab.session.profile.font_size));
@@ -1398,6 +1927,27 @@ impl SnekkieApp {
                 TextExport::Append(_) => picker.set_title("Append terminal text to existing file").pick_file(),
             };
             self.finish_text_export(&ctx, path, export);
+        }
+    }
+
+    fn invade_ui(&mut self, ui: &mut Ui) {
+        let theme = self.settings.colors();
+        // Menus, dialogs and the sidebar shown over the game pause it; none
+        // of them is part of the game, and paced sends keep going.
+        let interactive = !self.modal_open() && !egui::Popup::is_any_open(ui.ctx());
+        let options = InvadeOptions { theme, interactive };
+        let Some(game) = self.invade.as_mut() else { return };
+        let action = if theme.effects.is_super() {
+            style::monitor(ui, theme, |ui| game.ui(ui, &options))
+        } else {
+            game.ui(ui, &options)
+        };
+        // Resuming puts the sidebar shown over the game away again.
+        if self.invade_sidebar && game.is_running() {
+            self.invade_sidebar = false;
+        }
+        if action == Some(InvadeAction::Close) {
+            self.close_invade(EndReason::Closed);
         }
     }
 
@@ -1460,6 +2010,24 @@ impl SnekkieApp {
                         }
                         if ui.button("Cancel").clicked() || escape {
                             close = true;
+                        }
+                    });
+                }
+                Dialog::About { text, focus } => {
+                    ui.heading("About Snekkie");
+                    ui.add_space(6.0);
+                    ui.add(egui::Label::new(text.as_str()).wrap());
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let ok = ui.button("OK");
+                        if std::mem::take(focus) {
+                            ok.request_focus();
+                        }
+                        if ok.clicked() || escape {
+                            close = true;
+                        }
+                        if ui.button("Invade").clicked() {
+                            result = Some(DialogResult::Yes);
                         }
                     });
                 }
@@ -1571,8 +2139,7 @@ impl SnekkieApp {
                         "Snekkie downloads it, then restarts to install it, asking first if any sessions \
                          are connected. Saved sessions and settings are kept."
                     } else {
-                        "This copy of Snekkie wasn't installed with the installer, so it can't update \
-                         itself. Download the new version from its release page."
+                        update::install_kind().update_instructions()
                     };
                     ui.add(egui::Label::new(RichText::new(how).color(style::secondary(ui))).wrap());
                     if *installable {
@@ -1610,6 +2177,7 @@ impl SnekkieApp {
 
     fn finish_dialog(&mut self, ctx: &egui::Context, dialog: Dialog, result: DialogResult) {
         match (dialog, result) {
+            (Dialog::About { .. }, DialogResult::Yes) => self.open_invade(),
             (Dialog::ProfileTransfer(transfer), DialogResult::Yes) => {
                 let selected = transfer.profiles();
                 if transfer.is_export() {
@@ -1740,11 +2308,15 @@ impl SnekkieApp {
     fn preferences_ui(&mut self, ctx: &egui::Context, blocked: bool) {
         let Some(prefs) = self.preferences.as_mut() else { return };
         prefs.update_busy = self.updater.busy();
-        let monospace = self.fonts.monospace.clone();
+        prefs.network_sessions = self
+            .tabs
+            .iter()
+            .filter(|t| t.session.profile.kind().is_network() && !matches!(t.session.state(), State::Closed(_)))
+            .count();
         let mut outcome = preferences::Outcome::Open;
         let modal = egui::Modal::new(Id::new("preferences")).show(ctx, |ui| {
-            ui.set_width(preferences::WIDTH);
-            outcome = prefs.ui(ui, &monospace);
+            ui.set_width((ctx.content_rect().width() - 48.0).clamp(200.0, preferences::WIDTH));
+            outcome = prefs.ui(ui, &mut self.fonts);
         });
         if modal.should_close() && !blocked {
             outcome = preferences::Outcome::Cancel;
@@ -1770,6 +2342,11 @@ impl SnekkieApp {
                 }
                 self.save_settings();
                 self.preferences = None;
+                let theme = self.settings.colors();
+                self.accent = theme.cursor;
+                style::apply_theme(ctx, theme);
+                self.styled_theme = Some(theme);
+                ctx.request_repaint();
             }
             preferences::Outcome::AskThemeName { suggested } => {
                 self.input("Save theme", "Theme name:", suggested, false, InputAction::SaveTheme);
@@ -1897,14 +2474,13 @@ impl SnekkieApp {
         if !self.snippet_target_valid(target) {
             return Err("The reviewed connection changed or closed. Reopen snippets on a connected tab and review the commands again.".into());
         }
-        let index = self.tab_index(target.id).ok_or("The destination tab closed.")?;
+        self.tab_index(target.id).ok_or("The destination tab closed.")?;
         let mut text = text.to_string();
         if !text.ends_with(['\r', '\n']) {
             text.push('\n');
         }
         self.start_paste(ctx, target.clone(), &text, self.settings.paste_delay_ms)?;
-        self.active = index;
-        self.tabs[index].view.focus();
+        self.select_workspace_tab(WorkspaceTabId::Session(target.id));
         Ok(())
     }
 
@@ -1995,17 +2571,8 @@ impl SnekkieApp {
 
     fn finish_snippet_export(&mut self, ctx: &egui::Context, path: Option<PathBuf>, snippets: &[Snippet]) {
         let Some(path) = path else { return };
-        let policy_path = self.settings_store.path.with_file_name("network.ini");
-        if [
-            self.store.path.as_path(),
-            self.settings_store.path.as_path(),
-            policy_path.as_path(),
-            self.snippet_store.path.as_path(),
-        ]
-        .into_iter()
-        .any(|store| same_file_path(&path, store))
-        {
-            self.message("Export snippets", "Choose a different file. Exporting over Snekkie's active profiles, preferences or snippets would replace saved data.");
+        if self.is_protected_store(&path) {
+            self.message("Export snippets", "Choose a different file. Exporting over Snekkie's active profiles, preferences, snippets or Invade progress would replace saved data.");
             return;
         }
         let result = crate::snippets::export_snippets(snippets)
@@ -2031,6 +2598,7 @@ impl SnekkieApp {
     /// One frame of the whole app.
     pub fn frame(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
+        let command_origin = self.active;
         self.poll_background(&ctx);
         self.handle_close_request(&ctx);
 
@@ -2040,6 +2608,7 @@ impl SnekkieApp {
             self.terminal_had_focus =
                 self.current().is_some_and(|t| focused == Some(Id::new(("terminal", t.session.id))));
         }
+        self.suppress_held_game_keys(&ctx);
         let mut commands = if modal_open { Vec::new() } else { self.shortcuts(&ctx) };
 
         egui::Panel::top("menu")
@@ -2053,7 +2622,7 @@ impl SnekkieApp {
                     .stroke(Stroke::new(1.0, style::border(ui))),
             )
             .show(ui, |ui| self.status_bar(ui));
-        if self.settings.show_sidebar {
+        if self.sidebar_visible() {
             egui::Panel::left("sidebar")
                 .resizable(true)
                 .default_size(320.0)
@@ -2071,6 +2640,18 @@ impl SnekkieApp {
             .show(ui, |ui| self.central(ui));
 
         for command in commands {
+            if command_origin == Some(WorkspaceTabId::Invade) && command == Command::CloseTab {
+                // A mouse click may already have selected a connection or
+                // closed the game. Close the shortcut's original tab once.
+                self.close_workspace_tab(WorkspaceTabId::Invade, false);
+                continue;
+            }
+            // Shortcuts were queued before a mouse click could select a
+            // connection. Their origin remains the game even if it closed.
+            if command_origin == Some(WorkspaceTabId::Invade) && command.targets_session() {
+                self.flash(&ctx, "Terminal command ignored because it started in Invade.");
+                continue;
+            }
             self.run_command(&ctx, command);
         }
 
@@ -2087,7 +2668,7 @@ impl SnekkieApp {
         if modal_open
             && !self.modal_open()
             && self.terminal_had_focus
-            && let Some(tab) = self.tabs.get_mut(self.active)
+            && let Some(tab) = self.current_mut()
         {
             tab.view.focus();
         }
@@ -2095,6 +2676,16 @@ impl SnekkieApp {
 
     /// Hang up everything; called on exit.
     pub fn shutdown(&mut self) {
+        // Closing Snekkie ends the game's run; it is recorded once.
+        if let Some(game) = &mut self.invade {
+            game.finish(EndReason::AppClosed);
+            game.retry_failed_save();
+        } else if let Some(store) = &mut self.invade_store
+            && store.save_error.is_some()
+        {
+            // One last try for progress a closed tab could not save.
+            let _ = store.save();
+        }
         self.paste_queue = None;
         self.paste_preview = None;
         for tab in &self.tabs {
@@ -2114,6 +2705,67 @@ impl SnekkieApp {
         self.request_paste(ctx, text);
     }
 
+    /// Every tab's title in strip order; the game's is "Invade".
+    #[doc(hidden)]
+    pub fn workspace_titles(&self) -> Vec<String> {
+        self.workspace_order()
+            .into_iter()
+            .map(|entry| match entry {
+                WorkspaceTabId::Invade => "Invade".to_string(),
+                WorkspaceTabId::Session(id) => {
+                    self.tab_index(id).map(|i| self.tabs[i].session.title()).unwrap_or_default()
+                }
+            })
+            .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn active_title(&self) -> Option<String> {
+        match self.active? {
+            WorkspaceTabId::Invade => Some("Invade".into()),
+            WorkspaceTabId::Session(_) => self.current().map(|t| t.session.title()),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn invade_status(&self) -> Option<super::invade::InvadeStatus> {
+        self.invade.as_ref().map(|game| game.status())
+    }
+
+    #[doc(hidden)]
+    pub fn invade_tab(&mut self) -> Option<&mut InvadeTab> {
+        self.invade.as_deref_mut()
+    }
+
+    #[doc(hidden)]
+    pub fn invade_progress_path(&self) -> PathBuf {
+        self.invade_path()
+    }
+
+    /// Ask to restart into a downloaded update, as its button does.
+    #[doc(hidden)]
+    pub fn request_update_install(&mut self, ctx: &egui::Context) {
+        self.request_install(ctx);
+    }
+
+    /// Whether a downloaded update would install by itself right now.
+    #[doc(hidden)]
+    pub fn update_would_install_automatically(&self) -> bool {
+        self.can_install_silently()
+    }
+
+    /// Move a tab, by title, to `to` in the strip, as dragging would.
+    #[doc(hidden)]
+    pub fn move_tab(&mut self, title: &str, to: usize) {
+        let mut order = self.workspace_order();
+        let titles = self.workspace_titles();
+        if let Some(from) = titles.iter().position(|t| t == title) {
+            let moved = order.remove(from);
+            order.insert(to.min(order.len()), moved);
+            self.set_workspace_order(&order);
+        }
+    }
+
     #[doc(hidden)]
     pub fn tab_titles(&self) -> Vec<String> {
         self.tabs.iter().map(|t| t.session.title()).collect()
@@ -2124,7 +2776,9 @@ impl SnekkieApp {
         self.dialogs
             .iter()
             .map(|d| match d {
-                Dialog::Message { text, .. } | Dialog::Confirm { text, .. } => text.clone(),
+                Dialog::Message { text, .. } | Dialog::About { text, .. } | Dialog::Confirm { text, .. } => {
+                    text.clone()
+                }
                 Dialog::Input { label, .. } => label.clone(),
                 Dialog::HostKey(q) => q.fingerprint.clone(),
                 Dialog::Network(q) => q.text(),
@@ -2238,12 +2892,21 @@ fn append_terminal_text(path: &Path, text: &str) -> std::io::Result<()> {
 enum TabAction {
     Select,
     Close,
+    /// Game tab only.
+    Pause,
+    Build,
     Reconnect,
     Duplicate,
     Color(Option<Color32>),
     CustomColor,
     UseProfileColor,
     SaveProfileColor,
+}
+
+/// The tab that takes a closed tab's place: the next one, or the previous
+/// one if it was last. `order` still includes the closed tab.
+fn neighbor(order: &[WorkspaceTabId], closed: usize) -> Option<WorkspaceTabId> {
+    order.get(closed + 1).or_else(|| closed.checked_sub(1).and_then(|i| order.get(i))).copied()
 }
 
 fn same_destination(a: &Profile, b: &Profile) -> bool {
@@ -2354,6 +3017,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mac_shortcuts_use_command_and_preserve_physical_control_keys() {
+        let command = Modifiers { mac_cmd: true, command: true, ..Modifiers::NONE };
+        let control = Modifiers { ctrl: true, ..Modifiers::NONE };
+        for (key, expected) in [
+            (Key::W, Command::CloseTab),
+            (Key::Q, Command::Quit),
+            (Key::A, Command::SelectAll),
+            (Key::F, Command::Find),
+            (Key::B, Command::ToggleSidebar),
+            (Key::Comma, Command::Preferences),
+        ] {
+            assert_eq!(shortcut_command(key, command, true), Some(expected));
+            assert_eq!(shortcut_command(key, control, true), None, "Ctrl+{key:?} belongs to the device");
+        }
+        let shifted = Modifiers { shift: true, ..command };
+        for (key, expected) in [
+            (Key::N, Command::NewSession),
+            (Key::D, Command::Duplicate),
+            (Key::R, Command::Reconnect),
+            (Key::S, Command::Snippets),
+            (Key::L, Command::ClearScreen),
+            (Key::B, Command::SendBreak),
+        ] {
+            assert_eq!(shortcut_command(key, shifted, true), Some(expected));
+            assert_eq!(shortcut_command(key, Modifiers { shift: true, ..control }, true), None);
+        }
+        assert_eq!(shortcut_command(Key::Tab, command, true), None, "Cmd+Tab belongs to macOS");
+        assert_eq!(shortcut_command(Key::Tab, control, true), Some(Command::NextTab));
+        assert_eq!(shortcut_command(Key::Tab, Modifiers { shift: true, ..control }, true), Some(Command::PreviousTab));
+        assert_eq!(shortcut_command(Key::W, Modifiers { ctrl: true, ..command }, true), None);
+    }
+
+    #[test]
+    fn windows_and_linux_shortcuts_keep_their_control_bindings() {
+        let control = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
+        assert_eq!(shortcut_command(Key::W, control, false), Some(Command::CloseTab));
+        assert_eq!(shortcut_command(Key::F, control, false), Some(Command::Find));
+        assert_eq!(shortcut_command(Key::A, control, false), None, "plain Ctrl+A belongs to the device");
+        assert_eq!(shortcut_command(Key::A, Modifiers { shift: true, ..control }, false), Some(Command::SelectAll));
+        assert_eq!(shortcut_command(Key::PageDown, control, false), Some(Command::NextTab));
+        assert_eq!(shortcut_command(Key::PageUp, control, false), Some(Command::PreviousTab));
+        assert_eq!(shortcut_command(Key::F, Modifiers { alt: true, ..control }, false), None);
+    }
+
+    #[test]
+    fn menu_shortcut_labels_match_each_platform() {
+        for (original, macos) in [
+            ("Ctrl+Shift+N", "Cmd+Shift+N"),
+            ("Ctrl+F", "Cmd+F"),
+            ("Ctrl+Shift+C", "Cmd+C"),
+            ("Ctrl+Shift+V", "Cmd+V"),
+            ("Ctrl+Shift+A", "Cmd+A"),
+            ("Ctrl+Tab", "Ctrl+Tab"),
+            ("Ctrl+Shift+Tab", "Ctrl+Shift+Tab"),
+        ] {
+            assert_eq!(shortcut_label(original, true), macos);
+            assert_eq!(shortcut_label(original, false), original);
+        }
+    }
+
+    #[test]
     fn profile_metadata_updates_matching_sessions_and_rolls_back_on_write_failure() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
@@ -2402,6 +3126,7 @@ mod tests {
             app.settings_store.path.clone(),
             dir.path().join("network.ini"),
             app.snippet_store.path.clone(),
+            dir.path().join("invade.json"),
         ] {
             app.finish_profile_export(&ctx, Some(path), &profiles[..1]);
             assert!(app.dialog_texts().last().unwrap().contains("Choose a different file"));
@@ -2454,6 +3179,7 @@ mod tests {
             app.settings_store.path.clone(),
             dir.path().join("network.ini"),
             app.snippet_store.path.clone(),
+            dir.path().join("invade.json"),
         ] {
             if !path.exists() {
                 std::fs::write(&path, "original data").unwrap();
@@ -2506,7 +3232,7 @@ mod tests {
             color: None,
             color_override: false,
         });
-        app.active = 1;
+        app.active = Some(WorkspaceTabId::Session(app.tabs[1].session.id));
         for (commands, expected) in [("show a\r\nshow b\nshow c\r", "show a\rshow b\rshow c\r"), ("show d", "show d\r")]
         {
             app.send_snippet(&ctx, &target, commands).unwrap();
@@ -2519,7 +3245,7 @@ mod tests {
             let mut bytes = vec![0; expected.len()];
             first.read_exact(&mut bytes).unwrap();
             assert_eq!(bytes, expected.as_bytes());
-            assert_eq!(app.active, 0);
+            assert_eq!(app.active_index(), Some(0));
         }
         app.start_paste(&ctx, target.clone(), "first\nnever replay\n", 5000).unwrap();
         app.advance_paste(&ctx);
@@ -2575,6 +3301,15 @@ mod tests {
         app.finish_text_export(&ctx, Some(dir.path().to_path_buf()), TextExport::Save(text.into()));
         assert!(app.flash.is_none());
         assert!(app.dialog_texts()[0].starts_with("Could not save "));
+        // Terminal text never replaces an active store, the game's included.
+        let progress = dir.path().join("invade.json");
+        std::fs::write(&progress, "{\"version\":1}").unwrap();
+        for export in [TextExport::Save(text.into()), TextExport::Append(text.into())] {
+            app.dialogs.clear();
+            app.finish_text_export(&ctx, Some(progress.clone()), export);
+            assert!(app.dialog_texts()[0].starts_with("Choose a different file"));
+        }
+        assert_eq!(std::fs::read_to_string(&progress).unwrap(), "{\"version\":1}");
     }
 
     #[test]

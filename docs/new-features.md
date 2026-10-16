@@ -4,9 +4,11 @@ These features are included in Snekkie 2.5.0. See the [release notes](releases/2
 
 For the newer snippets, paste and logging features, see the [2.6.0 release notes](releases/2.6.0.md).
 
+For the reorganized Preferences, session sidebar, themes and Linux/macOS packages, see the [2.7.0 release notes](releases/2.7.0.md).
+
 ## Full app themes
 
-Choose a preset in **Settings → Preferences → General**. There are now 18 presets, including four complete app appearances:
+Choose a preset in **Settings → Preferences → Appearance**. The current build has 21 presets, including four complete app appearances. See the [Preferences guide](preferences.md) for the newer Frost Light, Copper Night and Forest Night palettes, contrast improvements and animation options.
 
 | Theme | Appearance |
 | --- | --- |
@@ -36,7 +38,7 @@ Each category can be changed or turned off separately, and the live preview demo
 
 ## Network privacy and installation
 
-The Windows installer now has a **Network privacy** page. You can disable startup update checks by themselves, or select **Enable offline mode** for more limited network use. The same controls are in **Settings → Preferences → General → Network privacy**. Offline mode is optional; existing installations retain their choices during automatic updates.
+The Windows installer now has a **Network privacy** page. You can disable startup update checks by themselves, or select **Enable offline mode** for more limited network use. The same controls are in **Settings → Preferences → Network → Network privacy**. Offline mode is optional; existing installations retain their choices during automatic updates.
 
 When offline mode is enabled:
 
@@ -75,17 +77,19 @@ Review the listed destinations and import notes, select the sessions you want, t
 
 Supported settings include SSH/Telnet/raw TCP destinations, ports, usernames, keepalives, supported serial line settings, font, scrollback, local echo and Backspace behavior. PuTTY's Default Settings entry and unsupported protocols or serial configurations are skipped with notes. Passwords and host-key trust are not imported. PuTTY colors, proxies, forwarding, remote commands and other unsupported options are not imported. The preview reports proxy/forwarding/command dependencies so you can review them before connecting.
 
-Snekkie uses Pageant/default SSH keys when the imported PuTTY profile allows an agent. A `.ppk` path is not imported as an OpenSSH key: load it into Pageant, or export it to OpenSSH format and select that file in Snekkie. Other saved key paths are imported as paths only; no private-key contents are read during import. Field mappings follow [PuTTY's settings implementation](https://raw.githubusercontent.com/github/putty/master/settings.c).
+Imported SSH sessions default to **Password**, regardless of PuTTY's agent setting. An explicit non-`.ppk` key path selects **Private key file** instead; only the path is imported, and no private-key contents are read during import. A `.ppk` path is not imported as an OpenSSH key: to use it, select **SSH agent / default keys** and load it into Pageant, or export it to OpenSSH format and select that file in Snekkie. Field mappings follow [PuTTY's settings implementation](https://raw.githubusercontent.com/github/putty/master/settings.c).
 
 ## Find and favorite saved sessions
 
 Type into **Filter saved sessions** in the sidebar to match names, hostnames/IPs, serial device names or protocols. Matching is case-insensitive. The **Clear** button clears the text filter. Filtering narrows the visible list without editing profiles or opening connections.
 
+Select a row and choose **Connect selected** to use its saved settings, or **Edit connection** to load it into the form without connecting. Double-clicking connects directly. The form's **Connect** and **Save…** actions use the form, while connecting a saved profile preserves an unfinished draft. Collapse **New session** to make room for the list, or use **Show sessions / Hide sessions** beside the tabs to resize the terminal workspace. See the [session sidebar guide](session-sidebar.md).
+
 Click the star beside a saved session to add or remove a favorite, then enable **Favorites only** in the **Saved sessions** heading to show starred sessions. The text filter and favorites filter work together. Favorites are saved with the profiles and survive restart; older profiles start without a favorite.
 
 ## Import and export Snekkie profiles
 
-Open **Settings → Import → Snekkie profiles (.json)…** or choose **… → Import profiles…** beside the sidebar's Load, Save and Delete buttons, then choose a Snekkie JSON profile export. The preview lists supported sessions with their names, protocols and destinations. Review any import notes, use **Select all** or **Select none**, then choose **Import selected**. **Cancel** adds nothing. Importing adds saved profiles without connecting to devices.
+Open **Settings → Import → Snekkie profiles (.json)…** or choose **… → Import profiles…** beside the sidebar's Save and Delete buttons, then choose a Snekkie JSON profile export. The preview lists supported sessions with their names, protocols and destinations. Review any import notes, use **Select all** or **Select none**, then choose **Import selected**. **Cancel** adds nothing. Importing adds saved profiles without connecting to devices.
 
 Existing profiles remain unchanged. Conflicting names are compared without regard to case and receive a unique suffix such as `Switch (Imported 1)`. The preview shows the final names. Malformed entries, unsupported protocols and incompatible serial settings are skipped with notes. Unrecognized fields are ignored; the supported profile settings are imported. Invalid JSON, unsupported file versions and files larger than 16 MiB produce an error.
 

@@ -1,6 +1,7 @@
 //! Serial transport backed by the serialport crate.
 
 use std::io::{ErrorKind, Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -151,9 +152,28 @@ fn settings(profile: &Profile) -> Result<(DataBits, Parity, StopBits, FlowContro
     Ok((data_bits, parity, stop_bits, flow))
 }
 
+/// A macOS pseudo-terminal: a virtual serial port such as one made by socat.
+fn is_macos_pty(path: &Path) -> bool {
+    path.parent() == Some(Path::new("/dev"))
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("ttys"))
+            .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The speed to open the device with. macOS sets it with the IOSSIOSPEED
+/// ioctl, which pseudo-terminals reject, and a speed means nothing to them,
+/// so open those without one. Symlinks to them (socat's link=) count too.
+fn open_baud(profile: &Profile) -> u32 {
+    let device = Path::new(&profile.device);
+    let pty = cfg!(target_os = "macos") && device.canonicalize().is_ok_and(|path| is_macos_pty(&path));
+    if pty { 0 } else { profile.baud }
+}
+
 pub fn open_port(profile: &Profile) -> Result<Box<dyn SerialPort>, String> {
     let (data_bits, parity, stop_bits, flow) = settings(profile)?;
-    serialport::new(&profile.device, profile.baud)
+    serialport::new(&profile.device, open_baud(profile))
         .data_bits(data_bits)
         .parity(parity)
         .stop_bits(stop_bits)
@@ -268,6 +288,29 @@ mod tests {
         assert_eq!(description(&profile), "Serial  COM3  9600-8N1");
         let profile = Profile { device: "COM3".into(), parity: "Even".into(), stopbits: 1.5, ..profile };
         assert_eq!(description(&profile), "Serial  COM3  9600-8E1.5");
+    }
+
+    #[test]
+    fn macos_pseudo_terminals_are_recognized_by_their_device_path() {
+        for pty in ["/dev/ttys000", "/dev/ttys004", "/dev/ttys123"] {
+            assert!(is_macos_pty(Path::new(pty)), "{pty}");
+        }
+        for device in [
+            "/dev/cu.usbserial-A10K3X",
+            "/dev/tty.usbserial-A10K3X",
+            "/dev/cu.usbmodem14101",
+            "/dev/ttys",
+            "/dev/ttysA",
+            "/dev/ttyS0",
+            "/dev/pts/3",
+            "/tmp/ttys001",
+            "COM3",
+        ] {
+            assert!(!is_macos_pty(Path::new(device)), "{device}");
+        }
+        // Real adapters, and every device on other systems, keep their speed.
+        let profile = Profile { device: "/dev/does-not-exist".into(), baud: 115200, ..Profile::default() };
+        assert_eq!(open_baud(&profile), 115200);
     }
 
     #[test]

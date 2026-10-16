@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Snekkie
+Comment=SSH and serial terminal
+Exec=snekkie
+Icon=snekkie
+Terminal=false
+Categories=Network;TerminalEmulator;
+Keywords=SSH;Serial;Telnet;Console;
+StartupWMClass=snekkie

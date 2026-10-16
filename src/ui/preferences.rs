@@ -1,11 +1,11 @@
-//! Preferences dialog: color theme and defaults for new sessions on one
-//! page, animations on the other.
+//! Preferences grouped by task, with draft settings and a fixed save footer.
 
 use std::collections::BTreeMap;
 
 use egui::{Color32, DragValue, RichText, Slider, Stroke, Ui};
 
 use super::animation_preview::AnimationPreview;
+use super::fonts::{self, Fonts};
 use super::syntax_preview::SyntaxPreview;
 use super::theme_preview::ThemePreview;
 use super::{sidebar, style};
@@ -15,10 +15,8 @@ use crate::settings::{
 };
 use crate::terminal::highlight;
 
-/// Width of the dialog, the same on both pages so it doesn't jump about
-/// when you switch: room for two groups of animation styles side by side,
-/// and still inside the smallest window.
-pub const WIDTH: f32 = 500.0;
+/// Preferred content width. The app clamps this to the viewport.
+pub const WIDTH: f32 = 640.0;
 
 /// Width of each animation style drop-down, so the longest style name
 /// ("Word by word") fits without the box growing.
@@ -36,9 +34,23 @@ const MIN_PAGE_HEIGHT: f32 = 60.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
-    General,
+    Appearance,
+    Terminal,
+    Input,
+    Network,
     Highlighting,
     Animations,
+}
+
+impl Page {
+    const ALL: [(Self, &'static str); 6] = [
+        (Self::Appearance, "Appearance"),
+        (Self::Terminal, "Terminal"),
+        (Self::Input, "Input & paste"),
+        (Self::Network, "Network"),
+        (Self::Highlighting, "Highlighting"),
+        (Self::Animations, "Animations"),
+    ];
 }
 
 /// What the dialog asks of the app this frame.
@@ -60,13 +72,13 @@ pub struct Preferences {
     saved_themes: BTreeMap<String, Scheme>,
     custom: Theme,
     page: Page,
-    /// The tallest a page has been, in points.
-    page_height: f32,
+    offline_at_open: bool,
     preview: AnimationPreview,
     theme_preview: ThemePreview,
     syntax_preview: SyntaxPreview,
     preview_syntax: String,
     pub update_busy: bool,
+    pub network_sessions: usize,
 }
 
 impl Preferences {
@@ -75,13 +87,14 @@ impl Preferences {
             settings: settings.clone(),
             saved_themes: settings.saved_themes.clone(),
             custom: settings.custom_theme(),
-            page: Page::General,
-            page_height: 0.0,
+            page: Page::Appearance,
+            offline_at_open: settings.offline_mode,
             preview: AnimationPreview::default(),
             theme_preview: ThemePreview::default(),
             syntax_preview: SyntaxPreview::default(),
             preview_syntax: "cisco_ios".into(),
             update_busy: false,
+            network_sessions: 0,
         }
     }
 
@@ -123,7 +136,7 @@ impl Preferences {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, monospace_fonts: &[String]) -> Outcome {
+    pub fn ui(&mut self, ui: &mut Ui, fonts: &mut Fonts) -> Outcome {
         let mut outcome = Outcome::Open;
         ui.heading("Preferences");
         ui.add_space(6.0);
@@ -135,39 +148,34 @@ impl Preferences {
         // the window's height after those, the dialog's frame and a margin
         // is the page's.
         let above = ui.cursor().min.y - ui.min_rect().min.y;
-        let below = ui.spacing().item_spacing.y + BUTTONS_GAP + ui.spacing().interact_size.y;
+        let below = ui.spacing().item_spacing.y + BUTTONS_GAP + 30.0;
         let room = (ui.ctx().content_rect().height() - 2.0 * EDGE_MARGIN - above - below).max(MIN_PAGE_HEIGHT);
         let page = self.page;
         egui::ScrollArea::vertical()
             .id_salt(page as u8) // each page keeps its own place
+            .min_scrolled_height(MIN_PAGE_HEIGHT)
             .max_height(room)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                let top = ui.cursor().min.y;
-                match page {
-                    Page::General => self.general_page(ui, monospace_fonts, &mut outcome),
-                    Page::Highlighting => self.highlighting_page(ui),
-                    Page::Animations => self.animations_page(ui),
-                }
-                // Each page takes the height of the tallest seen, so once
-                // you've looked at both the dialog stays put as you switch,
-                // or the room there is if that's less. A pass that's only
-                // measuring, or will be thrown away, may be laid out oddly.
-                let height = ui.cursor().min.y - top;
-                if !ui.is_sizing_pass() && !ui.ctx().will_discard() {
-                    self.page_height = self.page_height.max(height);
-                }
-                ui.add_space((self.page_height.min(room) - height).max(0.0));
+            .auto_shrink([false, false])
+            .show(ui, |ui| match page {
+                Page::Appearance => self.appearance_page(ui, fonts, &mut outcome),
+                Page::Terminal => self.terminal_page(ui, fonts),
+                Page::Input => self.input_page(ui),
+                Page::Network => self.network_page(ui),
+                Page::Highlighting => self.highlighting_page(ui),
+                Page::Animations => self.animations_page(ui),
             });
 
         ui.add_space(BUTTONS_GAP);
         ui.horizontal(|ui| {
-            if ui.button("Cancel").clicked() {
-                outcome = Outcome::Cancel;
-            }
-            if ui.add(egui::Button::new(RichText::new("OK").strong())).clicked() {
-                outcome = Outcome::Save(self.working());
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let accent = ui.visuals().selection.bg_fill;
+                if ui.add(style::accent_button("Save changes", accent)).clicked() {
+                    outcome = Outcome::Save(self.working());
+                }
+                if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, 30.0))).clicked() {
+                    outcome = Outcome::Cancel;
+                }
+            });
         });
         outcome
     }
@@ -177,10 +185,8 @@ impl Preferences {
         // A rule along the bottom of the tabs, under the selected one's
         // underline, so it's laid down first and filled in after.
         let rule = ui.painter().add(egui::Shape::Noop);
-        let tabs = ui.horizontal(|ui| {
-            for (page, label) in
-                [(Page::General, "General"), (Page::Highlighting, "Highlighting"), (Page::Animations, "Animations")]
-            {
+        let tabs = ui.horizontal_wrapped(|ui| {
+            for (page, label) in Page::ALL {
                 if style::tab_button(ui, label, self.page == page, true, accent).clicked() && self.page != page {
                     self.page = page;
                     // A dialog is centred by its size last frame; draw again
@@ -194,13 +200,15 @@ impl Preferences {
         ui.painter().set(rule, egui::Shape::hline(ui.max_rect().x_range(), y, Stroke::new(1.0, style::border(ui))));
     }
 
-    fn general_page(&mut self, ui: &mut Ui, monospace_fonts: &[String], outcome: &mut Outcome) {
+    fn appearance_page(&mut self, ui: &mut Ui, fonts: &mut Fonts, outcome: &mut Outcome) {
+        scope_note(ui, "Theme changes apply to all open and new sessions after you save.");
         egui::Grid::new("prefs_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label("Color theme");
             ui.horizontal(|ui| {
                 let names = self.working().theme_names();
                 egui::ComboBox::from_id_salt("theme")
-                    .width(180.0)
+                    .width((ui.available_width() - 190.0).clamp(120.0, 320.0))
+                    .truncate()
                     .height(320.0)
                     .selected_text(self.settings.theme.clone())
                     .show_ui(ui, |ui| {
@@ -223,12 +231,8 @@ impl Preferences {
                 }
             });
             ui.end_row();
-
-            ui.label("Preview");
-            let colors = self.current_colors();
-            self.theme_preview.ui(ui, colors);
-            ui.end_row();
         });
+        self.font_preview(ui, fonts);
 
         let mut colors = self.current_colors();
         let mut colors_changed = false;
@@ -278,45 +282,67 @@ impl Preferences {
             self.custom = colors;
             self.settings.theme = "Custom".into();
         }
+    }
 
-        ui.add_space(6.0);
+    fn terminal_page(&mut self, ui: &mut Ui, fonts: &mut Fonts) {
+        scope_note(
+            ui,
+            "Defaults for New session. Open sessions and saved profiles keep their own font and scrollback settings.",
+        );
+        style::section_heading(ui, "New session defaults");
         egui::Grid::new("prefs_defaults").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label("Font (new sessions)");
-            sidebar::font_picker(ui, "prefs_font", &mut self.settings.font_family, monospace_fonts);
+            let label = ui.label("Font family");
+            sidebar::font_picker(ui, "prefs_font", &mut self.settings.font_family, &fonts.monospace)
+                .labelled_by(label.id);
             ui.end_row();
 
-            ui.label("Font size");
-            ui.add(DragValue::new(&mut self.settings.font_size).range(6..=48));
+            let label = ui.label("Font size");
+            ui.add(DragValue::new(&mut self.settings.font_size).range(6..=48).suffix(" pt")).labelled_by(label.id);
             ui.end_row();
 
-            ui.label("Default scrollback");
-            ui.add(DragValue::new(&mut self.settings.scrollback).range(0..=200_000).speed(100.0));
+            let label = ui.label("Scrollback lines");
+            ui.add(DragValue::new(&mut self.settings.scrollback).range(0..=200_000).speed(100.0)).labelled_by(label.id);
             ui.end_row();
         });
-        ui.label(
-            RichText::new("Font settings apply to sessions opened from now on.").color(style::secondary(ui)).small(),
-        );
+        self.font_preview(ui, fonts);
+    }
 
-        ui.add_space(6.0);
+    fn font_preview(&mut self, ui: &mut Ui, fonts: &mut Fonts) {
+        ui.add_space(8.0);
+        ui.label(format!("Preview — {} pt", self.settings.font_size));
+        let family = fonts.family(ui.ctx(), &self.settings.font_family);
+        let (regular, bold) = Fonts::font_ids(family.as_deref(), fonts::points_to_pixels(self.settings.font_size));
+        let colors = self.current_colors();
+        self.theme_preview.ui(ui, colors, regular, bold);
+    }
+
+    fn input_page(&mut self, ui: &mut Ui) {
+        scope_note(ui, "Used for future input and paste actions in open and new sessions after you save.");
+        style::section_heading(ui, "Mouse and clipboard");
         ui.checkbox(&mut self.settings.right_click_paste, "Right-click pastes (PuTTY style)").on_hover_text(
             "Enabled by default. Turn off to open the terminal context menu on right-click and choose Paste there. Ctrl+right-click opens the menu in either mode.",
         );
         ui.checkbox(&mut self.settings.preview_multiline_paste, "Preview multiline paste")
             .on_hover_text("Review the destination and edit text before sending. Single-line paste stays immediate.");
         ui.horizontal(|ui| {
-            ui.label("Paste delay between lines");
+            let label = ui.label("Paste delay between lines");
             ui.add(
                 egui::DragValue::new(&mut self.settings.paste_delay_ms)
                     .range(0..=crate::paste::MAX_DELAY_MS)
                     .suffix(" ms"),
-            );
+            )
+            .labelled_by(label.id);
         });
         ui.checkbox(&mut self.settings.auto_paging, "Automatically page through show commands").on_hover_text(
             "Press Space at Cisco More prompts during show commands. Off by default. q or Ctrl+C stops it.",
         );
-        ui.add_space(10.0);
+    }
+
+    fn network_page(&mut self, ui: &mut Ui) {
+        scope_note(ui, "Network policy and update settings apply to the whole app after you save.");
         style::section_heading(ui, "Network privacy");
-        ui.add_enabled(!self.update_busy, egui::Checkbox::new(&mut self.settings.offline_mode, "Offline mode"));
+        let offline =
+            ui.add_enabled(!self.update_busy, egui::Checkbox::new(&mut self.settings.offline_mode, "Offline mode"));
         if self.update_busy {
             ui.label(
                 RichText::new("Wait for the current update check or download to finish before changing offline mode.")
@@ -326,7 +352,32 @@ impl Preferences {
         if self.settings.offline_mode {
             self.settings.check_for_updates = false;
         }
-        ui.label(RichText::new("Offline mode disables update checks and downloads. It asks before DNS lookups and every connection outside private/local IP ranges. Serial and local IP connections work directly. Enabling it closes open network sessions.").small());
+        ui.add(egui::Label::new("Offline mode asks before DNS lookups and connections outside private/local IP ranges. Serial and local IP connections work directly.").wrap());
+        if self.settings.offline_mode && !self.offline_at_open {
+            let warning = if self.network_sessions > 0 {
+                format!(
+                    "Saving will close {} open network {}. Serial sessions stay connected.",
+                    self.network_sessions,
+                    if self.network_sessions == 1 { "session" } else { "sessions" }
+                )
+            } else {
+                "Enabling Offline mode closes open network sessions. Serial sessions stay connected.".into()
+            };
+            let warning = egui::Frame::new()
+                .fill(ui.visuals().warn_fg_color.gamma_multiply(0.12))
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(RichText::new(warning).strong().color(ui.visuals().warn_fg_color)).wrap());
+                });
+            if offline.changed() {
+                warning.response.scroll_to_me(Some(egui::Align::Center));
+            }
+        }
+        ui.add_space(12.0);
+        style::section_heading(ui, "Updates");
+        if self.settings.offline_mode {
+            ui.add(egui::Label::new("Update checks and downloads are disabled in Offline mode.").wrap());
+        }
         ui.add_enabled(
             !self.settings.offline_mode,
             egui::Checkbox::new(&mut self.settings.check_for_updates, "Check for updates when Snekkie starts"),
@@ -334,6 +385,7 @@ impl Preferences {
     }
 
     fn highlighting_page(&mut self, ui: &mut Ui) {
+        scope_note(ui, "Highlighting intensity applies to all open and new sessions after you save.");
         ui.label("Syntax highlighting intensity");
         ui.horizontal(|ui| {
             ui.label("Less");
@@ -347,8 +399,7 @@ impl Preferences {
         ui.label(RichText::new(highlight::intensity_label(self.settings.highlighting_intensity)).strong());
         ui.label(highlight::intensity_help(self.settings.highlighting_intensity));
         ui.label(
-            RichText::new("Applies to all open and new sessions. Choose each session's vendor in the Device menu.")
-                .small(),
+            RichText::new("Choose each session's vendor in the sidebar's Highlighting menu. The preview below does not change a session's vendor."),
         );
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -366,7 +417,7 @@ impl Preferences {
         if theme.effects.monochrome {
             ui.label(
                 RichText::new(
-                    "This theme uses monochrome output. Turn it off under Theme colors to see syntax colors.",
+                    "This theme uses monochrome output. Turn it off under Appearance → Theme colors to see syntax colors.",
                 )
                 .small(),
             );
@@ -375,10 +426,27 @@ impl Preferences {
     }
 
     fn animations_page(&mut self, ui: &mut Ui) {
+        scope_note(ui, "Animation changes apply to all open and new sessions after you save.");
         let animations = &mut self.settings.animations;
-        ui.checkbox(&mut animations.enabled, "Animations");
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut animations.enabled, "Animations");
+            if ui
+                .button("Reduce motion")
+                .on_hover_text(
+                    "Use a steady cursor and a short output fade. No movement, particles, shake or delayed reveal.",
+                )
+                .clicked()
+            {
+                *animations = settings::Animations::reduced_motion();
+            }
+        });
         ui.label(
-            RichText::new("Off by default. Pick a style for each kind, or Off.").color(style::secondary(ui)).small(),
+            RichText::new(if animations.enabled {
+                "Pick a style for each kind, or choose Off."
+            } else {
+                "Animations are disabled. Enable them to adjust styles; your choices are kept."
+            })
+            .color(style::secondary(ui)),
         );
         ui.add_space(6.0);
 
@@ -395,23 +463,16 @@ impl Preferences {
                 ui.label(format!("{:.1}×", animations.speed));
             });
             ui.add_space(6.0);
-            ui.columns(2, |columns| {
-                style::section_heading(&mut columns[0], "Typing");
-                egui::Grid::new("animations_typing").num_columns(2).spacing([10.0, 6.0]).show(&mut columns[0], |ui| {
-                    style_row(ui, "Cursor movement", &mut animations.cursor_motion);
-                    style_row(ui, "Cursor blink", &mut animations.cursor_blink);
-                    style_row(ui, "Typed characters", &mut animations.typed_text);
-                    style_row(ui, "Keystroke burst", &mut animations.keystroke_burst);
-                    style_row(ui, "Screen shake", &mut animations.shake);
+            if ui.available_width() < 560.0 {
+                typing_styles(ui, animations);
+                ui.add_space(12.0);
+                output_styles(ui, animations);
+            } else {
+                ui.columns(2, |columns| {
+                    typing_styles(&mut columns[0], animations);
+                    output_styles(&mut columns[1], animations);
                 });
-                style::section_heading(&mut columns[1], "Output");
-                egui::Grid::new("animations_output").num_columns(2).spacing([10.0, 6.0]).show(&mut columns[1], |ui| {
-                    style_row(ui, "New text", &mut animations.new_text);
-                    style_row(ui, "Reveal", &mut animations.reveal);
-                    style_row(ui, "Scrolling", &mut animations.scrolling);
-                    style_row(ui, "New lines", &mut animations.new_lines);
-                });
-            });
+            }
         });
 
         ui.add_space(8.0);
@@ -419,6 +480,32 @@ impl Preferences {
         let colors = self.current_colors();
         self.preview.ui(ui, colors, self.settings.animations);
     }
+}
+
+fn scope_note(ui: &mut Ui, text: &str) {
+    ui.add(egui::Label::new(RichText::new(text).color(style::secondary(ui))).wrap());
+    ui.add_space(8.0);
+}
+
+fn typing_styles(ui: &mut Ui, animations: &mut settings::Animations) {
+    style::section_heading(ui, "Typing");
+    egui::Grid::new("animations_typing").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+        style_row(ui, "Cursor movement", &mut animations.cursor_motion);
+        style_row(ui, "Cursor blink", &mut animations.cursor_blink);
+        style_row(ui, "Typed characters", &mut animations.typed_text);
+        style_row(ui, "Keystroke burst", &mut animations.keystroke_burst);
+        style_row(ui, "Screen shake", &mut animations.shake);
+    });
+}
+
+fn output_styles(ui: &mut Ui, animations: &mut settings::Animations) {
+    style::section_heading(ui, "Output");
+    egui::Grid::new("animations_output").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+        style_row(ui, "New text", &mut animations.new_text);
+        style_row(ui, "Reveal", &mut animations.reveal);
+        style_row(ui, "Scrolling", &mut animations.scrolling);
+        style_row(ui, "New lines", &mut animations.new_lines);
+    });
 }
 
 /// What a style drop-down needs to know about a kind of animation.

@@ -23,9 +23,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows is the primary target. Linux also runs the pty-based
-        # serial tests that Windows has to skip.
-        os: [ubuntu-latest, windows-latest]
+        # Windows is the primary target. Linux and macOS also run the
+        # pty-based serial tests that Windows has to skip.
+        os: [ubuntu-latest, windows-latest, macos-latest]
 
     runs-on: ${{ matrix.os }}
 
@@ -38,15 +38,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Check public documentation
+        run: python scripts/check-public-docs.py
+
       - name: Format
         if: runner.os == 'Linux'
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
   build-windows:
     # Builds for tagged releases, or on demand from the Actions tab so the
@@ -104,7 +107,7 @@ jobs:
           }
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - uses: actions/upload-artifact@v7
         with:
@@ -303,6 +306,9 @@ jobs:
     # one it was built against, so build on the oldest supported runner.
     runs-on: ubuntu-22.04
 
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
     steps:
       - uses: actions/checkout@v7
 
@@ -310,24 +316,253 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: cargo build --release
+      - name: Read the version
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [[ $GITHUB_REF == refs/tags/v* && ${GITHUB_REF_NAME#v} != "$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the version in Cargo.toml ($version)."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      # A tarball, because release downloads drop the executable bit.
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev rpm desktop-file-utils \
+            libxkbcommon0 libxkbcommon-x11-0 libxcursor1 libxrandr2 libxi6
+
+      # The tarball keeps the executable bit, which plain downloads drop.
+      # Revision 0 packages and an older 0.0.1 release are test fixtures for
+      # upgrades; only dist/ is published.
       - name: Package
-        run: tar -czf snekkie-linux-x86_64.tar.gz -C target/release snekkie
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist fixtures/revision-0 fixtures/older
+          tar -czf dist/snekkie-linux-x86_64.tar.gz -C target/release snekkie
+          bash scripts/package-linux.sh "$VERSION" target/release/snekkie dist 1
+          bash scripts/package-appimage.sh "$VERSION" target/release/snekkie dist
+          bash scripts/package-linux.sh "$VERSION" target/release/snekkie fixtures/revision-0 0
+          bash scripts/package-linux.sh 0.0.1 target/release/snekkie fixtures/older 1
+          bash scripts/package-appimage.sh 0.0.1 target/release/snekkie fixtures/older
+          cp target/release/snekkie fixtures/snekkie
+          ls -l dist fixtures/*
 
       - uses: actions/upload-artifact@v7
         with:
           name: snekkie-linux
-          path: snekkie-linux-x86_64.tar.gz
+          path: dist/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-test-fixtures
+          path: fixtures/
+          if-no-files-found: error
+
+  linux-packages:
+    # Real package-manager installs, upgrades and removals, a desktop launch,
+    # and the online installer, each in a disposable container.
+    needs: build-linux
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu:22.04, ubuntu:24.04, debian:12, debian:13, fedora:44, opensuse/leap:16.0, opensuse/tumbleweed]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: snekkie-linux
+          path: dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-test-fixtures
+          path: fixtures
+
+      - name: Package lifecycle and desktop launch
+        env:
+          VERSION: ${{ needs.build-linux.outputs.version }}
+        run: bash scripts/test-linux-packages.sh dist "$VERSION" fixtures/revision-0 "${{ matrix.image }}"
+
+      - name: Online installer from local release folders
+        run: |
+          mkdir -p installer-new
+          cp dist/*.deb dist/*.rpm dist/*.AppImage installer-new/
+          (cd installer-new && sha256sum -- * > SHA256SUMS)
+          (cd fixtures/older && sha256sum -- * > SHA256SUMS)
+          bash scripts/test-install-script.sh containers fixtures/older installer-new "${{ matrix.image }}"
+
+  flatpak:
+    # Packages the Ubuntu 22.04 binary for the Freedesktop runtime, then
+    # installs, launches and updates it, and launches the AppImage.
+    needs: build-linux
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-test-fixtures
+          path: fixtures
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: snekkie-linux
+          path: dist
+
+      - name: Install Flatpak and desktop test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak appstream appstream-compose \
+            desktop-file-utils binutils python3 xvfb xauth xdotool dbus-x11 imagemagick \
+            libgl1-mesa-dri libegl1 libgl1 libxkbcommon-x11-0 libxcursor1 libxrandr2 libxi6
+
+      - name: Build the Flatpak bundles
+        env:
+          VERSION: ${{ needs.build-linux.outputs.version }}
+        run: |
+          chmod 0755 fixtures/snekkie dist/*.AppImage fixtures/older/*.AppImage
+          mkdir -p flatpak
+          bash scripts/package-flatpak.sh "$VERSION" fixtures/snekkie flatpak
+          bash scripts/package-flatpak.sh 0.0.1 fixtures/snekkie fixtures/older
+
+      - name: Launch the Flatpak and AppImage
+        env:
+          VERSION: ${{ needs.build-linux.outputs.version }}
+        run: |
+          bash scripts/test-linux-portable.sh flatpak "flatpak/Snekkie-$VERSION-x86_64.flatpak" target/portable-smoke/flatpak
+          bash scripts/test-linux-portable.sh appimage "dist/Snekkie-$VERSION-x86_64.AppImage" target/portable-smoke/appimage
+
+      - name: Online installer with the Flatpak
+        run: |
+          (cd flatpak && sha256sum -- *.flatpak > SHA256SUMS)
+          (cd fixtures/older && sha256sum -- * > SHA256SUMS)
+          bash scripts/test-install-script.sh flatpak fixtures/older flatpak
+
+      - name: Keep launch screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-launch-screenshots
+          path: target/portable-smoke/
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: snekkie-flatpak
+          path: flatpak/*.flatpak
+          if-no-files-found: error
+
+  build-macos:
+    # One universal app for Apple silicon and Intel Macs, from macOS 11 on.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: macos-latest
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read the version
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [[ $GITHUB_REF == refs/tags/v* && ${GITHUB_REF_NAME#v} != "$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the version in Cargo.toml ($version)."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build for Apple silicon and Intel
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      # The older 0.0.1 image only exercises installer updates; it is not published.
+      - name: Package the disk images
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          bash scripts/package-macos.sh "$VERSION" dist
+          bash scripts/package-macos.sh 0.0.1 fixtures/older
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: snekkie-macos
+          path: dist/*.dmg
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-test-fixtures
+          path: fixtures/older/*.dmg
+          if-no-files-found: error
+
+  test-macos:
+    needs: build-macos
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: snekkie-macos
+          path: dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: macos-test-fixtures
+          path: fixtures/older
+
+      - name: Launch the app from the disk image
+        env:
+          VERSION: ${{ needs.build-macos.outputs.version }}
+        run: bash scripts/test-macos-app.sh "dist/Snekkie-$VERSION-macos-universal.dmg" "$VERSION" target/macos-smoke
+
+      - name: Online installer with the disk image
+        run: |
+          (cd dist && shasum -a 256 Snekkie-*.dmg > SHA256SUMS)
+          (cd fixtures/older && shasum -a 256 Snekkie-*.dmg > SHA256SUMS)
+          bash scripts/test-install-script.sh macos fixtures/older dist
+
+      - name: Keep launch screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-launch-${{ matrix.os }}
+          path: target/macos-smoke/
+          if-no-files-found: ignore
 
   release:
     # Publishes the tag as a GitHub release with the builds attached. A tag
     # with a suffix (v2.1.0-beta.1) becomes a pre-release, so testers can
     # try it without it showing up as the latest version.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-windows, sign-windows, build-linux]
+    needs: [build-windows, sign-windows, build-linux, linux-packages, flatpak, build-macos, test-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write  # needed to create the release
@@ -343,8 +578,23 @@ jobs:
         with:
           name: snekkie-linux
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: snekkie-flatpak
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: snekkie-macos
+
+      # The online installers for Linux and macOS select assets from this
+      # file, so every package must be listed exactly once.
       - name: Calculate checksums of the final release files
-        run: sha256sum Snekkie-Setup-*.exe snekkie-*-portable.exe snekkie-linux-x86_64.tar.gz > SHA256SUMS
+        run: |
+          sha256sum Snekkie-Setup-*.exe snekkie-*-portable.exe snekkie-linux-x86_64.tar.gz \
+            snekkie_*_amd64.deb snekkie-*.x86_64.rpm Snekkie-*-x86_64.AppImage Snekkie-*-x86_64.flatpak \
+            Snekkie-*-macos-universal.dmg > SHA256SUMS
+          cat SHA256SUMS
+          [ "$(wc -l < SHA256SUMS)" -eq 8 ]
 
       - name: Publish release
         env:
@@ -355,23 +605,20 @@ jobs:
           release_args=(--title "Snekkie $version")
           case "$GITHUB_REF_NAME" in *-*) release_args+=(--prerelease) ;; esac
           notes_file="docs/releases/$version.md"
-          if [ -f "$notes_file" ]; then
-            cp "$notes_file" "$RUNNER_TEMP/release-notes.md"
-            notes_file="$RUNNER_TEMP/release-notes.md"
-            release_args+=(--notes-file "$notes_file")
-          else
-            release_args+=(--generate-notes)
-            notes_file="$RUNNER_TEMP/release-notes.md"
-            : > "$notes_file"
-            if [ "$SIGNING_ENABLED" = true ]; then
-              release_args+=(--notes-file "$notes_file")
-            fi
+          if [ ! -f "$notes_file" ]; then
+            echo "::error::A reviewed docs/releases/$version.md is required."
+            exit 1
           fi
+          cp "$notes_file" "$RUNNER_TEMP/release-notes.md"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          release_args+=(--notes-file "$notes_file")
           if [ "$SIGNING_ENABLED" = true ]; then
             printf '\n\nFree code signing provided by SignPath.io, certificate by SignPath Foundation.\n\n[Code signing policy](https://github.com/%s/blob/%s/docs/code-signing.md)\n' \
               "$GITHUB_REPOSITORY" "$GITHUB_SHA" >> "$notes_file"
           fi
           gh release create "$GITHUB_REF_NAME" \
-            Snekkie-Setup-*.exe snekkie-*-portable.exe snekkie-linux-x86_64.tar.gz SHA256SUMS \
+            Snekkie-Setup-*.exe snekkie-*-portable.exe snekkie-linux-x86_64.tar.gz \
+            snekkie_*_amd64.deb snekkie-*.x86_64.rpm Snekkie-*-x86_64.AppImage Snekkie-*-x86_64.flatpak \
+            Snekkie-*-macos-universal.dmg SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             "${release_args[@]}"
