@@ -2,7 +2,7 @@
 
 This directory keeps historical information about the retired Python releases separate from current Snekkie documentation. Use the [latest release](https://github.com/Dynamitecrown/Snekkie/releases/latest) for current development and packaged updates.
 
-Current Rust release: **2.6.0**. Use the [current documentation index](../../README.md) and [2.6.0 release notes](../../releases/2.6.0.md) for current features and updates. The information below remains historical.
+Current Rust release: **2.7.0**. Use the [current documentation index](../../README.md) and [2.7.0 release notes](../../releases/2.7.0.md) for current features and updates. The information below remains historical.
 
 | Version | Release and downloads | Source |
 | --- | --- | --- |

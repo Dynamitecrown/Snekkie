@@ -4,6 +4,7 @@ pub mod animation;
 pub mod animation_preview;
 pub mod app;
 pub mod fonts;
+pub mod invade;
 mod paste;
 pub mod preferences;
 mod profile_transfer;

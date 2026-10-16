@@ -1,12 +1,12 @@
 # Snekkie
 
-A tabbed SSH, Telnet, raw TCP and serial terminal for network engineers, built in Rust for Windows, Linux and macOS.
+Snekkie 2.7.0 is a tabbed SSH, Telnet, raw TCP and serial terminal for network engineers, built in Rust for Windows, Linux and macOS.
 
 **[Download the Windows master installer](https://github.com/Dynamitecrown/Snekkie/releases/download/installer-v1.0.0/Snekkie-Setup.exe)**
 
 Download this master installer once. It fetches and verifies the latest stable app from GitHub; future updates install through Snekkie's **Update** button.
 
-[Offline Windows installers, portable Windows and Linux downloads](https://github.com/Dynamitecrown/Snekkie/releases/latest) · [2.6.0 release notes](docs/releases/2.6.0.md)
+[Offline Windows installers, portable Windows, Linux and macOS downloads](https://github.com/Dynamitecrown/Snekkie/releases/latest) · [2.7.0 release notes](docs/releases/2.7.0.md)
 
 ## What it does
 
@@ -27,14 +27,14 @@ Full `Snekkie-Setup-<version>.exe` downloads support offline setup. Portable cop
 
 Windows downloads are currently unsigned, so SmartScreen may warn. See the [installer guide](docs/master-installer.md) and [signing policy](docs/code-signing.md).
 
-**Linux and macOS:** Starting with the release after 2.6.0, one install script picks the `.deb`, `.rpm`, Flatpak, AppImage or universal macOS app that suits your computer, verifies it against the release checksums and installs it. Run it again to update:
+**Linux and macOS:** Starting with 2.7.0, one install script picks the `.deb`, `.rpm`, Flatpak, AppImage or universal macOS app that suits your computer, verifies it against the release checksums and installs it. Run it again to update:
 
 ```bash
 curl -fsSLO https://github.com/Dynamitecrown/Snekkie/releases/download/unix-installer-v1.0.0/snekkie-install.sh
 sh snekkie-install.sh
 ```
 
-Each package can also be downloaded and installed by itself. See [Installing on Linux and macOS](docs/linux-and-macos.md) for per-distribution commands, macOS first launch and serial permissions. Release 2.6.0 offers only `snekkie-linux-x86_64.tar.gz` for x86_64 Linux: extract it with `tar -xzf snekkie-linux-x86_64.tar.gz` and run `./snekkie`.
+Each package can also be downloaded and installed by itself. See [Installing on Linux and macOS](docs/linux-and-macos.md) for per-distribution commands, macOS first launch and serial permissions.
 
 Linux serial access may require membership in `dialout`. On Windows, install your USB console cable's driver if its COM port is missing.
 

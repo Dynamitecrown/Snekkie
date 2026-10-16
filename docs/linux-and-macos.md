@@ -4,8 +4,8 @@ Snekkie for Linux comes as a `.deb`, an `.rpm`, a Flatpak bundle, an AppImage an
 plain tarball. The macOS version is a universal app for Apple silicon and Intel Macs.
 One install script picks the right one for your computer.
 
-> **Availability:** these packages and the install script ship with the first release
-> after 2.6.0. Release 2.6.0 and earlier offer only `snekkie-linux-x86_64.tar.gz` for
+> **Availability:** these packages and the install script are available from 2.7.0.
+> Release 2.6.0 and earlier offer only `snekkie-linux-x86_64.tar.gz` for
 > Linux and nothing for macOS.
 
 ## Install script (recommended)

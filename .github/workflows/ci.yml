@@ -38,15 +38,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Check public documentation
+        run: python scripts/check-public-docs.py
+
       - name: Format
         if: runner.os == 'Linux'
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
   build-windows:
     # Builds for tagged releases, or on demand from the Actions tab so the
@@ -104,7 +107,7 @@ jobs:
           }
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - uses: actions/upload-artifact@v7
         with:
@@ -602,18 +605,13 @@ jobs:
           release_args=(--title "Snekkie $version")
           case "$GITHUB_REF_NAME" in *-*) release_args+=(--prerelease) ;; esac
           notes_file="docs/releases/$version.md"
-          if [ -f "$notes_file" ]; then
-            cp "$notes_file" "$RUNNER_TEMP/release-notes.md"
-            notes_file="$RUNNER_TEMP/release-notes.md"
-            release_args+=(--notes-file "$notes_file")
-          else
-            release_args+=(--generate-notes)
-            notes_file="$RUNNER_TEMP/release-notes.md"
-            : > "$notes_file"
-            if [ "$SIGNING_ENABLED" = true ]; then
-              release_args+=(--notes-file "$notes_file")
-            fi
+          if [ ! -f "$notes_file" ]; then
+            echo "::error::A reviewed docs/releases/$version.md is required."
+            exit 1
           fi
+          cp "$notes_file" "$RUNNER_TEMP/release-notes.md"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          release_args+=(--notes-file "$notes_file")
           if [ "$SIGNING_ENABLED" = true ]; then
             printf '\n\nFree code signing provided by SignPath.io, certificate by SignPath Foundation.\n\n[Code signing policy](https://github.com/%s/blob/%s/docs/code-signing.md)\n' \
               "$GITHUB_REPOSITORY" "$GITHUB_SHA" >> "$notes_file"

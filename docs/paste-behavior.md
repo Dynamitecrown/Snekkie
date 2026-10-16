@@ -2,7 +2,7 @@
 
 Paste review, pacing and the right-click preference are available in Snekkie 2.6.0. Version 2.5.0 used PuTTY-style direct paste.
 
-In **Settings → Preferences → General**, choose **Right-click pastes (PuTTY style)**:
+In **Settings → Preferences → Input & paste**, choose **Right-click pastes (PuTTY style)**:
 
 | Setting | Plain right-click on terminal output | Ctrl+right-click |
 | --- | --- | --- |
@@ -23,7 +23,7 @@ CRLF, LF and CR all become CR on the wire. Empty lines are retained. A last line
 
 ## Pace and stop
 
-The default delay is **100 ms**; the preview accepts **0–5,000 ms**. Preferences → General saves **Paste delay between lines** and the preview checkbox for future pastes. Changing the delay in one preview only affects that paste. Canceling Preferences discards preference edits.
+The default delay is **100 ms**; the preview accepts **0–5,000 ms**. Preferences → Input & paste saves **Paste delay between lines** and the preview checkbox for future pastes. Changing the delay in one preview only affects that paste. Canceling Preferences discards preference edits.
 
 With a positive delay, the status bar shows the target and lines submitted, plus **Stop paste**. Stop discards remaining lines; lines already submitted to the transport cannot be recalled. Progress reports submission, not acknowledgment from the device. Delayed frames do not catch up by sending several lines at once.
 

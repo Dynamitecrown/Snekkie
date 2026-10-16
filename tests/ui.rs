@@ -333,7 +333,7 @@ fn super_themes_change_the_whole_app_and_standard_restores_it() {
     for (name, light) in [("E-Ink Super", true), ("Blueprint Super", false), ("Amber Super", false)] {
         open_preferences(&mut harness);
         choose_theme(&mut harness, current, name);
-        harness.get_by_label("OK").click();
+        harness.get_by_label("Save changes").click();
         harness.run_ok();
         assert_eq!(harness.ctx.global_style().visuals.dark_mode, !light);
         assert!(harness.ctx.global_style().visuals.override_text_color.is_some());
@@ -342,7 +342,7 @@ fn super_themes_change_the_whole_app_and_standard_restores_it() {
     }
     open_preferences(&mut harness);
     choose_theme(&mut harness, current, "Snekkie Dark");
-    harness.get_by_label("OK").click();
+    harness.get_by_label("Save changes").click();
     harness.run_ok();
     assert!(harness.ctx.global_style().visuals.override_text_color.is_none());
     assert_eq!(harness.get_by_label("Terminal output").rect(), original);
@@ -404,6 +404,7 @@ fn offline_mode_keeps_local_connections_and_requires_explicit_public_and_dns_app
     harness.get_by_label("OK").click();
     harness.run_ok();
     open_preferences(&mut harness);
+    show_page(&mut harness, "Network");
     harness.get_by_role_and_label(Role::CheckBox, "Offline mode").scroll_to_me();
     harness.run_ok();
     harness.get_by_role_and_label(Role::CheckBox, "Offline mode").click();
@@ -412,11 +413,12 @@ fn offline_mode_keeps_local_connections_and_requires_explicit_public_and_dns_app
     harness.run_ok();
     assert!(store.load().offline_mode);
     open_preferences(&mut harness);
+    show_page(&mut harness, "Network");
     harness.get_by_role_and_label(Role::CheckBox, "Offline mode").scroll_to_me();
     harness.run_ok();
     harness.get_by_role_and_label(Role::CheckBox, "Offline mode").click();
     harness.run_ok();
-    harness.get_by_label("OK").click();
+    harness.get_by_label("Save changes").click();
     harness.run_ok();
     assert!(!store.load().offline_mode);
     assert!(!store.load().check_for_updates);
@@ -430,11 +432,12 @@ fn enabling_offline_mode_closes_existing_network_sessions_and_new_local_sessions
     let mut old = open_raw_tab(&mut harness, "Before privacy change");
     old.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
     open_preferences(&mut harness);
+    show_page(&mut harness, "Network");
     harness.get_by_role_and_label(Role::CheckBox, "Offline mode").scroll_to_me();
     harness.run_ok();
     harness.get_by_role_and_label(Role::CheckBox, "Offline mode").click();
     harness.run_ok();
-    harness.get_by_label("OK").click();
+    harness.get_by_label("Save changes").click();
     harness.run_ok();
     let saved = snekkie::settings::SettingsStore::new(dir.path().join("settings.json")).load();
     assert!(saved.offline_mode);
@@ -467,12 +470,92 @@ fn creative_animation_choices_are_selectable_and_saved() {
         harness.get_by_label(new).click();
         harness.run_ok();
     }
-    harness.get_by_label("OK").click();
+    harness.get_by_label("Save changes").click();
     harness.run_ok();
     let saved = snekkie::settings::SettingsStore::new(dir.path().join("settings.json")).load();
     assert!(saved.animations.enabled);
     assert_eq!(saved.animations.keystroke_burst, snekkie::settings::KeystrokeBurst::Portal);
     assert_eq!(saved.animations.typed_text, snekkie::settings::TypedText::Stamp);
+}
+
+#[test]
+fn gentle_motion_choices_and_preset_can_be_previewed_cancelled_and_saved() {
+    use snekkie::settings::{Animations, NewLines, NewText, SettingsStore};
+    let dir = tempfile::tempdir().unwrap();
+    let store = SettingsStore::new(dir.path().join("settings.json"));
+    let original = store.load();
+    let mut app = harness(&dir);
+    open_preferences(&mut app);
+    show_page(&mut app, "Animations");
+    app.get_by_label("Reduce motion").click();
+    app.run_ok();
+    assert!(animations_ticked(&app));
+    app.get_by_value("Steady");
+    for (control, choice) in [("New text", "Focus"), ("New lines", "Bookends"), ("New lines", "Outline")] {
+        app.get_by_label(control).scroll_to_me();
+        app.run_ok();
+        app.get_by_label(control).click();
+        app.run_ok();
+        app.get_by_label(choice).scroll_to_me();
+        app.run_ok();
+        app.get_by_label(choice).click();
+        app.run_ok();
+    }
+    assert_eq!(store.load(), original);
+    app.get_by_label("Cancel").click();
+    app.run_ok();
+    assert_eq!(store.load(), original);
+
+    open_preferences(&mut app);
+    show_page(&mut app, "Animations");
+    assert!(!animations_ticked(&app));
+    app.get_by_label("Reduce motion").click();
+    app.run_ok();
+    app.get_by_label("Save changes").click();
+    app.run_ok();
+    assert_eq!(store.load().animations, Animations::reduced_motion());
+
+    open_preferences(&mut app);
+    show_page(&mut app, "Animations");
+    for (control, choice) in [("New text", "Focus"), ("New lines", "Bookends")] {
+        app.get_by_label(control).click();
+        app.run_ok();
+        app.get_by_label(choice).click();
+        app.run_ok();
+    }
+    app.get_by_label("Save changes").click();
+    app.run_ok();
+    let animations = store.load().animations;
+    assert_eq!(animations.new_text, NewText::Focus);
+    assert_eq!(animations.new_lines, NewLines::Bookends);
+}
+
+#[test]
+fn new_theme_presets_are_reachable_on_first_open_and_persist_after_restart() {
+    use snekkie::settings::{AppSettings, SettingsStore};
+    for size in [[1000.0, 640.0], [520.0, 320.0]] {
+        for name in ["Frost Light", "Copper Night", "Forest Night"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = SettingsStore::new(dir.path().join("settings.json"));
+            store.save(&AppSettings { check_for_updates: false, ..Default::default() }).unwrap();
+            let mut app = harness_sized(&dir, size);
+            open_preferences(&mut app);
+            app.get_by_value("Snekkie Dark").click();
+            app.run_ok();
+            app.get_by_label(name).scroll_to_me();
+            app.run_ok();
+            app.get_by_label(name).click();
+            app.run_ok();
+            app.get_by_value(name);
+            app.get_by_label("Save changes").click();
+            app.run_ok();
+            assert_eq!(store.load().theme, name);
+            drop(app);
+            let mut restarted = harness_sized(&dir, size);
+            open_preferences(&mut restarted);
+            restarted.get_by_value(name);
+        }
+    }
 }
 
 #[test]
@@ -619,7 +702,7 @@ fn favorites_save_without_connecting_and_survive_restart() {
     let mut app = harness(&dir);
     app.get_by_label("Alpha").click();
     app.run_ok();
-    app.get_by_label("Load").click();
+    app.get_by_label("Edit connection").click();
     app.run_ok();
     app.get_by_label("Favorite Beta").click();
     app.run_ok();
@@ -655,6 +738,146 @@ fn saved_sessions_and_their_actions_fit_the_default_window() {
     let first = app.get_by_label("Alpha").rect();
     let delete = app.get_by_label("Delete").rect();
     assert!(delete.top() - first.top() >= 3.0 * first.height(), "list too short: {first:?} to {delete:?}");
+}
+
+#[test]
+fn connect_selected_opens_the_saved_destination_and_leaves_the_form_draft_alone() {
+    use snekkie::profiles::{Profile, ProfileStore};
+    let dir = tempfile::tempdir().unwrap();
+    let saved_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    saved_listener.set_nonblocking(true).unwrap();
+    let draft_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    draft_listener.set_nonblocking(true).unwrap();
+    ProfileStore::open(dir.path().join("sessions.json"))
+        .put(Profile {
+            name: "Saved switch".into(),
+            kind: "raw".into(),
+            host: "127.0.0.1".into(),
+            port: saved_listener.local_addr().unwrap().port(),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut app = harness(&dir);
+    *app.state_mut().sidebar_draft() = Profile {
+        name: "Unsaved draft".into(),
+        kind: "raw".into(),
+        host: "127.0.0.1".into(),
+        port: draft_listener.local_addr().unwrap().port(),
+        ..Default::default()
+    };
+    let draft = app.state_mut().sidebar_draft().clone();
+    app.run_ok();
+    app.get_by_label("Saved switch").click();
+    app.run_ok();
+    assert!(app.state().tab_titles().is_empty());
+    app.get_by_label("Connect selected").click();
+    app.run_ok();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let _peer = loop {
+        match saved_listener.accept() {
+            Ok((peer, _)) => break peer,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(std::time::Instant::now() < deadline, "saved destination never connected");
+                app.run_ok();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+    assert_eq!(app.state().tab_titles(), ["Saved switch"]);
+    assert_eq!(*app.state_mut().sidebar_draft(), draft);
+    assert_eq!(draft_listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[test]
+fn compact_sidebar_toggle_expands_output_and_persists_without_losing_the_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness_sized(&dir, [520.0, 320.0]);
+    let _peer = open_raw_tab(&mut app, "Lab");
+    app.state_mut().sidebar_draft().host = "unfinished.example".into();
+    app.run_ok();
+    let narrow = app.get_by_label("Terminal output").rect();
+    app.get_by_label("Hide sessions").click();
+    app.run_ok();
+    let wide = app.get_by_label("Terminal output").rect();
+    assert!(wide.width() > narrow.width() + 250.0);
+    assert_eq!(saved_settings(&dir).unwrap()["show_sidebar"], false);
+    app.get_by_label("Show sessions").click();
+    app.run_ok();
+    assert_eq!(app.state_mut().sidebar_draft().host, "unfinished.example");
+    assert_eq!(saved_settings(&dir).unwrap()["show_sidebar"], true);
+    app.get_by_label("New session").click();
+    app.run_ok();
+    assert!(app.query_by_label("Host").is_none());
+    for label in ["Filter saved sessions", "Connect selected", "Edit connection", "Delete"] {
+        let rect = app.get_by_label(label).rect();
+        assert!(rect.bottom() <= 288.0 && rect.top() >= 0.0, "{label}: {rect:?}");
+    }
+    app.key_press_modifiers(app_modifiers(true), egui::Key::N);
+    app.run_ok();
+    app.get_by_label("Host");
+    assert!(app.state_mut().sidebar_draft().host.is_empty());
+}
+
+#[test]
+fn tab_status_is_named_and_tooltip_identifies_an_inactive_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    let mut peer = open_raw_tab(&mut app, "Core");
+    device_prints(&mut app, &mut peer, "Core#");
+    let _other = open_raw_tab(&mut app, "Other");
+    app.get_by_label("Core").hover();
+    app.run_ok();
+    app.get_by_label_contains("— Connected");
+    assert!(app.get_all_by_label("Connected").count() >= 1);
+    drop(peer);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.state().tab_titles()[0] != "Core (closed)" {
+        assert!(std::time::Instant::now() < deadline);
+        app.run_ok();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.run_ok();
+    app.get_by_label("Disconnected");
+    app.get_by_label("Core (closed)").hover();
+    app.run_ok();
+    app.get_by_label_contains("— Disconnected");
+    assert_eq!(app.state().tab_titles()[1], "Other");
+}
+
+#[test]
+fn collapsed_saved_session_actions_fit_short_windows_in_every_app_appearance() {
+    use snekkie::profiles::{Profile, ProfileStore};
+    use snekkie::settings::{AppSettings, SettingsStore};
+    for theme in ["Snekkie Dark", "Paper Light", "CRT Super", "E-Ink Super"] {
+        let dir = tempfile::tempdir().unwrap();
+        SettingsStore::new(dir.path().join("settings.json"))
+            .save(&AppSettings { theme: theme.into(), check_for_updates: false, ..Default::default() })
+            .unwrap();
+        ProfileStore::open(dir.path().join("sessions.json"))
+            .put(Profile { name: "Saved".into(), host: "192.0.2.10".into(), ..Default::default() })
+            .unwrap();
+        let mut app = harness_sized(&dir, [520.0, 320.0]);
+        let _peer = open_raw_tab(&mut app, "Live");
+        app.get_by_label("New session").click();
+        app.run_ok();
+        let footer_top = app.get_by_label("Private input").rect().top();
+        for label in [
+            "Saved",
+            "Filter saved sessions",
+            "Connect selected",
+            "Edit connection",
+            "Save…",
+            "Delete",
+            "More profile actions",
+        ] {
+            let rect = app.get_by_label(label).rect();
+            assert!(
+                rect.top() >= 30.0 && rect.bottom() < footer_top && rect.left() >= 0.0 && rect.right() < 320.0,
+                "{theme}, {label}: {rect:?}, footer at {footer_top}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1399,6 +1622,7 @@ fn right_click_preference_defaults_to_paste_cancel_discards_and_menu_mode_persis
     let mut peer = open_raw_tab(&mut app, "router");
     let label = "Right-click pastes (PuTTY style)";
     open_preferences(&mut app);
+    show_page(&mut app, "Input & paste");
     app.get_by_role_and_label(Role::CheckBox, label).scroll_to_me();
     app.run_ok();
     assert_eq!(app.get_by_role_and_label(Role::CheckBox, label).accesskit_node().toggled(), Some(Toggled::True));
@@ -1407,12 +1631,13 @@ fn right_click_preference_defaults_to_paste_cancel_discards_and_menu_mode_persis
     app.get_by_label("Cancel").click();
     app.run_ok();
     open_preferences(&mut app);
+    show_page(&mut app, "Input & paste");
     app.get_by_role_and_label(Role::CheckBox, label).scroll_to_me();
     app.run_ok();
     assert_eq!(app.get_by_role_and_label(Role::CheckBox, label).accesskit_node().toggled(), Some(Toggled::True));
     app.get_by_role_and_label(Role::CheckBox, label).click();
     app.run_ok();
-    app.get_by_label("OK").click();
+    app.get_by_label("Save changes").click();
     app.run_ok();
     assert_eq!(saved_settings(&dir).unwrap()["right_click_paste"], false);
     app.get_by_label("Filter saved sessions").click();
@@ -1441,12 +1666,13 @@ fn right_click_preference_defaults_to_paste_cancel_discards_and_menu_mode_persis
     app.key_press(egui::Key::Escape);
     app.run_ok();
     open_preferences(&mut app);
+    show_page(&mut app, "Input & paste");
     app.get_by_role_and_label(Role::CheckBox, label).scroll_to_me();
     app.run_ok();
     assert_eq!(app.get_by_role_and_label(Role::CheckBox, label).accesskit_node().toggled(), Some(Toggled::False));
     app.get_by_role_and_label(Role::CheckBox, label).click();
     app.run_ok();
-    app.get_by_label("OK").click();
+    app.get_by_label("Save changes").click();
     app.run_ok();
     assert_eq!(saved_settings(&dir).unwrap()["right_click_paste"], true);
 }
@@ -1473,7 +1699,7 @@ fn new_connections_with_other_tabs_open_do_not_inherit_the_last_saved_session_na
     let _existing = open_raw_tab(&mut harness, "already open");
     harness.get_by_label("saved console").click();
     harness.run_ok();
-    harness.get_by_label("Load").click();
+    harness.get_by_label("Edit connection").click();
     harness.run_ok();
     harness.get_by_label("Connect").click();
     harness.run_ok();
@@ -1520,7 +1746,7 @@ fn new_connections_with_other_tabs_open_do_not_inherit_the_last_saved_session_na
     harness.run_ok();
     assert_eq!(harness.state_mut().sidebar_draft().name, "New session");
     assert_eq!(harness.state_mut().sidebar_draft().host, "");
-    assert!(harness.get_by_label("Load").accesskit_node().is_disabled());
+    assert!(harness.get_by_label("Edit connection").accesskit_node().is_disabled());
 }
 
 #[test]
@@ -1769,6 +1995,8 @@ fn sidebar_keeps_its_width_on_every_page() {
     assert_eq!(sidebar_width(&harness), start);
     // The saved-session rows are sized from the panel's width; any overflow
     // would widen the panel a little more on every frame.
+    harness.get_by_label("More profile actions").scroll_to_me();
+    harness.run_ok();
     harness.get_by_label("More profile actions").click();
     for _ in 0..5 {
         harness.run_ok();
@@ -1852,7 +2080,12 @@ fn telnet_session_from_the_form() {
     // No login fields for telnet, its usual port, keepalives on.
     assert!(harness.query_by_label("Username").is_none());
     assert_eq!(harness.state_mut().sidebar_draft().port, 23);
+    assert!(harness.query_by_label("Keepalive").is_none());
+    harness.get_by_label("Advanced").click();
+    harness.run_ok();
     harness.get_by_value("60 s");
+    harness.get_by_label("Telnet").click();
+    harness.run_ok();
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -2024,7 +2257,8 @@ fn open_preferences(harness: &mut Harness<'static, SnekkieApp>) {
 }
 
 fn show_page(harness: &mut Harness<'static, SnekkieApp>, page: &str) {
-    harness.get_by_role_and_label(Role::Button, page).click();
+    // The app menu also has a Terminal button behind the modal.
+    harness.get_all_by_role_and_label(Role::Button, page).next_back().unwrap().click();
     harness.run_ok();
 }
 
@@ -2062,8 +2296,8 @@ fn save_theme_as(harness: &mut Harness<'static, SnekkieApp>, name: &str) {
     harness.run_ok();
     harness.event(egui::Event::Text(name.into()));
     harness.run_ok();
-    // The name dialog sits above Preferences, which also has an OK button.
-    harness.get_all_by_role_and_label(Role::Button, "OK").next_back().unwrap().click();
+    // Naming a theme is a separate dialog; the Preferences draft stays open.
+    harness.get_by_role_and_label(Role::Button, "OK").click();
     harness.run_ok();
 }
 
@@ -2085,7 +2319,7 @@ fn selected_theme_colors_can_be_edited_and_saved_as_a_named_copy() {
     }
     save_theme_as(&mut harness, "Monokai blue");
     harness.get_by_value("Monokai blue");
-    harness.get_by_label("OK").click();
+    harness.get_by_label("Save changes").click();
     harness.run_ok();
     let saved = saved_settings(&dir).unwrap();
     assert_eq!(saved["theme"], "Monokai blue");
@@ -2138,7 +2372,7 @@ fn crt_effects_survive_color_edits_and_named_saves_and_can_be_toggled() {
     }
     edit_cursor_red(&mut harness, 164, 112);
     save_theme_as(&mut harness, "My CRT");
-    harness.get_by_label("OK").click();
+    harness.get_by_label("Save changes").click();
     harness.run_ok();
     let saved = store.load();
     assert_eq!(saved.theme, "My CRT");
@@ -2187,7 +2421,7 @@ fn highlighting_slider_is_global_saved_and_cancelable_and_vendors_are_available(
     harness.get_by_label("Juniper Junos").click();
     harness.run_ok();
     harness.get_by_value("Juniper Junos");
-    harness.get_by_label("OK").click();
+    harness.get_by_label("Save changes").click();
     harness.run_ok();
     assert_eq!(store.load().highlighting_intensity, 1);
     open_preferences(&mut harness);
@@ -2203,7 +2437,7 @@ fn highlighting_slider_is_global_saved_and_cancelable_and_vendors_are_available(
     harness.run_ok();
     assert_eq!(store.load().highlighting_intensity, 1);
 
-    harness.get_by_value("None").click();
+    harness.get_by_value("Off").click();
     harness.run_ok();
     for (_, label) in snekkie::terminal::highlight::syntax_options() {
         harness.get_by_label(label);
@@ -2225,7 +2459,7 @@ fn crt_super_changes_app_and_terminal_then_regular_crt_restores_chrome() {
     let original = harness.get_by_label("Terminal output").rect();
     open_preferences(&mut harness);
     choose_theme(&mut harness, "Snekkie Dark", "CRT Super");
-    harness.get_by_label("OK").click();
+    harness.get_by_label("Save changes").click();
     harness.run_ok();
     let retro = harness.ctx.global_style();
     assert!(retro.visuals.override_text_color.is_some());
@@ -2242,7 +2476,7 @@ fn crt_super_changes_app_and_terminal_then_regular_crt_restores_chrome() {
 
     open_preferences(&mut harness);
     choose_theme(&mut harness, "CRT Super", "CRT");
-    harness.get_by_label("OK").click();
+    harness.get_by_label("Save changes").click();
     harness.run_ok();
     assert!(harness.ctx.global_style().visuals.override_text_color.is_none());
     assert_eq!(harness.ctx.global_style().text_styles[&egui::TextStyle::Button].family, egui::FontFamily::Proportional);
@@ -2312,7 +2546,7 @@ fn animations_are_turned_on_and_styled_in_preferences() {
     harness.run_ok();
     assert_eq!(harness.get_by_label("Cursor movement").value().as_deref(), Some("Smear"));
 
-    harness.get_by_label("OK").click();
+    harness.get_by_label("Save changes").click();
     harness.run_ok();
     assert!(harness.query_by_label("Preferences").is_none(), "Preferences should have closed");
     let saved = saved_settings(&dir).expect("settings.json wasn't written");
@@ -2347,6 +2581,7 @@ fn automatic_paging_defaults_off_and_both_toggles_save_the_same_setting() {
     let dir = tempfile::tempdir().unwrap();
     let mut harness = harness(&dir);
     open_preferences(&mut harness);
+    show_page(&mut harness, "Input & paste");
     let checkbox = harness.get_by_role_and_label(Role::CheckBox, "Automatically page through show commands");
     assert_eq!(checkbox.accesskit_node().toggled(), Some(Toggled::False));
     harness.get_by_label("Cancel").click();
@@ -2359,13 +2594,14 @@ fn automatic_paging_defaults_off_and_both_toggles_save_the_same_setting() {
     assert_eq!(saved_settings(&dir).unwrap()["auto_paging"], true);
 
     open_preferences(&mut harness);
+    show_page(&mut harness, "Input & paste");
     let checkbox = harness.get_by_role_and_label(Role::CheckBox, "Automatically page through show commands");
     assert_eq!(checkbox.accesskit_node().toggled(), Some(Toggled::True));
     checkbox.scroll_to_me();
     harness.run_ok();
     harness.get_by_role_and_label(Role::CheckBox, "Automatically page through show commands").click();
     harness.run_ok();
-    harness.get_by_label("OK").click();
+    harness.get_by_label("Save changes").click();
     harness.run_ok();
     assert_eq!(saved_settings(&dir).unwrap()["auto_paging"], false);
 
@@ -2374,6 +2610,7 @@ fn automatic_paging_defaults_off_and_both_toggles_save_the_same_setting() {
     drop(harness);
     let mut restarted = harness_sized(&dir, [1000.0, 640.0]);
     open_preferences(&mut restarted);
+    show_page(&mut restarted, "Input & paste");
     let checkbox = restarted.get_by_role_and_label(Role::CheckBox, "Automatically page through show commands");
     assert_eq!(checkbox.accesskit_node().toggled(), Some(Toggled::False));
 }
@@ -2386,10 +2623,10 @@ fn preferences_fit_the_window_on_both_pages() {
     let mut harness = harness(&dir);
     open_preferences(&mut harness);
     let mut buttons = Vec::new();
-    for page in ["General", "Animations", "General"] {
+    for page in ["Appearance", "Animations", "Appearance"] {
         show_page(&mut harness, page);
         let heading = harness.get_by_label("Preferences").rect();
-        let ok = harness.get_by_label("OK").rect();
+        let ok = harness.get_by_label("Save changes").rect();
         assert!(heading.min.x >= 0.0 && heading.min.y >= 0.0, "{page}: heading at {heading:?}");
         assert!(ok.max.y <= 640.0, "{page}: OK at {ok:?}");
         buttons.push(ok);
@@ -2422,14 +2659,14 @@ fn preferences_stay_usable_in_a_short_window() {
         let dir = tempfile::tempdir().unwrap();
         let mut harness = harness_sized(&dir, size);
         open_preferences(&mut harness);
-        for page in ["General", "Animations", "General", "Animations"] {
+        for page in ["Appearance", "Animations", "Appearance", "Animations"] {
             show_page(&mut harness, page);
             for (role, label) in [
                 (Role::Label, "Preferences"),
-                (Role::Button, "General"),
+                (Role::Button, "Appearance"),
                 (Role::Button, "Animations"),
                 (Role::Button, "Cancel"),
-                (Role::Button, "OK"),
+                (Role::Button, "Save changes"),
             ] {
                 let rect = harness.get_by_role_and_label(role, label).rect();
                 let inside = rect.min.x >= 0.0 && rect.min.y >= 0.0 && rect.max.x <= size[0] && rect.max.y <= size[1];
@@ -2441,16 +2678,144 @@ fn preferences_stay_usable_in_a_short_window() {
         // OK to save them both.
         harness.get_by_role_and_label(Role::CheckBox, "Animations").click();
         harness.run_ok();
-        show_page(&mut harness, "General");
+        show_page(&mut harness, "Appearance");
         harness.get_by_value("Snekkie Dark").click();
         harness.run_ok();
         harness.get_by_label("Monokai").click();
         harness.run_ok();
-        harness.get_by_label("OK").click();
+        harness.get_by_label("Save changes").click();
         harness.run_ok();
         assert!(harness.query_by_label("Preferences").is_none(), "{size:?}: Preferences should have closed");
         let saved = saved_settings(&dir).unwrap_or_else(|| panic!("{size:?}: settings.json wasn't written"));
         assert_eq!(saved["animations"]["enabled"], true, "{size:?}: {saved:#}");
         assert_eq!(saved["theme"], "Monokai", "{size:?}: {saved:#}");
     }
+}
+
+const PREFERENCE_PAGES: [&str; 6] =
+    ["Appearance", "Terminal", "Input & paste", "Network", "Highlighting", "Animations"];
+
+fn set_preference_number(app: &mut Harness<'static, SnekkieApp>, label: &str, value: &str) {
+    app.get_by_label(label).scroll_to_me();
+    app.run_ok();
+    app.get_by_label(label).click();
+    app.run_ok();
+    app.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    app.event(egui::Event::Text(value.into()));
+    app.key_press(egui::Key::Enter);
+    app.run_ok();
+}
+
+#[test]
+fn preferences_sections_save_together_and_cancel_discards_every_section() {
+    use snekkie::settings::{AppSettings, SettingsStore};
+    for save in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path().join("settings.json"));
+        let original = AppSettings { check_for_updates: false, ..Default::default() };
+        store.save(&original).unwrap();
+        let mut app = harness(&dir);
+        open_preferences(&mut app);
+        // Theme selection must work on the first opening click.
+        app.get_by_value("Snekkie Dark").click();
+        app.run_ok();
+        app.get_by_label("Monokai").click();
+        app.run_ok();
+        show_page(&mut app, "Terminal");
+        set_preference_number(&mut app, "Font size", "18");
+        set_preference_number(&mut app, "Scrollback lines", "12345");
+        app.get_by_label("Preview — 18 pt");
+        show_page(&mut app, "Input & paste");
+        app.get_by_label("Right-click pastes (PuTTY style)").click();
+        app.run_ok();
+        set_preference_number(&mut app, "Paste delay between lines", "250");
+        show_page(&mut app, "Animations");
+        app.get_by_role_and_label(Role::CheckBox, "Animations").click();
+        app.run_ok();
+        show_page(&mut app, "Network");
+        app.get_by_label("Check for updates when Snekkie starts").click();
+        app.run_ok();
+        assert_eq!(store.load(), original, "a section wrote settings before Save changes");
+        app.get_by_label(if save { "Save changes" } else { "Cancel" }).click();
+        app.run_ok();
+        let saved = store.load();
+        if save {
+            assert_eq!(saved.theme, "Monokai");
+            assert_eq!(saved.font_size, 18);
+            assert_eq!(saved.scrollback, 12345);
+            assert_eq!(saved.paste_delay_ms, 250);
+            assert!(!saved.right_click_paste);
+            assert!(saved.animations.enabled);
+            assert!(saved.check_for_updates);
+        } else {
+            assert_eq!(saved, original);
+        }
+    }
+}
+
+#[test]
+fn preferences_pages_and_footer_fit_all_themes_and_compact_animations_stack() {
+    use snekkie::settings::{AppSettings, SettingsStore};
+    for theme in ["Snekkie Dark", "Paper Light", "CRT Super", "E-Ink Super"] {
+        for size in [[1000.0, 640.0], [520.0, 320.0]] {
+            let dir = tempfile::tempdir().unwrap();
+            SettingsStore::new(dir.path().join("settings.json"))
+                .save(&AppSettings { theme: theme.into(), check_for_updates: false, ..Default::default() })
+                .unwrap();
+            let mut app = harness_sized(&dir, size);
+            open_preferences(&mut app);
+            let footer = app.get_by_label("Save changes").rect();
+            for page in PREFERENCE_PAGES {
+                show_page(&mut app, page);
+                let save = app.get_by_label("Save changes").rect();
+                let cancel = app.get_by_label("Cancel").rect();
+                assert_eq!(save, footer, "{theme}, {size:?}, {page}: footer moved");
+                assert!(save.right() <= size[0] - 8.0 && save.bottom() <= size[1] - 8.0);
+                assert!(save.left() > cancel.right(), "Save changes is not right of Cancel");
+                for name in PREFERENCE_PAGES {
+                    let tab = app.get_all_by_role_and_label(Role::Button, name).next_back().unwrap().rect();
+                    assert!(
+                        tab.left() >= 8.0 && tab.right() <= size[0] - 8.0 && tab.bottom() < save.top(),
+                        "{theme}, {size:?}, {name}: {tab:?}"
+                    );
+                }
+            }
+            let typing = app.get_by_label("Screen shake").rect();
+            let output = app.get_by_label("Output").rect();
+            if size[0] < 600.0 {
+                assert!(output.top() > typing.bottom(), "{theme}: compact animation groups did not stack");
+            } else {
+                assert!(output.left() > typing.right(), "{theme}: wide animation groups did not form columns");
+            }
+            // Every style remains reachable by scrolling without losing the footer.
+            for name in TYPING.into_iter().chain(OUTPUT) {
+                app.get_by_label(name).scroll_to_me();
+                app.run_ok();
+                let control = app.get_by_label(name).rect();
+                assert!(
+                    control.left() >= 8.0 && control.right() <= size[0] - 8.0 && control.bottom() < footer.top(),
+                    "{theme}, {size:?}, {name}: {control:?}"
+                );
+                assert_eq!(app.get_by_label("Save changes").rect(), footer);
+            }
+        }
+    }
+}
+
+#[test]
+fn offline_warning_counts_live_network_sessions_and_cancel_keeps_them_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    let mut peer = open_raw_tab(&mut app, "Live switch");
+    open_preferences(&mut app);
+    show_page(&mut app, "Network");
+    app.get_by_label("Offline mode").click();
+    app.run_ok();
+    app.get_by_label("Saving will close 1 open network session. Serial sessions stay connected.");
+    assert!(app.get_by_label("Check for updates when Snekkie starts").accesskit_node().is_disabled());
+    assert!(!app.state().tab_titles()[0].contains("closed"));
+    app.get_by_label("Cancel").click();
+    app.run_ok();
+    device_prints(&mut app, &mut peer, "still connected>");
+    assert!(app.state().active_screen_text().unwrap().contains("still connected>"));
 }

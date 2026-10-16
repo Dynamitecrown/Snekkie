@@ -552,7 +552,8 @@ impl TerminalView {
         if animations.enabled {
             // Every frame while something moves; otherwise only when the
             // blink next changes, if it's blinking at all.
-            let blink = blinking.then(|| animation::blink_wake(animations.cursor_blink, now, self.blink_epoch));
+            let blink = (blinking && animations.cursor_blink != crate::settings::CursorBlink::Steady)
+                .then(|| animation::blink_wake(animations.cursor_blink, now, self.blink_epoch));
             match next_frame(self.animator.next_wake(now), blink) {
                 Some(wait) if wait <= 0.0 => ctx.request_repaint(),
                 Some(wait) => ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait)),
@@ -1379,6 +1380,25 @@ fn paint_line_mark(painter: &Painter, d: &Metrics, row: f32, mark: &LineMark, th
                 Stroke::new(1.5, theme.cursor.gamma_multiply(mark.alpha)),
             );
         }
+        NewLines::Bookends => {
+            let rect = span(start, end).expand2(vec2(2.0, -1.0));
+            let arm = (d.cell.x * 0.4).min(rect.width().max(0.0) * 0.5);
+            let stroke = Stroke::new(1.0, theme.cursor.gamma_multiply(mark.alpha));
+            for (x, sign) in [(rect.left(), 1.0), (rect.right(), -1.0)] {
+                painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], stroke);
+                for y in [rect.top(), rect.bottom()] {
+                    painter.line_segment([pos2(x, y), pos2(x + sign * arm, y)], stroke);
+                }
+            }
+        }
+        NewLines::Outline => {
+            painter.rect_stroke(
+                span(start, end).expand2(vec2(1.5, -0.5)),
+                1.0,
+                Stroke::new(1.0, theme.cursor.gamma_multiply(mark.alpha)),
+                egui::StrokeKind::Inside,
+            );
+        }
     }
 }
 
@@ -1916,6 +1936,24 @@ mod tests {
             right_click_paste: true,
             animations,
         }
+    }
+
+    #[test]
+    fn steady_cursor_stays_visible_without_requesting_blink_frames() {
+        let ctx = egui::Context::default();
+        let emu = emulator(60, 5, 100);
+        emu.lock().feed(b"Switch#");
+        let mut view = TerminalView::default();
+        let options = view_options(Animations::reduced_motion());
+        let size = vec2(600.0, 200.0);
+        for now in [1.0, 1.1, 1.7, 2.5, 100.0] {
+            let _ = draw(&ctx, &mut view, &emu, &options, now, size);
+            assert_eq!(animation::blink_level(options.animations.cursor_blink, now, 0.0), 1.0);
+            assert_eq!(animation::blink_halo(options.animations.cursor_blink, now, 0.0), 0.0);
+        }
+        // A previous frame's immediate repaint may carry over for one pass.
+        let out = draw(&ctx, &mut view, &emu, &options, 100.1, size);
+        assert_eq!(repaint_delay(&out), std::time::Duration::MAX);
     }
 
     /// Draw one frame of the demo at `time`, as a window `size` big.

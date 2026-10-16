@@ -79,11 +79,11 @@ impl Category {
 }
 
 pub fn syntax_options() -> impl Iterator<Item = (&'static str, &'static str)> {
-    std::iter::once(("none", "None")).chain(devices::DEVICES.iter().map(|d| (d.key, d.label)))
+    std::iter::once(("none", "Off")).chain(devices::DEVICES.iter().map(|d| (d.key, d.label)))
 }
 
 pub fn syntax_label(value: &str) -> &'static str {
-    syntax_options().find(|(v, _)| *v == value).map_or("None", |(_, l)| l)
+    syntax_options().find(|(v, _)| *v == value).map_or("Off", |(_, l)| l)
 }
 
 pub fn sample(syntax: &str) -> &'static str {
