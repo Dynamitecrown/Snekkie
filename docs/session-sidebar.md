@@ -2,6 +2,8 @@
 
 Use **Show sessions** or **Hide sessions**, beside the session tabs, to give the terminal more room. The same action is available through **Ctrl+B** (**Cmd+B** on macOS). Sidebar visibility is saved between launches. Hiding the sidebar keeps the unfinished connection form and saved-session filters intact.
 
+The empty workspace offers **New connection**, which opens and resets the connection form. The menu bar carries Snekkie's name and a small snake mark. Network forms place **Host** and **Port** together, leaving more room for saved sessions.
+
 ![The connection form and explicit saved-session actions](screenshots/session-sidebar.png)
 
 ## Connect or edit a saved session
@@ -12,13 +14,15 @@ Use **Show sessions** or **Hide sessions**, beside the session tabs, to give the
 
 The form's **Connect** button always uses the form. **Connect selected** always uses the selected saved profile, even when the form contains a different destination. Selecting a row alone never connects or changes the form.
 
+Each saved row shows its alias above its protocol and destination. Serial rows include the device and baud rate. Long lines shorten independently; hover for the full destination. Selection uses a neutral fill and a thin accent line, while the star remains a separate favorite action.
+
 Filtering or **Favorites only** can hide the selected profile. When that happens, **Connect selected**, **Edit connection**, and **Delete** are disabled until a visible profile is selected or the filter is cleared. Saving still saves the form.
 
 ## Make room for saved sessions
 
 Click the arrow beside **New session** to collapse the connection form independently of the saved-session list. This is useful in short windows. **Edit connection** and **Session → New session** reopen the form; the latter resets it for a new connection.
 
-Saved-session action buttons stack when the sidebar or theme font is too narrow to fit their labels side by side. The sidebar remains scrollable when its content exceeds the window height.
+Saved-session action buttons stack when the sidebar or theme font is too narrow to fit their labels side by side. Short windows use tighter sidebar controls and spacing. The sidebar remains scrollable when its content exceeds the window height.
 
 ![Saved-session actions in a 520 by 320 window with the form collapsed](screenshots/session-sidebar-compact.png)
 
@@ -34,6 +38,6 @@ A filled dot indicates **Connected**, an outlined ring indicates **Connecting**,
 
 ## Visual checks
 
-Run `cargo run --locked --example sidebar_qa` to render the current interface at 1000 × 640 and 520 × 320 in standard, light, CRT, and E-Ink themes. It uses temporary stores and a fictional local TCP device; it does not open saved user sessions. Images are written to `target/sidebar-qa/`.
+Run `cargo run --locked --example sidebar_qa` to render empty, connected, collapsed, hidden-sidebar and disconnected states at 1000 × 640, 720 × 540 and 520 × 320. It covers Snekkie Dark, Paper Light, Frost Light, Copper Night, Forest Night, CRT and E-Ink. It uses temporary stores and a fictional local TCP device; it does not open saved user sessions. Images are written to `target/sidebar-qa/`.
 
 For a manual check, select a saved session while a different host is in the form and verify both connection actions use their stated destination. At a small window size, collapse **New session**, use the saved-session actions, and hide/show the sidebar. Check tab status tooltips with more than one session open.

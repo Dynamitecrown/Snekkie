@@ -1,14 +1,14 @@
-//! Fine ASCII artwork: four glyphs in each direction per simulation cell.
+//! Fine ASCII artwork: eight glyphs in each direction per simulation cell.
 //! Keeping these bounds aligned with the model preserves collision geometry
 //! when the arena uses its smaller graphics font.
 
 use crate::invade::Rig;
 use crate::invade::content::{ASPECT, DeviceKind};
 
-const DETAIL: f32 = 4.0;
+const DETAIL: f32 = 8.0;
 
 pub(super) fn rig(rig: Rig) -> Vec<String> {
-    double(match rig {
+    redouble(match rig {
         Rig::Probe => &["  /==\\  ", "<==^^==>"],
         Rig::Ghost => &[r" /\/\ ", "<~==~>"],
         Rig::Bastion => &[" /======\\ ", "[|==^^==|]"],
@@ -110,7 +110,7 @@ pub(super) fn asteroid(radius: f32, spin: f32) -> Vec<String> {
 }
 
 pub(super) fn device(kind: DeviceKind, damaged: bool) -> Vec<String> {
-    double(match kind {
+    redouble(match kind {
         DeviceKind::Endpoint => &[" /==\\ ", "<.==.>"],
         DeviceKind::Router => &[" /++\\ ", "<+--+>"],
         DeviceKind::Firewall if damaged => &["[#/ ##", "|= :/|"],
@@ -121,10 +121,15 @@ pub(super) fn device(kind: DeviceKind, damaged: bool) -> Vec<String> {
 }
 
 pub(super) fn guard() -> Vec<String> {
-    double(&["|/##\\|", "|=##=|"])
+    redouble(&["|/##\\|", "|=##=|"])
 }
 
 pub(super) fn detail(source: &[&str]) -> Vec<String> {
+    redouble(&double(source).iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// Two expansions: hand-drawn half-resolution art to full detail.
+fn redouble(source: &[&str]) -> Vec<String> {
     let expanded = double(source);
     double(&expanded.iter().map(String::as_str).collect::<Vec<_>>())
 }
@@ -186,8 +191,9 @@ mod tests {
     use crate::invade::content::{BossKind, MinibossKind};
 
     fn bounds(sprite: &[String], width: usize, height: usize) {
-        assert_eq!(sprite.len(), height * 4);
-        assert!(sprite.iter().all(|line| line.is_ascii() && line.len() == width * 4));
+        let detail = DETAIL as usize;
+        assert_eq!(sprite.len(), height * detail);
+        assert!(sprite.iter().all(|line| line.is_ascii() && line.len() == width * detail));
     }
 
     #[test]

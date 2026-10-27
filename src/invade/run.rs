@@ -12,6 +12,9 @@
 use std::collections::BTreeSet;
 
 use super::arsenal::{Loadout, WeaponKind, WeaponSpec, WeaponState, acquire_weapon, initial_weapons};
+use super::loot::{ItemDrop, ItemKind, PivotKind};
+
+mod expansion;
 use super::content::{
     ARENA_H, ARENA_W, ASPECT, BossKind, DeviceKind, EncounterKind, FRAGMENT_DEVICES, Flight, GUARD_BASE_HP,
     MinibossKind, Rig, Unlock, WORLD_H, WORLD_W, boss_hp, device_flight, device_hp, encounter_for, fire_interval,
@@ -186,6 +189,7 @@ pub enum Phase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
+    ItemCollected(ItemKind),
     Unlocked(Unlock),
     /// An encounter was cleared: the wave number.
     Completed(u32),
@@ -222,6 +226,7 @@ pub enum Role {
 
 #[derive(Debug, Clone)]
 pub struct Enemy {
+    pub elite: bool,
     pub id: u32,
     pub role: Role,
     /// Top-left corner.
@@ -288,10 +293,16 @@ pub enum ShotKind {
     Fork,
     Fragment,
     Pivot,
+    Flame,
+    Missile,
+    Reflected,
 }
 
 #[derive(Debug, Clone)]
 pub struct Shot {
+    /// Collision radius in visual units; also controls the drawn size.
+    pub radius: f32,
+    target: Option<u32>,
     pub kind: ShotKind,
     pub x: f32,
     pub y: f32,
@@ -330,6 +341,8 @@ impl HostileKind {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Hostile {
+    /// Boss ordnance bypasses orbital shields without changing its attack pattern.
+    pub unblockable: bool,
     pub kind: HostileKind,
     pub x: f32,
     pub y: f32,
@@ -445,6 +458,9 @@ pub struct XpOrb {
 
 #[derive(Debug, Clone)]
 pub struct Orbital {
+    pub shield: bool,
+    pub size: f32,
+    previous: (f32, f32),
     pub x: f32,
     pub y: f32,
     angle: f32,
@@ -593,6 +609,11 @@ pub struct InvadeRun {
     weapons: Vec<WeaponState>,
     weapon_cooldowns: Vec<f32>,
     orbitals: Vec<Orbital>,
+    items: BTreeSet<ItemKind>,
+    item_drops: Vec<ItemDrop>,
+    pivot_kind: PivotKind,
+    loot_rng: Rng,
+    mirror_rng: Rng,
     orbs: Vec<XpOrb>,
     asteroids: Vec<Asteroid>,
     xp: u64,
@@ -839,6 +860,11 @@ impl InvadeRun {
             weapons: initial_weapons(loadout),
             weapon_cooldowns: vec![0.0],
             orbitals: Vec::new(),
+            items: BTreeSet::new(),
+            item_drops: Vec::new(),
+            pivot_kind: PivotKind::Chain,
+            loot_rng: Rng::stream(seed, STREAM_COMBAT ^ 0xE117E, 0),
+            mirror_rng: Rng::stream(seed, STREAM_COMBAT ^ 0xA1170, 0),
             orbs: Vec::new(),
             asteroids: Vec::new(),
             xp: 0,
@@ -1043,7 +1069,26 @@ impl InvadeRun {
     /// The offered upgrades, described for this rig and build.
     pub fn cards(&self) -> Vec<Card> {
         let ctx = self.offer_context();
-        self.offers.iter().map(|offer| describe_level(*offer, &ctx, &self.weapons)).collect()
+        self.offers
+            .iter()
+            .map(|offer| {
+                let mut card = describe_level(*offer, &ctx, &self.weapons);
+                if self.rig == Rig::Probe
+                    && self.pivot_kind == PivotKind::Missile
+                    && *offer == LevelChoice::Module(Offer::Upgrade(UpgradeId::ToolAmplifier))
+                {
+                    let next = stats(self.rig, &self.build.with(UpgradeId::ToolAmplifier));
+                    card.effect = format!(
+                        "Missile blast damage {:.0} -> {:.0}; radius {} -> {}.",
+                        self.stats.pivot_direct * 2.0,
+                        next.pivot_direct * 2.0,
+                        8 + self.stats.pivot_jumps.saturating_sub(3),
+                        8 + next.pivot_jumps.saturating_sub(3)
+                    );
+                }
+                card
+            })
+            .collect()
     }
 
     /// The miniboss or boss's name and remaining health, 0 to 1.
@@ -1165,6 +1210,7 @@ impl InvadeRun {
             }
         }
         self.update_player(input);
+        self.update_items();
         self.update_asteroids();
         self.rock_contacts();
         if self.phase == Phase::Over {
@@ -1318,7 +1364,13 @@ impl InvadeRun {
         if input.special && combat && p.charges > 0 {
             p.charges -= 1;
             match self.rig {
-                Rig::Probe => self.launch(ShotKind::Pivot, self.player.aim, s.pivot_direct, 0, false),
+                Rig::Probe => {
+                    if self.pivot_kind == PivotKind::Missile {
+                        self.launch_missile();
+                    } else {
+                        self.launch_pivot();
+                    }
+                }
                 Rig::Ghost => {
                     let p = &mut self.player;
                     let dir = p.nose();
@@ -1563,8 +1615,10 @@ impl InvadeRun {
             return;
         }
         let speed = if kind == ShotKind::Pivot { PIVOT_SPEED } else { SHOT_SPEED };
-        let (vx, vy) = velocity(heading, speed * ASPECT);
+        let (vx, vy) = velocity(heading, speed * ASPECT * self.projectile_speed());
         self.shots.push(Shot {
+            radius: self.projectile_size() * 0.15,
+            target: None,
             kind,
             x: self.player.x,
             y: self.player.y + 0.5,
@@ -1590,7 +1644,7 @@ impl InvadeRun {
             let spec = weapon.spec(self.rig, &self.stats);
             self.weapon_cooldowns[index] = spec.cooldown;
             match weapon.kind {
-                WeaponKind::Packet | WeaponKind::Scatter | WeaponKind::Rail => {
+                WeaponKind::Packet | WeaponKind::Scatter | WeaponKind::Rail | WeaponKind::Flamethrower => {
                     let heading = self.player.aim;
                     for n in 0..spec.projectiles {
                         let angle = if spec.projectiles <= 1 {
@@ -1598,7 +1652,9 @@ impl InvadeRun {
                         } else {
                             spec.spread * (f32::from(n) / f32::from(spec.projectiles - 1) - 0.5)
                         };
-                        self.weapon_packet(ShotKind::Primary, rotated(heading, angle), spec.damage, spec);
+                        let kind =
+                            if weapon.kind == WeaponKind::Flamethrower { ShotKind::Flame } else { ShotKind::Primary };
+                        self.weapon_packet(kind, rotated(heading, angle), spec.damage, spec);
                     }
                     if self.stats.fork_damage.is_some() {
                         for side in [-1.0, 1.0] {
@@ -1611,7 +1667,18 @@ impl InvadeRun {
                         }
                     }
                 }
-                WeaponKind::Arc => self.arc(spec),
+                WeaponKind::Arc => {
+                    if self.items.contains(&ItemKind::PortMirroring) {
+                        for side in [-1.0, 1.0] {
+                            if !self.mirror_rng.chance(0.25) {
+                                let aim = self.player.aim;
+                                self.arc_direction(spec, Some((aim.0 * side, aim.1 * side)));
+                            }
+                        }
+                    } else {
+                        self.arc(spec);
+                    }
+                }
                 WeaponKind::Pulse => {
                     let at = (self.player.x, self.player.y + 0.5);
                     self.effect(EffectKind::Pulse, at, at, 0.35);
@@ -1632,17 +1699,23 @@ impl InvadeRun {
                         self.damage(target, spec.damage);
                     }
                 }
-                WeaponKind::Orbit => {
+                WeaponKind::Orbit | WeaponKind::Shield => {
                     let room = 32usize.saturating_sub(self.orbitals.len());
                     for n in 0..usize::from(spec.projectiles).min(room) {
                         let angle = std::f32::consts::TAU * n as f32 / f32::from(spec.projectiles);
                         self.orbitals.push(Orbital {
+                            shield: weapon.kind == WeaponKind::Shield,
+                            size: self.projectile_size() * if weapon.kind == WeaponKind::Shield { 1.2 } else { 0.3 },
+                            previous: (
+                                self.player.x + angle.cos() * spec.radius,
+                                self.player.y + 0.5 + angle.sin() * spec.radius / ASPECT,
+                            ),
                             x: self.player.x + angle.cos() * spec.radius,
                             y: self.player.y + 0.5 + angle.sin() * spec.radius / ASPECT,
                             angle,
                             radius: spec.radius,
-                            speed: spec.speed,
-                            remaining: spec.range / spec.speed.max(1.0),
+                            speed: spec.speed * self.projectile_speed(),
+                            remaining: spec.range / (spec.speed * self.projectile_speed()).max(1.0),
                             damage: spec.damage,
                             hit: Vec::new(),
                         });
@@ -1653,11 +1726,24 @@ impl InvadeRun {
     }
 
     fn weapon_packet(&mut self, kind: ShotKind, heading: (f32, f32), damage: f32, spec: WeaponSpec) {
+        let mirrored = self.items.contains(&ItemKind::PortMirroring);
+        for side in 0..if mirrored { 2 } else { 1 } {
+            if mirrored && self.mirror_rng.chance(0.25) {
+                continue;
+            }
+            let dir = if side == 0 { heading } else { (-heading.0, -heading.1) };
+            self.single_packet(kind, dir, damage, spec);
+        }
+    }
+
+    fn single_packet(&mut self, kind: ShotKind, heading: (f32, f32), damage: f32, spec: WeaponSpec) {
         if self.shots.len() >= MAX_SHOTS {
             return;
         }
-        let (vx, vy) = velocity(heading, spec.speed);
+        let (vx, vy) = velocity(heading, spec.speed * self.projectile_speed());
         self.shots.push(Shot {
+            radius: 0.15 * self.projectile_size(),
+            target: None,
             kind,
             x: self.player.x,
             y: self.player.y + 0.5,
@@ -1668,11 +1754,15 @@ impl InvadeRun {
             hit: Vec::new(),
             travelled: 0.0,
             range: spec.range,
-            guided: self.stats.guidance,
+            guided: self.stats.guidance && kind != ShotKind::Flame,
         });
     }
 
     fn arc(&mut self, spec: WeaponSpec) {
+        self.arc_direction(spec, None);
+    }
+
+    fn arc_direction(&mut self, spec: WeaponSpec, hemisphere: Option<(f32, f32)>) {
         let mut at = (self.player.x, self.player.y + 0.5);
         let mut hit = Vec::new();
         for _ in 0..spec.chain_targets {
@@ -1681,6 +1771,13 @@ impl InvadeRun {
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| e.alive && e.visible_in(self.camera()) && !hit.contains(&e.id))
+                .filter(|(_, e)| {
+                    !hit.is_empty()
+                        || hemisphere.is_none_or(|dir| {
+                            let c = e.center();
+                            (c.0 - at.0) * dir.0 + (c.1 - at.1) * ASPECT * dir.1 >= 0.0
+                        })
+                })
                 .map(|(i, e)| (visual_distance(at, e.center()), e.id, i))
                 .filter(|(d, _, _)| *d <= spec.range)
                 .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -1702,6 +1799,7 @@ impl InvadeRun {
             orb.x = self.player.x + orb.angle.cos() * orb.radius;
             orb.y = self.player.y + 0.5 + orb.angle.sin() * orb.radius / ASPECT;
             let start = if self.player_teleported { (orb.x, orb.y) } else { from };
+            orb.previous = start;
             let hits: Vec<_> = self
                 .enemies
                 .iter()
@@ -1711,10 +1809,10 @@ impl InvadeRun {
                     segment_enters(
                         (start.0 + e.x - e.previous.0, start.1 + e.y - e.previous.1),
                         (orb.x, orb.y),
-                        e.x - 0.3,
-                        e.y - 0.15,
-                        e.x + e.w + 0.3,
-                        e.y + e.h + 0.15,
+                        e.x - orb.size,
+                        e.y - orb.size / ASPECT,
+                        e.x + e.w + orb.size,
+                        e.y + e.h + orb.size / ASPECT,
                     )
                     .is_some()
                 })
@@ -1849,7 +1947,9 @@ impl InvadeRun {
         self.live_fragments = shots.iter().filter(|s| s.kind == ShotKind::Fragment).count();
         self.live_shots = shots.len();
         shots.retain_mut(|shot| {
-            if shot.guided {
+            if shot.kind == ShotKind::Missile {
+                self.steer_missile(shot);
+            } else if shot.guided {
                 self.steer(shot);
             }
             let from = (shot.x, shot.y);
@@ -1858,6 +1958,9 @@ impl InvadeRun {
             shot.travelled += (shot.vx.hypot(shot.vy * ASPECT)) * STEP;
             let consumed = self.phase == Phase::Combat && self.collide(shot, from);
             let gone = shot.travelled > shot.range;
+            if gone && !consumed && shot.kind == ShotKind::Missile {
+                self.explode((shot.x, shot.y), shot.damage);
+            }
             if consumed || gone {
                 self.live_shots = self.live_shots.saturating_sub(1);
             }
@@ -1904,11 +2007,23 @@ impl InvadeRun {
             .filter(|(_, e)| e.alive && !shot.hit.contains(&e.id))
             .filter_map(|(i, e)| {
                 let relative_from = (from.0 + e.x - e.previous.0, from.1 + e.y - e.previous.1);
-                segment_enters(relative_from, to, e.x - 0.15, e.y, e.x + e.w + 0.15, e.y + e.h).map(|t| (t, e.id, i))
+                segment_enters(
+                    relative_from,
+                    to,
+                    e.x - shot.radius,
+                    e.y - shot.radius / ASPECT,
+                    e.x + e.w + shot.radius,
+                    e.y + e.h + shot.radius / ASPECT,
+                )
+                .map(|t| (t, e.id, i))
             })
             .collect();
         hits.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        let rock = self.rock_entry(from, to);
+        let rock = self
+            .asteroids
+            .iter()
+            .filter_map(|rock| segment_circle(from, to, (rock.x, rock.y), rock.radius + shot.radius))
+            .min_by(f32::total_cmp);
         for (t, id, index) in hits {
             if rock.is_some_and(|r| r < t) {
                 break;
@@ -1917,6 +2032,10 @@ impl InvadeRun {
                 continue;
             }
             let at = self.enemies[index].center();
+            if shot.kind == ShotKind::Missile {
+                self.explode((from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t), shot.damage);
+                return true;
+            }
             if shot.kind == ShotKind::Pivot {
                 self.pivot(index, shot.damage);
                 return true;
@@ -1941,6 +2060,10 @@ impl InvadeRun {
         if let Some(t) = rock {
             // Rocks absorb packets from either side.
             let at = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+            if shot.kind == ShotKind::Missile {
+                self.explode(at, shot.damage);
+                return true;
+            }
             self.effect(EffectKind::Spark, at, (0.0, 0.0), 0.12);
             return true;
         }
@@ -1989,6 +2112,7 @@ impl InvadeRun {
             self.compromised += 1;
         }
         let at = enemy.center();
+        let elite = enemy.elite;
         let value = match enemy.role {
             Role::Device(_) | Role::Guard => 1,
             Role::Miniboss(MinibossKind::RelayPair) => 12,
@@ -2001,6 +2125,10 @@ impl InvadeRun {
                 }
             }
         };
+        let value = if elite { value * 5 } else { value };
+        if elite {
+            self.drop_elite_item(at);
+        }
         if value > 0 {
             self.add_orb(at, value);
         }
@@ -2037,8 +2165,13 @@ impl InvadeRun {
                 return;
             }
             self.live_fragments += 1;
-            let (vx, vy) = velocity(rotated(heading, side * std::f32::consts::FRAC_PI_2), FRAGMENT_SPEED);
+            let (vx, vy) = velocity(
+                rotated(heading, side * std::f32::consts::FRAC_PI_2),
+                FRAGMENT_SPEED * self.projectile_speed(),
+            );
             self.new_shots.push(Shot {
+                radius: 0.15 * self.projectile_size(),
+                target: None,
                 kind: ShotKind::Fragment,
                 x: at.0,
                 y: at.1,
@@ -2090,6 +2223,7 @@ impl InvadeRun {
         let mut hostiles = std::mem::take(&mut self.hostiles);
         let mut hits = 0;
         let mut absorbed = Vec::new();
+        let mut reflected = Vec::new();
         hostiles.retain_mut(|h| {
             let from = (h.x, h.y);
             h.x += h.vx * STEP;
@@ -2098,6 +2232,24 @@ impl InvadeRun {
             let relative_from = (from.0 + self.player.x - previous.0, from.1 + self.player.y - previous.1);
             let player = segment_enters(relative_from, (h.x, h.y), left, top, right, bottom);
             let rock = self.rock_entry(from, (h.x, h.y));
+            let shield = self
+                .orbitals
+                .iter()
+                .filter(|o| o.shield)
+                .filter_map(|o| {
+                    let relative = (from.0 + o.x - o.previous.0, from.1 + o.y - o.previous.1);
+                    segment_circle(relative, (h.x, h.y), (o.x, o.y), o.size).map(|t| (t, o.damage))
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            if !h.unblockable
+                && h.kind != HostileKind::Stream
+                && let Some((t, damage)) = shield
+                && rock.is_none_or(|r| t < r)
+                && player.is_none_or(|p| t < p)
+            {
+                reflected.push(((from.0 + h.vx * STEP * t, from.1 + h.vy * STEP * t), (-h.vx, -h.vy), damage));
+                return false;
+            }
             if let Some(t) = rock
                 && player.is_none_or(|p| t < p)
             {
@@ -2114,6 +2266,9 @@ impl InvadeRun {
                 && h.x < camera.0 + ARENA_W + 12.0
         });
         self.hostiles = hostiles;
+        for (at, dir, damage) in reflected {
+            self.reflect(at, dir, damage);
+        }
         for at in absorbed {
             self.effect(EffectKind::Spark, at, (0.0, 0.0), 0.12);
         }
@@ -2172,7 +2327,8 @@ impl InvadeRun {
         if self.hostiles.len() >= self.hostile_cap() {
             return false;
         }
-        self.hostiles.push(Hostile { kind, x: at.0, y: at.1, vx: velocity.0, vy: velocity.1 });
+        let unblockable = matches!(self.encounter_kind, EncounterKind::Boss(_));
+        self.hostiles.push(Hostile { unblockable, kind, x: at.0, y: at.1, vx: velocity.0, vy: velocity.1 });
         true
     }
 
@@ -2399,6 +2555,7 @@ impl InvadeRun {
         let id = self.next_id;
         self.next_id += 1;
         self.enemies.push(Enemy {
+            elite: false,
             id,
             role,
             x: at.0,
@@ -2488,6 +2645,13 @@ impl InvadeRun {
         let at = self.perimeter((3.0, 1.0), edge);
         let hp = device_hp(kind.base_hp(), self.wave) as f32;
         self.add_enemy(Role::Device(kind), at, (3.0, 1.0), hp, true, kind.score());
+        if self.wave >= 3 && self.loot_rng.below(20) == 0 {
+            let e = self.enemies.last_mut().unwrap();
+            e.elite = true;
+            e.hp *= 3.0;
+            e.max_hp = e.hp;
+            e.score *= 4;
+        }
         let top = flight_speed(kind, self.wave);
         let e = self.enemies.last_mut().unwrap();
         e.cooldown = 1.5;

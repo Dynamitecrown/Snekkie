@@ -1,4 +1,4 @@
-//! Starting loadouts and the six independently ranked weapons. Execution,
+//! Starting loadouts and independently ranked weapons. Execution,
 //! collision ownership and runtime cooldowns belong to the run model.
 
 use super::content::Rig;
@@ -17,10 +17,21 @@ pub enum WeaponKind {
     Arc,
     Orbit,
     Pulse,
+    Flamethrower,
+    Shield,
 }
 
 impl WeaponKind {
-    pub const ALL: [Self; 6] = [Self::Packet, Self::Scatter, Self::Rail, Self::Arc, Self::Orbit, Self::Pulse];
+    pub const ALL: [Self; 8] = [
+        Self::Packet,
+        Self::Scatter,
+        Self::Rail,
+        Self::Arc,
+        Self::Orbit,
+        Self::Pulse,
+        Self::Flamethrower,
+        Self::Shield,
+    ];
     pub const STARTERS: [Self; 3] = [Self::Packet, Self::Scatter, Self::Rail];
 
     pub fn id(self) -> &'static str {
@@ -31,6 +42,8 @@ impl WeaponKind {
             Self::Arc => "arc",
             Self::Orbit => "orbit",
             Self::Pulse => "pulse",
+            Self::Flamethrower => "flamethrower",
+            Self::Shield => "shield",
         }
     }
 
@@ -46,6 +59,8 @@ impl WeaponKind {
             Self::Arc => "Arc",
             Self::Orbit => "Orbit",
             Self::Pulse => "Pulse",
+            Self::Flamethrower => "Flamethrower",
+            Self::Shield => "Shield",
         }
     }
 
@@ -57,6 +72,8 @@ impl WeaponKind {
             Self::Arc => "An electrical chain that damages up to three distinct nearby devices.",
             Self::Orbit => "Rotating packets circle the rig to intercept nearby devices.",
             Self::Pulse => "Periodic damage to every device inside a short radius around the rig.",
+            Self::Flamethrower => "A short, piercing fan of firewall flames aimed at the nearest device.",
+            Self::Shield => "Rotating shields damage devices and reflect ordinary packets. Boss attacks pass through.",
         }
     }
 
@@ -132,6 +149,24 @@ impl WeaponKind {
                 spec.speed = 0.0;
                 spec.range = 0.0;
                 spec.radius = 9.0 + r;
+            }
+            Self::Flamethrower => {
+                spec.damage = damage(0.28, 0.22);
+                spec.cooldown = cooldown(0.65, 0.95);
+                spec.projectiles = 3;
+                spec.spread = 26.0f32.to_radians();
+                spec.pierce = stats.pierce.saturating_add(2);
+                spec.speed = 32.0;
+                spec.range = 12.0 + r;
+            }
+            Self::Shield => {
+                spec.damage = damage(0.6, 0.20);
+                spec.cooldown = cooldown(14.0, 0.95);
+                spec.projectiles = 1 + ranks / 2;
+                spec.pierce = 0;
+                spec.speed = 24.0;
+                spec.range = 60.0;
+                spec.radius = 5.0 + 0.5 * r;
             }
         }
         spec

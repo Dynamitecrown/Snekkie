@@ -95,7 +95,9 @@ Existing profiles remain unchanged. Conflicting names are compared without regar
 
 Open **Settings → Export profiles…** or the sidebar's **… → Export profiles…** to preview saved sessions for export. The selected saved session starts checked; when none is selected, all sessions start checked. Adjust the selection, choose **Export selected…**, and select a JSON destination. Choose a separate file: Snekkie blocks its active profile, preferences and network settings files as export targets. Canceling either the preview or file chooser writes nothing.
 
-Exports include connection and terminal settings, favorites and saved tab colors. Private-key and log file paths are references and are included; passwords, private-key contents and SSH host-key trust are excluded. Transfer the relevant key files separately and review paths when moving profiles between computers. Import and export errors are shown; a failed import save leaves the existing saved collection intact.
+Exports include connection and terminal settings, favorites and saved tab colors. Private-key and log file paths are references and are included; passwords, private-key contents and SSH host-key trust are excluded. Transfer the relevant key files separately and review paths when moving profiles between computers.
+
+Importing turns logging off: each imported profile that had a log path gets the note "logging disabled on import; choose a local log path to enable it", and password logging is also switched off. A shared file can't choose where your logs are written, so a log path from someone else can't make device output overwrite one of your files. To log an imported session, open it with **Edit connection**, set **Log session to** on the **Advanced** page, and save. Profiles already in your list keep their logging settings. Import and export errors are shown; a failed import save leaves the existing saved collection intact.
 
 ## Session tab colors
 

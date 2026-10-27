@@ -12,10 +12,16 @@ use snekkie::{
 
 fn main() {
     std::fs::create_dir_all("target/sidebar-qa").unwrap();
-    for (theme, name) in
-        [("Snekkie Dark", "dark"), ("Paper Light", "light"), ("CRT Super", "crt"), ("E-Ink Super", "e-ink")]
-    {
-        for (size, viewport) in [([1000.0, 640.0], "normal"), ([520.0, 320.0], "small")] {
+    for (theme, name) in [
+        ("Snekkie Dark", "dark"),
+        ("Paper Light", "light"),
+        ("Frost Light", "frost"),
+        ("Copper Night", "copper"),
+        ("Forest Night", "forest"),
+        ("CRT Super", "crt"),
+        ("E-Ink Super", "e-ink"),
+    ] {
+        for (size, viewport) in [([1000.0, 640.0], "normal"), ([720.0, 540.0], "medium"), ([520.0, 320.0], "small")] {
             let dir = tempfile::tempdir().unwrap();
             let paths =
                 Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
@@ -42,6 +48,8 @@ fn main() {
             app.state_mut().set_form_kind(Kind::Ssh);
             app.state_mut().sidebar_draft().host = "draft.example".into();
             app.run_ok();
+            app.get_by_label("New connection");
+            app.render().unwrap().save(format!("target/sidebar-qa/empty-{name}-{viewport}.png")).unwrap();
             app.get_by_label("New session").click();
             app.run_ok();
             app.get_by_label("Core switch").scroll_to_me();
@@ -64,7 +72,7 @@ fn main() {
                     Err(error) => panic!("{error}"),
                 }
             };
-            peer.write_all(b"Core#show ip interface brief\r\nGi0/1 192.0.2.1 up up\r\nCore#").unwrap();
+            peer.write_all(b"Core#show ip interface brief\r\nInterface  IP-Address     Status  Protocol\r\nGi0/1      192.0.2.1      up      up\r\nGi0/2      192.0.2.2      up      up\r\nGi0/3      unassigned     down    down\r\nCore#").unwrap();
             while app.state().active_screen_text().is_none_or(|s| !s.trim_end().ends_with("Core#")) {
                 assert!(Instant::now() < deadline);
                 app.run_ok();

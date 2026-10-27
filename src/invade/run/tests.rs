@@ -56,7 +56,14 @@ fn target(run: &mut InvadeRun, at: (f32, f32), hp: f32) -> u32 {
 
 fn hostile_at_player(run: &mut InvadeRun) {
     let x = run.player.x;
-    run.hostiles.push(Hostile { kind: HostileKind::Straight, x, y: run.player.y - 0.05, vx: 0.0, vy: 20.0 });
+    run.hostiles.push(Hostile {
+        unblockable: false,
+        kind: HostileKind::Straight,
+        x,
+        y: run.player.y - 0.05,
+        vx: 0.0,
+        vy: 20.0,
+    });
 }
 
 fn kill_all(run: &mut InvadeRun) {
@@ -234,6 +241,8 @@ fn fast_packets_collide_without_tunneling_and_misses_miss() {
     for (x, hits) in [(41.5, true), (44.0, false), (39.9, true)] {
         let before = run.enemies.iter().find(|e| e.id == id).unwrap().hp;
         run.shots.push(Shot {
+            radius: 0.15,
+            target: None,
             kind: ShotKind::Primary,
             x,
             y: 20.0,
@@ -252,7 +261,7 @@ fn fast_packets_collide_without_tunneling_and_misses_miss() {
     }
     // Hostile packets can't tunnel through the player either.
     let x = run.player.x;
-    run.hostiles.push(Hostile { kind: HostileKind::Straight, x, y: 10.0, vx: 0.0, vy: 3000.0 });
+    run.hostiles.push(Hostile { unblockable: false, kind: HostileKind::Straight, x, y: 10.0, vx: 0.0, vy: 3000.0 });
     run.move_hostiles();
     assert_eq!(run.integrity, MAX_INTEGRITY - 1);
 }
@@ -1177,7 +1186,14 @@ fn player_motion_cannot_tunnel_through_stationary_packets_or_ship_bodies() {
         if body {
             target(&mut run, (38.5, 14.0), 100.0);
         } else {
-            run.hostiles.push(Hostile { kind: HostileKind::Straight, x: 40.0, y: 14.5, vx: 0.0, vy: 0.0 });
+            run.hostiles.push(Hostile {
+                unblockable: false,
+                kind: HostileKind::Straight,
+                x: 40.0,
+                y: 14.5,
+                vx: 0.0,
+                vy: 0.0,
+            });
         }
         run.step(IDLE);
         assert_eq!(run.integrity(), 4, "body={body}");
@@ -1206,6 +1222,8 @@ fn guidance_takes_the_short_turn_across_the_angle_boundary() {
     let angle = 179.0f32.to_radians();
     let (vx, vy) = velocity((angle.cos(), angle.sin()), 40.0);
     let mut shot = Shot {
+        radius: 0.15,
+        target: None,
         kind: ShotKind::Primary,
         x: 40.0,
         y: 14.0,
@@ -1854,6 +1872,8 @@ fn asteroids_absorb_packets_before_targets_but_do_not_block_nearer_targets() {
         target(&mut run, (if rock_first { 60.0 } else { 48.0 }, 26.0), 100.0);
         run.place_asteroid((if rock_first { 50.0 } else { 60.0 }, 26.5), 3.0, (0.0, 0.0));
         run.shots.push(Shot {
+            radius: 0.15,
+            target: None,
             kind: ShotKind::Primary,
             x: 40.0,
             y: 26.5,
@@ -1872,7 +1892,14 @@ fn asteroids_absorb_packets_before_targets_but_do_not_block_nearer_targets() {
 
         let mut hostile = quiet(Rig::Probe);
         hostile.place_asteroid((if rock_first { 50.0 } else { 30.0 }, 26.5), 3.0, (0.0, 0.0));
-        hostile.hostiles.push(Hostile { kind: HostileKind::Straight, x: 70.0, y: 26.5, vx: -4000.0, vy: 0.0 });
+        hostile.hostiles.push(Hostile {
+            unblockable: false,
+            kind: HostileKind::Straight,
+            x: 70.0,
+            y: 26.5,
+            vx: -4000.0,
+            vy: 0.0,
+        });
         hostile.move_hostiles();
         assert!(hostile.hostiles.is_empty());
         assert_eq!(hostile.integrity(), if rock_first { MAX_INTEGRITY } else { MAX_INTEGRITY - 1 });
@@ -2046,4 +2073,315 @@ fn a_fatal_asteroid_contact_stops_the_step_before_the_encounter_can_fire_again()
         run.hostiles.is_empty() && run.marks.is_empty() && run.scans.is_empty(),
         "defeat clears attacks and does not let the due boss pattern recreate them"
     );
+}
+
+#[test]
+fn flamethrower_hits_a_short_piercing_cone_and_stops_at_its_range() {
+    let mut run = armed(WeaponKind::Flamethrower);
+    for at in [(38.5, 23.5), (38.5, 21.5), (38.5, 12.0), (60.0, 26.0)] {
+        target(&mut run, at, 100.0);
+    }
+    run.step(Input { fire: true, aim: Some((40.0, 0.0)), ..IDLE });
+    assert_eq!(run.shots.len(), 3);
+    assert!(run.shots.iter().all(|s| s.kind == ShotKind::Flame));
+    seconds(&mut run, IDLE, 0.7);
+    let lost = hp_lost(&run);
+    assert!(lost[0] > 0.0 && lost[1] > 0.0, "{lost:?}");
+    assert_eq!(&lost[2..], &[0.0, 0.0]);
+    assert!(run.shots.is_empty());
+}
+
+fn shield_fixture() -> InvadeRun {
+    let mut run = armed(WeaponKind::Shield);
+    run.fire_weapons(true);
+    run.orbitals[0].x = 45.0;
+    run.orbitals[0].y = 26.5;
+    run.orbitals[0].previous = (45.0, 26.5);
+    run
+}
+
+#[test]
+fn rotating_shield_reflects_fast_packets_and_reflections_damage_without_recursion() {
+    let mut run = shield_fixture();
+    target(&mut run, (48.5, 26.0), 100.0);
+    run.hostiles.push(Hostile {
+        unblockable: false,
+        kind: HostileKind::Straight,
+        x: 50.0,
+        y: 26.5,
+        vx: -1200.0,
+        vy: 0.0,
+    });
+    run.move_hostiles();
+    assert!(run.hostiles.is_empty());
+    assert_eq!(run.integrity, MAX_INTEGRITY);
+    assert_eq!(run.shots.len(), 1);
+    assert_eq!(run.shots[0].kind, ShotKind::Reflected);
+    assert!(run.shots[0].vx > 0.0);
+    for _ in 0..30 {
+        run.move_shots();
+    }
+    assert!(hp_lost(&run)[0] > 0.0);
+    assert!(run.shots.iter().all(|s| s.kind != ShotKind::Fragment));
+    let before = run.orbitals[0].angle;
+    run.update_orbitals();
+    assert!(run.orbitals[0].angle > before);
+}
+
+#[test]
+fn shields_have_gaps_and_cannot_deflect_heavy_boss_packets_or_streams() {
+    for kind in [HostileKind::Straight, HostileKind::Stream] {
+        let mut run = shield_fixture();
+        run.hostiles.push(Hostile { unblockable: true, kind, x: 50.0, y: 26.5, vx: -1200.0, vy: 0.0 });
+        run.move_hostiles();
+        assert_eq!(run.integrity, MAX_INTEGRITY - 1, "{kind:?}");
+        assert!(run.shots.is_empty());
+    }
+    let mut run = shield_fixture();
+    hostile_at_player(&mut run);
+    run.move_hostiles();
+    assert_eq!(run.integrity, MAX_INTEGRITY - 1, "a shield is not full-circle immunity");
+    let mut boss = quiet(Rig::Probe);
+    boss.encounter_kind = EncounterKind::Boss(BossKind::Gateway);
+    boss.spawn(HostileKind::Straight, (40.0, 10.0), (0.0, 1.0));
+    assert!(boss.hostiles[0].unblockable);
+}
+
+#[test]
+fn missile_locks_nearest_high_health_retains_lock_and_reacquires_after_death() {
+    let mut run = quiet(Rig::Probe);
+    run.weapons.clear();
+    target(&mut run, (38.5, 24.0), 1.0);
+    let first = target(&mut run, (48.5, 22.0), 20.0);
+    target(&mut run, (38.5, 10.0), 100.0);
+    run.set_pivot_kind(PivotKind::Missile);
+    run.step(Input { special: true, ..IDLE });
+    assert_eq!(run.player.charges, 0);
+    assert_eq!(run.shots.len(), 1);
+    assert_eq!(run.shots[0].target, Some(first));
+    assert_eq!(run.shots[0].kind, ShotKind::Missile);
+    let mut shot = run.shots.pop().unwrap();
+    let closer = target(&mut run, (41.0, 25.5), 50.0);
+    run.steer_missile(&mut shot);
+    assert_eq!(shot.target, Some(first), "a live lock is stable");
+    let first_index = run.alive_index(first).unwrap();
+    run.damage(first_index, 1000.0);
+    run.steer_missile(&mut shot);
+    assert_eq!(shot.target, Some(closer));
+    run.step(Input { special: true, ..IDLE });
+    assert!(run.shots.is_empty(), "cannot spend the same charge twice");
+}
+
+#[test]
+fn missile_falls_back_to_nearest_and_explodes_on_hit_rock_and_expiry() {
+    for mode in 0..3 {
+        let mut run = quiet(Rig::Probe);
+        run.weapons.clear();
+        let id = target(&mut run, (38.5, 21.0), 4.0);
+        target(&mut run, (43.5, 21.0), 4.0);
+        target(&mut run, (65.0, 21.0), 4.0);
+        run.launch_missile();
+        assert_eq!(run.shots[0].target, Some(id));
+        if mode == 1 {
+            run.place_asteroid((40.0, 23.5), 1.0, (0.0, 0.0));
+        }
+        if mode == 2 {
+            run.shots[0].range = 0.0;
+            run.shots[0].x = 40.0;
+            run.shots[0].y = 22.0;
+        }
+        for _ in 0..100 {
+            run.move_shots();
+        }
+        assert!(!run.enemies[0].alive && !run.enemies[1].alive, "mode {mode}");
+        assert!(run.enemies[2].alive);
+        assert_eq!(run.compromised, 2);
+        assert!(run.shots.is_empty());
+    }
+}
+
+#[test]
+fn missile_blast_damages_a_shared_boss_pool_once_and_amplifier_increases_blast() {
+    let mut run = quiet(Rig::Probe);
+    let a = target(&mut run, (38.5, 22.0), 100.0);
+    let b = target(&mut run, (43.0, 22.0), 100.0);
+    run.pools.push(Pool { hp: 100.0, alive: true });
+    for e in &mut run.enemies {
+        if e.id == a || e.id == b {
+            e.pool = Some(0);
+        }
+    }
+    run.explode((42.0, 23.0), 12.0);
+    assert_eq!(run.pools[0].hp, 88.0);
+    assert_eq!(run.effects.last().unwrap().radius, 8.0);
+    run.grant(UpgradeId::ToolAmplifier);
+    run.launch_missile();
+    assert_eq!(run.shots[0].damage, 14.0);
+    run.explode((42.0, 23.0), 14.0);
+    assert_eq!(run.effects.last().unwrap().radius, 9.0);
+}
+
+#[test]
+fn elites_are_rare_seeded_tougher_and_drop_their_unique_cargo_once() {
+    let mut a = quiet(Rig::Probe);
+    let mut b = quiet(Rig::Probe);
+    a.wave = 4;
+    b.wave = 4;
+    for _ in 0..1000 {
+        a.spawn_device(DeviceKind::Endpoint, None);
+        b.spawn_device(DeviceKind::Endpoint, None);
+    }
+    let elites: Vec<_> = a.enemies.iter().filter(|e| e.elite).collect();
+    assert!((15..90).contains(&elites.len()), "{} elites", elites.len());
+    assert_eq!(
+        a.enemies.iter().map(|e| e.elite).collect::<Vec<_>>(),
+        b.enemies.iter().map(|e| e.elite).collect::<Vec<_>>()
+    );
+    for e in elites {
+        assert_eq!(e.hp, device_hp(DeviceKind::Endpoint.base_hp(), 4) as f32 * 3.0);
+    }
+    for index in 0..a.enemies.len() {
+        a.damage(index, 100000.0);
+    }
+    assert_eq!(a.item_drops.len(), 2, "duplicates never fill the world");
+    assert_eq!(
+        a.orbs.iter().map(|o| o.value).sum::<u64>(),
+        1000 + a.enemies.iter().filter(|e| e.elite).count() as u64 * 4
+    );
+    let mut run = quiet(Rig::Probe);
+    for _ in 0..2 {
+        run.place_elite((50.0, 26.0));
+        let i = run.enemies.len() - 1;
+        run.damage(i, 10000.0);
+        run.kill(i);
+    }
+    let mut kinds: Vec<_> = run.item_drops.iter().map(|d| d.kind).collect();
+    kinds.sort();
+    assert_eq!(kinds, ItemKind::ALL, "the second elite drops the other item");
+    assert_eq!(run.compromised, 2);
+}
+
+#[test]
+fn elites_never_drop_an_item_the_player_has_equipped() {
+    for seed in 0..40 {
+        let mut run = InvadeRun::new(seed, Rig::Probe, [], 0);
+        run.collect_item(ItemKind::JumboFrame);
+        run.place_elite((50.0, 26.0));
+        let i = run.enemies.len() - 1;
+        run.damage(i, 10000.0);
+        assert_eq!(run.item_drops.iter().map(|d| d.kind).collect::<Vec<_>>(), [ItemKind::PortMirroring]);
+        run.item_drops.clear();
+        run.collect_item(ItemKind::PortMirroring);
+        run.place_elite((50.0, 26.0));
+        let i = run.enemies.len() - 1;
+        run.damage(i, 10000.0);
+        assert!(run.item_drops.is_empty(), "nothing left to drop");
+    }
+}
+
+#[test]
+fn cargo_pickup_is_unique_lasts_between_waves_and_resets_on_a_new_run() {
+    let mut run = quiet(Rig::Probe);
+    run.spawn_item_drop(ItemKind::JumboFrame, (50.0, 26.5));
+    run.update_items();
+    assert!(run.items.is_empty());
+    run.player.x = 50.0;
+    run.update_items();
+    assert!(run.items.contains(&ItemKind::JumboFrame));
+    assert!(run.item_drops.is_empty());
+    run.spawn_item_drop(ItemKind::JumboFrame, (50.0, 26.5));
+    run.collect_item(ItemKind::JumboFrame);
+    assert!(run.item_drops.is_empty());
+    assert_eq!(run.take_events().iter().filter(|e| **e == Event::ItemCollected(ItemKind::JumboFrame)).count(), 1);
+    run.spawn_item_drop(ItemKind::PortMirroring, (55.0, 26.5));
+    run.start_wave(4);
+    assert!(run.items.contains(&ItemKind::JumboFrame));
+    assert_eq!(run.item_drops.len(), 1);
+    let fresh = quiet(Rig::Probe);
+    assert!(fresh.items.is_empty() && fresh.item_drops.is_empty());
+}
+
+#[test]
+fn jumbo_frame_scales_existing_and_future_packets_missiles_fragments_and_orbitals() {
+    let mut run = armed(WeaponKind::Orbit);
+    run.fire_weapons(true);
+    run.launch_missile();
+    let original = run.shots[0].clone();
+    let orb_speed = run.orbitals[0].speed;
+    run.collect_item(ItemKind::JumboFrame);
+    assert!(close_to(run.shots[0].radius, original.radius * 1.25));
+    assert!(close_to(run.shots[0].vx.hypot(run.shots[0].vy * ASPECT), original.vx.hypot(original.vy * ASPECT) * 0.5));
+    assert!(close_to(run.orbitals[0].size, 0.375));
+    assert_eq!(run.orbitals[0].speed, orb_speed * 0.5);
+    run.collect_item(ItemKind::JumboFrame);
+    assert_eq!(run.orbitals[0].speed, orb_speed * 0.5, "no stacking");
+    run.shots.clear();
+    let spec = WeaponKind::Packet.spec(1, run.rig, &run.stats);
+    run.weapon_packet(ShotKind::Primary, (1.0, 0.0), 1.0, spec);
+    assert_eq!(run.shots[0].vx, spec.speed * 0.5);
+    assert!(close_to(run.shots[0].radius, 0.1875));
+    run.grant(UpgradeId::Fragment);
+    run.fragment(1, (40.0, 26.0), 1.0, (1.0, 0.0));
+    assert!(
+        run.new_shots
+            .iter()
+            .all(|s| close_to(s.radius, 0.1875) && close_to(s.vx.hypot(s.vy * ASPECT), FRAGMENT_SPEED * 0.5))
+    );
+}
+
+#[test]
+fn jumbo_frame_enlarges_the_projectile_collision_box() {
+    for jumbo in [false, true] {
+        let mut run = quiet(Rig::Probe);
+        target(&mut run, (50.0, 26.0), 100.0);
+        if jumbo {
+            run.collect_item(ItemKind::JumboFrame);
+        }
+        let spec = WeaponKind::Packet.spec(1, run.rig, &run.stats);
+        run.single_packet(ShotKind::Primary, (0.0, -1.0), 1.0, spec);
+        let mut shot = run.shots.pop().unwrap();
+        shot.x = 49.83;
+        shot.y = 26.5;
+        let from = (shot.x, 28.0);
+        assert_eq!(run.collide(&mut shot, from), jumbo);
+    }
+}
+
+#[test]
+fn port_mirroring_fires_opposite_directions_with_seeded_misses_and_bounded_slots() {
+    let mut a = quiet(Rig::Probe);
+    let mut b = quiet(Rig::Probe);
+    for run in [&mut a, &mut b] {
+        run.collect_item(ItemKind::PortMirroring);
+    }
+    let spec = WeaponKind::Packet.spec(1, a.rig, &a.stats);
+    let mut forward = 0;
+    let mut backward = 0;
+    for _ in 0..1000 {
+        for run in [&mut a, &mut b] {
+            run.shots.clear();
+            run.weapon_packet(ShotKind::Primary, (1.0, 0.0), 1.0, spec);
+        }
+        assert_eq!(a.shots.iter().map(|s| s.vx).collect::<Vec<_>>(), b.shots.iter().map(|s| s.vx).collect::<Vec<_>>());
+        forward += a.shots.iter().filter(|s| s.vx > 0.0).count();
+        backward += a.shots.iter().filter(|s| s.vx < 0.0).count();
+    }
+    assert!((680..820).contains(&forward) && (680..820).contains(&backward), "{forward}/{backward}");
+    for _ in 0..1000 {
+        a.weapon_packet(ShotKind::Primary, (1.0, 0.0), 1.0, spec);
+    }
+    assert_eq!(a.shots.len(), MAX_SHOTS);
+    assert_eq!(a.weapons.len(), 1, "cargo consumes no weapon slots");
+}
+
+#[test]
+fn missile_amplifier_cards_describe_the_selected_specials_actual_damage_and_radius() {
+    let mut run = quiet(Rig::Probe);
+    run.set_pivot_kind(PivotKind::Missile);
+    run.offers = vec![LevelChoice::Module(Offer::Upgrade(UpgradeId::ToolAmplifier))];
+    assert_eq!(run.cards()[0].effect, "Missile blast damage 12 -> 14; radius 8 -> 9.");
+    run.grant(UpgradeId::ToolAmplifier);
+    assert_eq!(run.cards()[0].effect, "Missile blast damage 14 -> 16; radius 9 -> 10.");
+    run.set_pivot_kind(PivotKind::Chain);
+    assert!(run.cards()[0].effect.contains("Pivot chains"));
 }

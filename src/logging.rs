@@ -95,6 +95,29 @@ impl Privacy {
     }
 }
 
+/// Where "Automatic log filename" puts logs.
+pub fn default_log_dir() -> PathBuf {
+    crate::config::config_dir().join("logs")
+}
+
+/// On Unix, new log files are readable only by their owner (0600); the
+/// default umask would usually leave them readable by every account.
+fn private_file(options: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(options, 0o600);
+    options
+}
+
+/// Folders Snekkie creates for logs are private on Unix (0700). Existing
+/// folders the user chose keep their permissions.
+fn create_log_dirs(dir: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
+}
+
 /// Archives use create_new: prior files are never replaced by rotation.
 pub struct RotatingFile {
     path: PathBuf,
@@ -108,10 +131,23 @@ pub struct RotatingFile {
 
 impl RotatingFile {
     pub fn open(path: &Path, limit: u64, daily: bool) -> io::Result<Self> {
+        Self::open_with(path, limit, daily, &default_log_dir())
+    }
+
+    fn open_with(path: &Path, limit: u64, daily: bool, default_dir: &Path) -> io::Result<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
+            create_log_dirs(parent)?;
+            // Snekkie's own folder is tightened even if an older version made
+            // it readable to others, which also covers the logs already in it.
+            #[cfg(unix)]
+            if parent == default_dir {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            }
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        #[cfg(not(unix))]
+        let _ = default_dir;
+        let file = private_file(OpenOptions::new().create(true).append(true)).open(path)?;
         static FILES: OnceLock<parking_lot::Mutex<BTreeMap<PathBuf, Weak<parking_lot::Mutex<()>>>>> = OnceLock::new();
         let key = path.canonicalize()?;
         let coordinate = {
@@ -143,7 +179,7 @@ impl RotatingFile {
         let archive = loop {
             let mut archive = self.path.as_os_str().to_os_string();
             archive.push(format!(".{stamp}.{index}"));
-            match OpenOptions::new().write(true).create_new(true).open(Path::new(&archive)) {
+            match private_file(OpenOptions::new().write(true).create_new(true)).open(Path::new(&archive)) {
                 Ok(mut destination) => {
                     let mut source = File::open(&self.path)?;
                     io::copy(&mut source, &mut destination)?;
@@ -311,6 +347,21 @@ impl Recorder {
     }
 }
 
+/// The longest unfinished line kept for redaction. A device that never sends
+/// a line break would otherwise grow it until memory runs out, so logging
+/// stops instead; the fragment is dropped, never written unredacted.
+const MAX_PENDING_LINE: usize = 1024 * 1024;
+
+fn check_pending(len: usize) -> io::Result<()> {
+    if len > MAX_PENDING_LINE {
+        return Err(io::Error::other(format!(
+            "the device sent more than {} MiB without a line break, so logging stopped",
+            MAX_PENDING_LINE / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
 /// Preserve ordinary raw lines exactly. Buffer sensitive candidates until the
 /// complete line is available so a transport chunk cannot bypass redaction.
 struct RawWriter<W: Write> {
@@ -354,6 +405,7 @@ impl<W: Write> RawWriter<W> {
                     self.emit()?;
                 }
             }
+            check_pending(self.pending.len())?;
         }
         self.writer.flush()
     }
@@ -459,6 +511,7 @@ impl<W: Write> TextWriter<W> {
                 _ => {}
             }
         }
+        check_pending(self.streams[index].bytes.len())?;
         self.writer.flush()
     }
 
@@ -569,5 +622,138 @@ mod tests {
         let text = String::from_utf8_lossy(&writer.writer);
         assert!(text.contains("secret [redacted]"));
         assert!(!text.contains("never-log-this"));
+    }
+
+    /// A line just under the limit still logs, redacted, from many small chunks.
+    /// Going over stops logging with the fragment unwritten, in every writer.
+    #[test]
+    fn a_line_without_a_break_is_capped_and_never_written_unredacted() {
+        let chunk = [b'x'; 4096];
+        let under = MAX_PENDING_LINE - 64;
+        let line = |prefix: &[u8], len: usize| {
+            let mut line = prefix.to_vec();
+            line.resize(len, b'x');
+            line
+        };
+
+        // Raw output: split keyword, ANSI and UTF-8 at the boundary still redact.
+        let mut raw = RawWriter::new(Vec::new(), false);
+        let mut long = line(b"enable s\x1b[0mecret 0 hidden-value ", under);
+        long.extend_from_slice(b"caf\xc3\xa9\r\n");
+        for piece in long.chunks(7) {
+            raw.receive(piece).unwrap();
+        }
+        let written = raw.writer.len();
+        assert!(String::from_utf8_lossy(&raw.writer).contains("secret [redacted]"));
+        assert!(!String::from_utf8_lossy(&raw.writer).contains("hidden-value"));
+        raw.receive(b"password never-written ").unwrap();
+        let tries = MAX_PENDING_LINE / chunk.len() + 2;
+        let error = (0..tries).find_map(|_| raw.receive(&chunk).err()).expect("the raw line was never capped");
+        assert!(error.to_string().contains("without a line break"), "{error}");
+        assert!(raw.pending.len() <= MAX_PENDING_LINE + chunk.len());
+        assert_eq!(raw.writer.len(), written, "the oversized fragment was written");
+
+        // Readable text, in both directions.
+        for direction in [Direction::Output, Direction::Input] {
+            let mut text = TextWriter::new(Vec::new(), false);
+            let mut ok = line(b"secret 0 hidden-value ", under);
+            ok.push(b'\n');
+            for piece in ok.chunks(4096) {
+                text.record(Record { direction, bytes: piece.to_vec(), time: Utc::now() }).unwrap();
+            }
+            let written = text.writer.len();
+            let logged = String::from_utf8_lossy(&text.writer).into_owned();
+            assert!(logged.contains("secret [redacted]") && !logged.contains("hidden-value"));
+            let record = |bytes: &[u8]| Record { direction, bytes: bytes.to_vec(), time: Utc::now() };
+            text.record(record(b"password never-written ")).unwrap();
+            let error =
+                (0..tries).find_map(|_| text.record(record(&chunk)).err()).expect("the text line was never capped");
+            assert!(error.to_string().contains("without a line break"), "{error}");
+            assert!(text.streams.iter().all(|stream| stream.bytes.len() <= MAX_PENDING_LINE + chunk.len()));
+            assert_eq!(text.writer.len(), written, "the oversized fragment was written");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_logs_companions_archives_and_the_default_folder_are_private() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let root = tempfile::tempdir().unwrap();
+
+        // An older version left the default folder readable by everyone.
+        let default_dir = root.path().join("snekkie").join("logs");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        std::fs::set_permissions(&default_dir, Permissions::from_mode(0o755)).unwrap();
+        let mut log = RotatingFile::open_with(&default_dir.join("lab.log"), 4, false, &default_dir).unwrap();
+        log.write_all(b"one").unwrap();
+        log.write_all(b"two").unwrap(); // Over the limit: rotates into an archive.
+        assert_eq!(mode(&default_dir), 0o700);
+        let files: Vec<_> = std::fs::read_dir(&default_dir).unwrap().map(|entry| entry.unwrap().path()).collect();
+        assert_eq!(files.len(), 2, "{files:?}");
+        for file in &files {
+            assert_eq!(mode(file), 0o600, "{}", file.display());
+        }
+
+        // A folder the user named that doesn't exist yet is created private.
+        let custom = root.path().join("custom").join("nested");
+        RotatingFile::open_with(&custom.join("a.log"), 0, false, &default_dir).unwrap();
+        assert_eq!((mode(&custom), mode(&custom.join("a.log"))), (0o700, 0o600));
+
+        // An existing folder and an existing file keep what the user chose.
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, Permissions::from_mode(0o755)).unwrap();
+        let old = shared.join("old.log");
+        std::fs::write(&old, b"before\n").unwrap();
+        std::fs::set_permissions(&old, Permissions::from_mode(0o640)).unwrap();
+        RotatingFile::open_with(&old, 0, false, &default_dir).unwrap().write_all(b"after\n").unwrap();
+        assert_eq!((mode(&shared), mode(&old)), (0o755, 0o640));
+        assert_eq!(std::fs::read(&old).unwrap(), b"before\nafter\n");
+
+        // Raw logging's input companion is private too.
+        let raw = shared.join("raw.log");
+        let (handle, worker) = LogHandle::start(&raw, 0, false, false, true, Arc::new(|_| {})).unwrap();
+        drop(handle);
+        worker.join().unwrap();
+        assert_eq!((mode(&raw), mode(&shared.join("raw.log.input.log"))), (0o600, 0o600));
+    }
+
+    /// Through the worker: one warning, nothing more accepted, and the partial
+    /// line before the limit is never flushed.
+    #[test]
+    fn the_worker_warns_once_and_stops_at_the_limit() {
+        #[derive(Clone, Default)]
+        struct Shared(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let file = Shared::default();
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = warnings.clone();
+        let (mut handle, worker) =
+            LogHandle::start_test(Box::new(file.clone()), Arc::new(move |e| seen.lock().unwrap().push(e))).unwrap();
+        handle.write_all(b"before\n").unwrap();
+        let chunk = vec![b'x'; 64 * 1024];
+        // Once the worker stops, the queue is closed and sending fails.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while handle.write_all(&chunk).is_ok() {
+            assert!(std::time::Instant::now() < deadline, "logging never stopped");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(handle);
+        worker.join().unwrap();
+        let warnings = warnings.lock().unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("without a line break"), "{}", warnings[0]);
+        let logged = String::from_utf8(file.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.ends_with("RX before\n"), "{logged:?}");
     }
 }

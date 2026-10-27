@@ -433,6 +433,14 @@ pub fn weapon_details(kind: WeaponKind, spec: &WeaponSpec) -> String {
             spec.range / spec.speed
         ),
         WeaponKind::Pulse => format!("{cadence} to each device within {:.1} radius.", spec.radius),
+        WeaponKind::Flamethrower => format!(
+            "{cadence} per flame; {} flames; {:.1} range; {} extra pierce.",
+            spec.projectiles, spec.range, spec.pierce
+        ),
+        WeaponKind::Shield => format!(
+            "{cadence} per contact; {} shields at {:.1} radius; reflect ordinary packets for {:.2} damage.",
+            spec.projectiles, spec.radius, spec.damage
+        ),
     }
 }
 
@@ -446,6 +454,11 @@ fn weapon_downside(kind: WeaponKind) -> Option<String> {
             Some("The rotating packets stay near your rig instead of pursuing distant targets.".into())
         }
         WeaponKind::Pulse => Some("Short-range only; devices outside the radius are unaffected.".into()),
+        WeaponKind::Flamethrower => Some("Short reach; each penetration retains 65% damage.".into()),
+        WeaponKind::Shield => Some(
+            "Only packets touching a shield are reflected. Boss packets, streams, scans and curtains pass through."
+                .into(),
+        ),
     }
 }
 
@@ -468,7 +481,7 @@ fn weapon_changes(ctx: &OfferContext<'_>, weapons: &[WeaponState], next: &Stats,
 }
 
 fn projectile_weapon(kind: WeaponKind) -> bool {
-    matches!(kind, WeaponKind::Packet | WeaponKind::Scatter | WeaponKind::Rail)
+    matches!(kind, WeaponKind::Packet | WeaponKind::Scatter | WeaponKind::Rail | WeaponKind::Flamethrower)
 }
 
 pub fn describe_level(choice: LevelChoice, ctx: &OfferContext<'_>, weapons: &[WeaponState]) -> Card {

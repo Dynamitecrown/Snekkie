@@ -1,0 +1,18 @@
+# Advisories reviewed and accepted for `cargo audit`. Each needs a reason;
+# review again whenever the dependency that brings it in is updated.
+
+[advisories]
+ignore = [
+    # rsa "Marvin" timing side channel: no fixed release exists. It comes in
+    # through russh's `rsa` feature, needed for RSA keys and host keys. Snekkie
+    # only signs with the user's own key, once per login, so a remote party
+    # can't collect the many timing samples the attack needs.
+    "RUSTSEC-2023-0071",
+    # zbus_names, zvariant and zvariant_derive are unmaintained. They come in
+    # through egui-winit's Linux screen-reader support (AT-SPI) and talk only
+    # to the local accessibility bus. No maintained replacement yet; drop
+    # these once egui/accesskit moves off them.
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0372",
+]

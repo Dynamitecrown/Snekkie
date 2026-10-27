@@ -249,6 +249,16 @@ impl Sidebar {
         accent: egui::Color32,
     ) -> Vec<Action> {
         self.blocks_terminal_input = false;
+        ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+        if ui.available_height() < 500.0 {
+            let style = ui.style_mut();
+            style.spacing.item_spacing.y = 4.0;
+            style.spacing.button_padding = egui::vec2(8.0, 4.0);
+            style.spacing.interact_size.y = 24.0;
+            for text in [egui::TextStyle::Body, egui::TextStyle::Button] {
+                style.text_styles.get_mut(&text).unwrap().size = 13.0;
+            }
+        }
         let width = ui.available_width();
         egui::ScrollArea::vertical()
             .id_salt("sidebar_contents")
@@ -279,36 +289,46 @@ impl Sidebar {
         if expand {
             form.header_response.scroll_to_me(Some(egui::Align::TOP));
         }
-        ui.add_space(12.0);
+        ui.add_space(8.0);
         self.saved_ui(ui, store, &mut actions);
         actions
     }
 
     fn form_ui(&mut self, ui: &mut Ui, monospace_fonts: &[String], accent: egui::Color32, actions: &mut Vec<Action>) {
-        row(ui, "Type", |ui| {
+        ui.columns(2, |columns| {
+            for ui in columns.iter_mut() {
+                ui.spacing_mut().item_spacing.y = 2.0;
+            }
+            let ui = &mut columns[0];
+            let label = ui.label("Type");
             let mut kind = self.draft.kind();
-            ComboBox::from_id_salt("kind").width(ui.available_width()).truncate().selected_text(kind.label()).show_ui(
-                ui,
-                |ui| {
+            ComboBox::from_id_salt("kind")
+                .width(ui.available_width().floor())
+                .truncate()
+                .selected_text(kind.label())
+                .show_ui(ui, |ui| {
                     for option in Kind::ALL {
                         ui.selectable_value(&mut kind, option, option.label());
                     }
-                },
-            );
+                })
+                .response
+                .labelled_by(label.id);
             if kind != self.draft.kind() {
                 self.set_kind(kind);
             }
-        });
-        row(ui, "Highlighting", |ui| {
+            let ui = &mut columns[1];
+            let label = ui.label("Highlighting");
             ComboBox::from_id_salt("device_syntax")
-                .width(ui.available_width())
+                .width(ui.available_width().floor())
                 .truncate()
                 .selected_text(syntax_label(&self.draft.device_syntax))
                 .show_ui(ui, |ui| {
                     for (value, label) in syntax_options() {
                         ui.selectable_value(&mut self.draft.device_syntax, value.to_string(), label);
                     }
-                });
+                })
+                .response
+                .labelled_by(label.id);
         });
         ui.add_space(6.0);
 
@@ -322,20 +342,17 @@ impl Sidebar {
             }
         });
 
-        egui::Frame::new().stroke(egui::Stroke::new(1.0, style::border(ui))).corner_radius(4.0).inner_margin(8.0).show(
-            ui,
-            |ui| {
-                ui.set_width(ui.available_width());
-                match self.page {
-                    Page::Network => self.network_page(ui, actions),
-                    Page::Serial => self.serial_page(ui, actions),
-                    Page::Advanced => self.advanced_page(ui, monospace_fonts, actions),
-                }
-            },
-        );
+        egui::Frame::new().fill(ui.visuals().faint_bg_color).corner_radius(4.0).inner_margin(8.0).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            match self.page {
+                Page::Network => self.network_page(ui, actions),
+                Page::Serial => self.serial_page(ui, actions),
+                Page::Advanced => self.advanced_page(ui, monospace_fonts, actions),
+            }
+        });
 
         ui.add_space(6.0);
-        let connect = ui.add_sized([ui.available_width(), 30.0], style::accent_button("Connect", accent));
+        let connect = ui.add_sized([ui.available_width(), 30.0], style::primary_button(ui, "Connect"));
         if connect.clicked() {
             let profile = self.collect();
             match validate(&profile) {
@@ -346,13 +363,22 @@ impl Sidebar {
     }
 
     fn network_page(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        row(ui, "Host", |ui| {
-            let host = ui.add(text_field(&mut self.draft.host, "hostname or IP", ui.available_width()));
-            if std::mem::take(&mut self.focus_host) && self.page == Page::Network {
-                host.request_focus();
-            }
+        ui.horizontal_top(|ui| {
+            let host_width = (ui.available_width() - 64.0 - ui.spacing().item_spacing.x).floor();
+            ui.allocate_ui_with_layout(egui::vec2(host_width, 0.0), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let label = ui.label("Host");
+                let host = ui.add(text_field(&mut self.draft.host, "hostname or IP", host_width)).labelled_by(label.id);
+                if std::mem::take(&mut self.focus_host) && self.page == Page::Network {
+                    host.request_focus();
+                }
+            });
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let label = ui.label("Port");
+                ui.add(DragValue::new(&mut self.draft.port).range(1..=65535).speed(0.2)).labelled_by(label.id);
+            });
         });
-        row(ui, "Port", |ui| ui.add(DragValue::new(&mut self.draft.port).range(1..=65535).speed(0.2)));
         if self.draft.kind() == Kind::Ssh {
             self.ssh_login(ui, actions);
         }
@@ -548,7 +574,7 @@ impl Sidebar {
         egui::CollapsingHeader::new("Logging options").show(ui, |ui| {
         if ui.button("Automatic log filename").clicked() {
             self.draft.log_path =
-                crate::config::config_dir().join("logs").join("{host}-{date}-{session}.log").display().to_string();
+                crate::logging::default_log_dir().join("{host}-{date}-{session}.log").display().to_string();
         }
         row(ui, "Log format", |ui| {
             egui::ComboBox::from_id_salt("log_format")
@@ -659,8 +685,13 @@ impl Sidebar {
         let stacked =
             button_width(ui, "Connect selected") + button_width(ui, "Edit connection") + ui.spacing().item_spacing.x
                 > ui.available_width();
-        let button_row =
-            (if stacked { 3.0 } else { 2.0 }) * (ui.spacing().interact_size.y + ui.spacing().item_spacing.y) + 8.0;
+        let control_height = ui
+            .spacing()
+            .interact_size
+            .y
+            .max(ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y)
+            .ceil();
+        let button_row = (if stacked { 3.0 } else { 2.0 }) * (control_height + ui.spacing().item_spacing.y) + 8.0;
         let list_height = (ui.available_height() - button_row).max(34.0);
         egui::Frame::new()
             .fill(ui.visuals().faint_bg_color)
@@ -690,8 +721,8 @@ impl Sidebar {
                                             profile.name
                                         );
                                         let star = ui.add_sized(
-                                            [24.0, 22.0],
-                                            egui::Button::new(if profile.favorite { "★" } else { "☆" }),
+                                            [24.0, 34.0],
+                                            egui::Button::new(if profile.favorite { "★" } else { "☆" }).frame(false),
                                         );
                                         star.widget_info(|| {
                                             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &label)
@@ -701,17 +732,48 @@ impl Sidebar {
                                             actions.push(Action::ToggleFavorite(profile.name.clone()));
                                         }
                                         ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                                            let name = RichText::new(&profile.name);
-                                            let name = if selected {
-                                                name.color(ui.visuals().selection.stroke.color)
+                                            let endpoint = if profile.kind() == Kind::Serial {
+                                                format!("{} · {} baud", profile.device, profile.baud)
                                             } else {
-                                                name
+                                                format!("{}:{}", profile.host, profile.port)
                                             };
-                                            ui.add(
-                                                egui::Button::selectable(selected, name)
-                                                    .truncate()
-                                                    .min_size(egui::vec2(0.0, 22.0)),
-                                            )
+                                            let response = ui.add(
+                                                egui::Button::selectable(selected, "").min_size(egui::vec2(0.0, 34.0)),
+                                            );
+                                            // Elide each line independently so a long alias never hides its destination.
+                                            let details = format!("{} · {endpoint}", profile.kind().label());
+                                            for (text, font, color, y) in [
+                                                (profile.name.as_str(), egui::TextStyle::Body, style::primary(ui), 3.0),
+                                                (details.as_str(), egui::TextStyle::Small, style::secondary(ui), 18.0),
+                                            ] {
+                                                let mut job = egui::text::LayoutJob::simple(
+                                                    text.into(),
+                                                    font.resolve(ui.style()),
+                                                    color,
+                                                    (response.rect.width() - 16.0).max(1.0),
+                                                );
+                                                job.wrap.max_rows = 1;
+                                                let galley = ui.fonts_mut(|f| f.layout_job(job));
+                                                ui.painter()
+                                                    .with_clip_rect(response.rect.intersect(ui.clip_rect()))
+                                                    .galley(response.rect.min + egui::vec2(8.0, y), galley, color);
+                                            }
+                                            response.widget_info(|| {
+                                                egui::WidgetInfo::selected(
+                                                    egui::WidgetType::SelectableLabel,
+                                                    ui.is_enabled(),
+                                                    selected,
+                                                    &profile.name,
+                                                )
+                                            });
+                                            if selected {
+                                                ui.painter().hline(
+                                                    response.rect.x_range(),
+                                                    response.rect.bottom(),
+                                                    egui::Stroke::new(1.0, ui.visuals().hyperlink_color),
+                                                );
+                                            }
+                                            response
                                         })
                                         .inner
                                     })
@@ -725,8 +787,16 @@ impl Sidebar {
                                     );
                                     ui.painter().rect_filled(strip, 1.0, color);
                                 }
-                                let response = response
-                                    .on_hover_text(format!("{} — double-click to connect", profile.kind().label()));
+                                let response = response.on_hover_text(format!(
+                                    "{} — {}\n{}\nDouble-click to connect",
+                                    profile.name,
+                                    profile.kind().label(),
+                                    if profile.kind() == Kind::Serial {
+                                        profile.device.clone()
+                                    } else {
+                                        format!("{}:{}", profile.host, profile.port)
+                                    },
+                                ));
                                 let menu_was_open =
                                     egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
                                 let menu = response.context_menu(|ui| {
@@ -874,9 +944,10 @@ const MORE: &str = "…";
 
 /// Width of a plain text button, for sizing the rest of its row.
 fn button_width(ui: &Ui, text: &str) -> f32 {
-    ui.fonts_mut(|f| {
+    (ui.fonts_mut(|f| {
         f.layout_no_wrap(text.to_string(), egui::TextStyle::Button.resolve(ui.style()), egui::Color32::WHITE).size().x
-    }) + ui.spacing().button_padding.x * 2.0
+    }) + ui.spacing().button_padding.x * 2.0)
+        .ceil()
 }
 
 /// A widget filling the row with a button after it. Returns whether the

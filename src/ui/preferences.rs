@@ -68,7 +68,7 @@ pub enum Outcome {
 }
 
 pub struct Preferences {
-    settings: AppSettings,
+    pub(super) settings: AppSettings,
     saved_themes: BTreeMap<String, Scheme>,
     custom: Theme,
     page: Page,
@@ -168,8 +168,7 @@ impl Preferences {
         ui.add_space(BUTTONS_GAP);
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let accent = ui.visuals().selection.bg_fill;
-                if ui.add(style::accent_button("Save changes", accent)).clicked() {
+                if ui.add(style::primary_button(ui, "Save changes")).clicked() {
                     outcome = Outcome::Save(self.working());
                 }
                 if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, 30.0))).clicked() {
@@ -181,7 +180,7 @@ impl Preferences {
     }
 
     fn page_tabs(&mut self, ui: &mut Ui) {
-        let accent = ui.visuals().selection.bg_fill;
+        let accent = ui.visuals().hyperlink_color;
         // A rule along the bottom of the tabs, under the selected one's
         // underline, so it's laid down first and filled in after.
         let rule = ui.painter().add(egui::Shape::Noop);
@@ -382,6 +381,36 @@ impl Preferences {
             !self.settings.offline_mode,
             egui::Checkbox::new(&mut self.settings.check_for_updates, "Check for updates when Snekkie starts"),
         );
+        ui.add_space(12.0);
+        style::section_heading(ui, "AI agent access");
+        ui.checkbox(&mut self.settings.agent_access, "Let AI agents on this computer use open sessions (MCP)");
+        agent_animations_checkbox(ui, &mut self.settings.agent_animations);
+        ui.add(
+            egui::Label::new(
+                "Any agent that supports MCP, such as Claude Code, Claude Desktop, OpenAI Codex or a self-hosted \
+                 agent running a local model, can list your open tabs, read their output and type commands into \
+                 them, as you would. Commands run on the real devices and are logged like typing. Only programs \
+                 running under your account on this computer can connect.",
+            )
+            .wrap(),
+        );
+        ui.label("Add Snekkie to your agent as a local (stdio) MCP server that runs:");
+        ui.add(egui::Label::new(RichText::new(crate::mcp::launch_line()).monospace()).wrap());
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Copy Claude Code command").clicked() {
+                ui.ctx().copy_text(crate::mcp::claude_code_command());
+            }
+            if ui.button("Copy Codex command").clicked() {
+                ui.ctx().copy_text(crate::mcp::codex_command());
+            }
+            if ui
+                .button("Copy JSON config")
+                .on_hover_text("The mcpServers entry used by Claude Desktop and many other agents")
+                .clicked()
+            {
+                ui.ctx().copy_text(crate::mcp::json_config());
+            }
+        });
     }
 
     fn highlighting_page(&mut self, ui: &mut Ui) {
@@ -475,11 +504,24 @@ impl Preferences {
             }
         });
 
+        // Its own switch, so it stays usable while Animations is off.
+        ui.add_space(12.0);
+        style::section_heading(ui, "AI agent activity");
+        agent_animations_checkbox(ui, &mut self.settings.agent_animations);
+
         ui.add_space(8.0);
         ui.label("Preview");
         let colors = self.current_colors();
         self.preview.ui(ui, colors, self.settings.animations);
     }
+}
+
+/// On both the Network and Animations pages; they edit the same setting.
+fn agent_animations_checkbox(ui: &mut Ui, on: &mut bool) {
+    ui.checkbox(on, "Animate agent activity").on_hover_text(
+        "A cyan light sweeps the output while an agent reads, and an amber pulse shows each time it types. \
+         When off, the same colors glow steadily.",
+    );
 }
 
 fn scope_note(ui: &mut Ui, text: &str) {

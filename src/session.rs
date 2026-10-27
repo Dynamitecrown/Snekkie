@@ -82,10 +82,31 @@ pub struct Shared {
     /// Bumped on every (re)connect, so a worker from a previous connection
     /// can't write into the new one.
     generation: AtomicU64,
+    /// Copies of device output for whoever is waiting on it, such as an
+    /// agent's command; dropped receivers fall away on the next output.
+    taps: Mutex<Vec<std::sync::mpsc::Sender<Vec<u8>>>>,
     repaint: Box<dyn Fn() + Send + Sync>,
 }
 
 impl Shared {
+    fn record_safe_input(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let result = self.input_log.lock().as_ref().map(|handle| handle.input(bytes));
+        if let Some(Err(error)) = result {
+            let message = format!("Session logging failed: {error}");
+            let mut status = self.log_status.lock();
+            if !matches!(*status, LogStatus::Failed(_)) {
+                *status = LogStatus::Failed(message.clone());
+                drop(status);
+                *self.log.lock() = SessionLog::Failed;
+                *self.input_log.lock() = None;
+                self.notify(NoticeLevel::Warning, message);
+            }
+        }
+    }
+
     fn fail_log(&self, generation: u64, message: String) {
         let first = {
             let mut log = self.log.lock();
@@ -138,7 +159,84 @@ impl Shared {
             self.notify(NoticeLevel::Warning, message);
         }
         self.emulator.lock().feed(bytes);
+        self.taps.lock().retain(|tap| tap.send(bytes.to_vec()).is_ok());
         (self.repaint)();
+    }
+}
+
+/// Submit input only to the connection that was reviewed, preserving echo/paging.
+fn submit(shared: &Shared, link: &Mutex<Option<Link>>, echo: bool, generation: u64, bytes: Vec<u8>) -> bool {
+    if *shared.state.lock() != State::Connected || !shared.is_current(generation) {
+        return false;
+    }
+    let echo = echo.then(|| keys::local_echo(&bytes));
+    let visible = {
+        let emu = shared.emulator.lock();
+        emu.cursor_line_text()
+    };
+    let mut pager = shared.pager.lock();
+    pager.sent(&bytes, &visible);
+    // Arm suppression before the device can echo any of these bytes.
+    let input = shared.privacy.lock().input(&bytes, &visible);
+    let submitted = link.lock().as_ref().is_some_and(|link| link.try_write(bytes));
+    drop(pager);
+    if submitted {
+        shared.record_safe_input(input);
+    }
+    if submitted && let Some(echo) = echo.filter(|e| !e.is_empty()) {
+        // Local echo is already recorded as TX. Never duplicate it as RX.
+        shared.emulator.lock().feed(&echo);
+        (shared.repaint)();
+    }
+    submitted
+}
+
+/// An open session as another thread sees it, such as the agent server.
+/// Reconnecting the session carries over; closing it leaves this closed.
+#[derive(Clone)]
+pub struct Remote {
+    pub id: u64,
+    pub name: String,
+    pub description: String,
+    profile: Profile,
+    shared: Arc<Shared>,
+    link: Arc<Mutex<Option<Link>>>,
+}
+
+impl Remote {
+    pub fn kind(&self) -> Kind {
+        self.profile.kind()
+    }
+
+    pub fn state(&self) -> State {
+        self.shared.state.lock().clone()
+    }
+
+    /// Everything on the screen and in the scrollback, as the user sees it.
+    pub fn text(&self) -> String {
+        self.shared.emulator.lock().all_text()
+    }
+
+    /// The line the cursor is on, where a prompt waits.
+    pub fn cursor_line(&self) -> String {
+        self.shared.emulator.lock().cursor_line_text()
+    }
+
+    pub fn columns(&self) -> usize {
+        self.shared.emulator.lock().columns()
+    }
+
+    /// Send input as if typed, logged the same way. False unless connected.
+    pub fn write(&self, bytes: Vec<u8>) -> bool {
+        let echo = self.profile.local_echo().applies(self.kind(), self.shared.remote_echo.load(Ordering::SeqCst));
+        submit(&self.shared, &self.link, echo, self.shared.generation.load(Ordering::SeqCst), bytes)
+    }
+
+    /// Device output from now until the receiver is dropped.
+    pub fn tap(&self) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.shared.taps.lock().push(sender);
+        receiver
     }
 }
 
@@ -279,6 +377,7 @@ impl Session {
             remote_echo: AtomicBool::new(false),
             pager: Mutex::new(AutoPager::default()),
             generation: AtomicU64::new(0),
+            taps: Mutex::new(Vec::new()),
             repaint: Box::new(repaint),
         });
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -430,25 +529,7 @@ impl Session {
 
     fn record_input(&self, bytes: Vec<u8>, prompt: &str) {
         let bytes = self.shared.privacy.lock().input(&bytes, prompt);
-        self.record_safe_input(bytes);
-    }
-
-    fn record_safe_input(&self, bytes: Vec<u8>) {
-        if bytes.is_empty() {
-            return;
-        }
-        let result = self.shared.input_log.lock().as_ref().map(|handle| handle.input(bytes));
-        if let Some(Err(error)) = result {
-            let message = format!("Session logging failed: {error}");
-            let mut status = self.shared.log_status.lock();
-            if !matches!(*status, LogStatus::Failed(_)) {
-                *status = LogStatus::Failed(message.clone());
-                drop(status);
-                *self.shared.log.lock() = SessionLog::Failed;
-                *self.shared.input_log.lock() = None;
-                self.shared.notify(NoticeLevel::Warning, message);
-            }
-        }
+        self.shared.record_safe_input(bytes);
     }
 
     pub fn state(&self) -> State {
@@ -485,29 +566,18 @@ impl Session {
 
     /// Submit input only to the connection that was reviewed, preserving echo/paging.
     pub fn write_reviewed(&self, generation: u64, bytes: Vec<u8>) -> bool {
-        if !self.is_connected() || !self.shared.is_current(generation) {
-            return false;
+        submit(&self.shared, &self.link, self.echoes_locally(), generation, bytes)
+    }
+
+    pub fn remote(&self) -> Remote {
+        Remote {
+            id: self.id,
+            name: self.profile.name.clone(),
+            description: self.description(),
+            profile: self.profile.clone(),
+            shared: self.shared.clone(),
+            link: self.link.clone(),
         }
-        let echo = self.echoes_locally().then(|| keys::local_echo(&bytes));
-        let visible = {
-            let emu = self.shared.emulator.lock();
-            emu.cursor_line_text()
-        };
-        let mut pager = self.shared.pager.lock();
-        pager.sent(&bytes, &visible);
-        // Arm suppression before the device can echo any of these bytes.
-        let input = self.shared.privacy.lock().input(&bytes, &visible);
-        let submitted = self.link.lock().as_ref().is_some_and(|link| link.try_write(bytes));
-        drop(pager);
-        if submitted {
-            self.record_safe_input(input);
-        }
-        if submitted && let Some(echo) = echo.filter(|e| !e.is_empty()) {
-            // Local echo is already recorded as TX. Never duplicate it as RX.
-            self.shared.emulator.lock().feed(&echo);
-            (self.shared.repaint)();
-        }
-        submitted
     }
 
     pub fn echoes_locally(&self) -> bool {

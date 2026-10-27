@@ -63,6 +63,92 @@ fn starts_empty() {
     assert!(harness.state().tab_titles().is_empty());
 }
 
+fn assert_hover_background_precedes_text(app: &Harness<'_, SnekkieApp>, label: &str, rect: egui::Rect) {
+    fn flatten<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a egui::Shape>) {
+        if let egui::Shape::Vec(shapes) = shape {
+            for shape in shapes {
+                flatten(shape, out);
+            }
+        } else {
+            out.push(shape);
+        }
+    }
+    let mut shapes = Vec::new();
+    for shape in &app.output().shapes {
+        flatten(&shape.shape, &mut shapes);
+    }
+    let fill = app.ctx.global_style().visuals.widgets.hovered.weak_bg_fill;
+    let background = shapes.iter().rposition(|shape| matches!(shape,
+        egui::Shape::Rect(background) if background.fill == fill && background.rect.contains_rect(rect.shrink(1.0))
+    )).expect("hover background was not drawn");
+    let text = shapes
+        .iter()
+        .rposition(|shape| {
+            matches!(shape,
+                egui::Shape::Text(text) if text.galley.text() == label
+                    && text.galley.rect.translate(text.pos.to_vec2()).intersects(rect)
+            )
+        })
+        .expect("hovered tab label was not drawn");
+    assert!(background < text, "{label}: opaque hover fill covers its label");
+}
+
+#[test]
+fn every_preferences_tab_keeps_its_text_above_the_hover_fill() {
+    use snekkie::settings::{AppSettings, SettingsStore, THEMES};
+    for (theme, _) in THEMES {
+        for size in [[1000.0, 640.0], [520.0, 320.0]] {
+            let dir = tempfile::tempdir().unwrap();
+            SettingsStore::new(dir.path().join("settings.json"))
+                .save(&AppSettings { theme: theme.into(), check_for_updates: false, ..Default::default() })
+                .unwrap();
+            let mut app = harness_sized(&dir, size);
+            open_preferences(&mut app);
+            for label in ["Terminal", "Input & paste", "Network", "Highlighting", "Animations", "Appearance"] {
+                if label == "Appearance" {
+                    show_page(&mut app, "Terminal");
+                }
+                app.get_all_by_role_and_label(Role::Button, label).next_back().unwrap().hover();
+                app.run_ok();
+                let rect = app.get_all_by_role_and_label(Role::Button, label).next_back().unwrap().rect();
+                assert_hover_background_precedes_text(&app, label, rect);
+            }
+        }
+    }
+}
+
+#[test]
+fn inactive_connection_tab_keeps_its_text_above_the_hover_fill() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    let _first = open_raw_tab(&mut app, "First connection");
+    let _second = open_raw_tab(&mut app, "Second connection");
+    app.get_by_label("First connection").hover();
+    app.run_ok();
+    assert_hover_background_precedes_text(&app, "First connection", app.get_by_label("First connection").rect());
+    assert_eq!(app.state().active_title().as_deref(), Some("Second connection"));
+}
+
+#[test]
+fn empty_workspace_action_opens_the_connection_form_with_the_sidebar_hidden() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness_sized(&dir, [520.0, 320.0]);
+    for label in ["Workspace", "SSH, serial, Telnet or TCP.", "New connection"] {
+        assert!(app.ctx.content_rect().contains_rect(app.get_by_label(label).rect()), "{label}");
+    }
+    app.get_by_label("Hide sessions").click();
+    app.run_ok();
+    app.get_by_label("Snekkie");
+    let action = app.get_by_label("New connection");
+    assert!(app.ctx.content_rect().contains_rect(action.rect()));
+    assert!(app.ctx.content_rect().contains_rect(app.get_by_label("SSH, serial, Telnet or TCP.").rect()));
+    action.click();
+    app.run_ok();
+    app.get_by_label("Hide sessions");
+    app.get_by_label("Host");
+    assert!(app.state().tab_titles().is_empty());
+}
+
 #[test]
 fn startup_uses_serial_when_ports_are_detected_and_ssh_otherwise() {
     fn one_cable() -> Vec<PortInfo> {
@@ -550,10 +636,14 @@ fn new_theme_presets_are_reachable_on_first_open_and_persist_after_restart() {
             app.get_by_label("Save changes").click();
             app.run_ok();
             assert_eq!(store.load().theme, name);
+            assert_eq!(app.ctx.global_style().visuals.dark_mode, name != "Frost Light");
+            let colors = store.load().colors();
+            assert_eq!(app.ctx.global_style().visuals.faint_bg_color, colors.bg);
             drop(app);
             let mut restarted = harness_sized(&dir, size);
             open_preferences(&mut restarted);
             restarted.get_by_value(name);
+            assert_eq!(restarted.ctx.global_style().visuals.dark_mode, name != "Frost Light");
         }
     }
 }
@@ -956,7 +1046,7 @@ fn json_import_previews_selected_final_names_and_cancel_saves_nothing() {
         .put(Profile { name: "Alpha".into(), host: "192.0.2.1".into(), ..Default::default() })
         .unwrap();
     let json = br##"{"version":1,"sessions":[
-        {"name":"Alpha","kind":"ssh","host":"192.0.2.2","favorite":true,"tab_color":"#abcdef"},
+        {"name":"Alpha","kind":"ssh","host":"192.0.2.2","favorite":true,"tab_color":"#abcdef","log_path":"C:/example/startup.sh","log_format":"raw"},
         {"name":"Beta","kind":"telnet","host":"192.0.2.3"},
         {"name":"Bad","kind":"unsupported","host":"192.0.2.4"}
     ]}"##;
@@ -983,6 +1073,7 @@ fn json_import_previews_selected_final_names_and_cancel_saves_nothing() {
     assert_eq!(saved.get("Alpha").unwrap().host, "192.0.2.1");
     let imported = saved.get("Alpha (Imported 1)").unwrap();
     assert_eq!(imported.host, "192.0.2.2");
+    assert!(imported.log_path.is_empty());
     assert!(imported.favorite);
     assert_eq!(imported.tab_color, "#abcdef");
     assert!(app.state().tab_titles().is_empty());
@@ -2114,7 +2205,7 @@ fn newer_release(installer_url: &str) -> snekkie::update::Release {
             name: "Snekkie-Setup-99.0.0.exe".into(),
             url: installer_url.into(),
             size: 1000,
-            sha256: None,
+            sha256: "0".repeat(64),
         }),
     }
 }
@@ -2576,6 +2667,39 @@ fn cancelling_preferences_leaves_animations_off() {
     assert!(!animations_ticked(&harness), "the cancelled change came back");
 }
 
+/// The agent cue switch is on both pages, works while Animations is off,
+/// and each copy shows what the other set.
+#[test]
+fn agent_activity_animation_is_switched_from_either_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(&dir);
+    let ticked = |harness: &Harness<'static, SnekkieApp>| {
+        let checkbox = harness.get_by_role_and_label(Role::CheckBox, "Animate agent activity");
+        assert!(!checkbox.accesskit_node().is_disabled(), "greyed out");
+        checkbox.accesskit_node().toggled() == Some(Toggled::True)
+    };
+    let click = |harness: &mut Harness<'static, SnekkieApp>| {
+        harness.get_by_role_and_label(Role::CheckBox, "Animate agent activity").scroll_to_me();
+        harness.run_ok();
+        harness.get_by_role_and_label(Role::CheckBox, "Animate agent activity").click();
+        harness.run_ok();
+    };
+    open_preferences(&mut harness);
+    show_page(&mut harness, "Animations");
+    assert!(!animations_ticked(&harness));
+    assert!(ticked(&harness), "on by default");
+    click(&mut harness);
+    show_page(&mut harness, "Network");
+    assert!(!ticked(&harness), "the Network page didn't see the change");
+    click(&mut harness);
+    show_page(&mut harness, "Animations");
+    assert!(ticked(&harness), "the Animations page didn't see the change");
+    click(&mut harness);
+    harness.get_by_label("Save changes").click();
+    harness.run_ok();
+    assert_eq!(saved_settings(&dir).unwrap()["agent_animations"], false);
+}
+
 #[test]
 fn automatic_paging_defaults_off_and_both_toggles_save_the_same_setting() {
     let dir = tempfile::tempdir().unwrap();
@@ -2818,4 +2942,121 @@ fn offline_warning_counts_live_network_sessions_and_cancel_keeps_them_connected(
     app.run_ok();
     device_prints(&mut app, &mut peer, "still connected>");
     assert!(app.state().active_screen_text().unwrap().contains("still connected>"));
+}
+
+fn toggle_agent_access(app: &mut Harness<'static, SnekkieApp>) {
+    open_preferences(app);
+    show_page(app, "Network");
+    let label = "Let AI agents on this computer use open sessions (MCP)";
+    app.get_by_role_and_label(Role::CheckBox, label).scroll_to_me();
+    app.run_ok();
+    app.get_by_role_and_label(Role::CheckBox, label).click();
+    app.run_ok();
+    app.get_by_label("Save changes").click();
+    app.run_ok();
+}
+
+#[test]
+fn agents_reach_open_tabs_through_the_bridge_only_while_access_is_on() {
+    use std::io::{BufRead, Read, Write};
+    use std::process::{Command, Stdio};
+
+    // Where the bridge looks for the app on each platform.
+    let root = tempfile::tempdir().unwrap();
+    let config = if cfg!(target_os = "macos") {
+        root.path().join("Library").join("Application Support").join("snekkie")
+    } else {
+        root.path().join("snekkie")
+    };
+    std::fs::create_dir_all(&config).unwrap();
+    let file = config.join("mcp.json");
+    let paths = Paths { sessions: config.join("sessions.json"), settings: config.join("settings.json") };
+    let mut app = Harness::builder()
+        .with_size([1000.0, 640.0])
+        .build_eframe(move |_cc| SnekkieApp::with_port_lister(paths, two_cables));
+    app.run_ok();
+    let mut device = open_raw_tab(&mut app, "lab-switch");
+    assert!(!file.exists(), "agent access is off by default");
+
+    let mut bridge = Command::new(env!("CARGO_BIN_EXE_snekkie"))
+        .arg("--mcp")
+        .env("APPDATA", root.path())
+        .env("XDG_CONFIG_HOME", root.path())
+        .env("HOME", root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut to_bridge = bridge.stdin.take().unwrap();
+    let mut from_bridge = std::io::BufReader::new(bridge.stdout.take().unwrap());
+    let mut ask = |id: u32, method: &str, params: serde_json::Value| {
+        let message = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        writeln!(to_bridge, "{message}").unwrap();
+        let mut reply = String::new();
+        from_bridge.read_line(&mut reply).unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["id"], id);
+        reply["result"].clone()
+    };
+    let tool = |name: &str, arguments: serde_json::Value| serde_json::json!({ "name": name, "arguments": arguments });
+
+    // An agent started before access is on still connects and learns why.
+    let hello = serde_json::json!({ "protocolVersion": "2025-06-18", "clientInfo": { "name": "claude-code" } });
+    assert_eq!(ask(1, "initialize", hello)["serverInfo"]["name"], "snekkie");
+    let refused = ask(2, "tools/call", tool("list_sessions", serde_json::json!({})));
+    assert_eq!(refused["isError"], true);
+    assert!(refused["content"][0]["text"].as_str().unwrap().contains("AI agent access is off"));
+
+    toggle_agent_access(&mut app);
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(saved["agent_access"], true);
+    assert!(file.exists());
+    // The bridge finds the app again by itself and the status bar names its agent.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.query_by_label("Claude Code connected").is_none() {
+        assert!(std::time::Instant::now() < deadline, "the agent never showed as connected");
+        app.run_ok();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let listed = ask(3, "tools/call", tool("list_sessions", serde_json::json!({})));
+    let sessions: serde_json::Value = serde_json::from_str(listed["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        (&sessions[0]["name"], &sessions[0]["selected"]),
+        (&serde_json::json!("lab-switch"), &serde_json::json!(true))
+    );
+
+    let id = sessions[0]["session_id"].clone();
+    let answering = std::thread::spawn(move || {
+        let (mut seen, mut buf) = (Vec::new(), [0u8; 256]);
+        while !seen.ends_with(b"show vlan brief\r") {
+            let n = device.read(&mut buf).unwrap();
+            assert!(n > 0, "hung up after {seen:?}");
+            seen.extend_from_slice(&buf[..n]);
+        }
+        device.write_all(b"show vlan brief\r\n10   users    active\r\nlab-switch>").unwrap();
+        device
+    });
+    let ran = ask(
+        4,
+        "tools/call",
+        tool("send_command", serde_json::json!({ "session_id": id, "command": "show vlan brief" })),
+    );
+    assert_eq!(ran["isError"], false, "{ran}");
+    assert_eq!(ran["content"][0]["text"], "show vlan brief\n10   users    active\nlab-switch>");
+    let _device = answering.join().unwrap();
+    app.run_ok();
+    assert!(app.state().active_screen_text().unwrap().contains("10   users    active"), "the user sees it too");
+    // Typing shows first, then reading the output; which one depends on timing.
+    let status = ["Claude Code is typing in lab-switch", "Claude Code is reading lab-switch"];
+    assert!(status.iter().any(|text| app.query_by_label(text).is_some()), "the status bar says what the agent does");
+
+    toggle_agent_access(&mut app);
+    assert!(!file.exists());
+    assert!(app.query_by_label_contains("Claude Code").is_none(), "no agent status once access is off");
+    let refused = ask(5, "tools/call", tool("read_output", serde_json::json!({ "session_id": id })));
+    assert_eq!(refused["isError"], true);
+
+    drop(to_bridge);
+    assert!(bridge.wait().unwrap().success());
 }

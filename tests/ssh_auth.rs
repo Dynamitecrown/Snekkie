@@ -44,12 +44,14 @@ enum Mode {
 struct Handler {
     mode: Mode,
     round: usize,
+    authentication_attempted: Arc<AtomicBool>,
 }
 
 impl server::Handler for Handler {
     type Error = russh::Error;
 
     async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
+        self.authentication_attempted.store(true, Ordering::SeqCst);
         Ok(match self.mode {
             Mode::Password if password == PASSWORD => Auth::Accept,
             _ => Auth::reject(),
@@ -62,6 +64,7 @@ impl server::Handler for Handler {
         _submethods: &str,
         response: Option<Response<'a>>,
     ) -> Result<Auth, Self::Error> {
+        self.authentication_attempted.store(true, Ordering::SeqCst);
         if matches!(self.mode, Mode::Password) {
             return Ok(Auth::reject());
         }
@@ -104,6 +107,7 @@ struct Harness {
     runtime: tokio::runtime::Runtime,
     port: u16,
     known_hosts: tempfile::TempDir,
+    authentication_attempted: Arc<AtomicBool>,
 }
 
 fn start_server(mode: Mode) -> Harness {
@@ -122,17 +126,22 @@ fn start_server(mode: Mode) -> Harness {
     });
     let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
     let port = listener.local_addr().unwrap().port();
+    let authentication_attempted = Arc::new(AtomicBool::new(false));
+    let attempted = authentication_attempted.clone();
     runtime.spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             let config = config.clone();
+            let authentication_attempted = attempted.clone();
             tokio::spawn(async move {
-                if let Ok(session) = server::run_stream(config, socket, Handler { mode, round: 0 }).await {
+                if let Ok(session) =
+                    server::run_stream(config, socket, Handler { mode, round: 0, authentication_attempted }).await
+                {
                     let _ = session.await;
                 }
             });
         }
     });
-    Harness { runtime, port, known_hosts: tempfile::tempdir().unwrap() }
+    Harness { runtime, port, known_hosts: tempfile::tempdir().unwrap(), authentication_attempted }
 }
 
 impl Harness {
@@ -225,6 +234,28 @@ fn password_login() {
 #[test]
 fn wrong_password_is_reported() {
     assert_rejected(Mode::Password);
+}
+
+#[test]
+fn revoked_host_keys_are_refused_before_authentication_or_acceptance() {
+    let harness = start_server(Mode::Password);
+    let key = russh::keys::decode_secret_key(HOST_KEY, None).unwrap().public_key().to_openssh().unwrap();
+    let host = format!("[127.0.0.1]:{}", harness.port);
+    let revoked = format!("@revoked {host} {key}\n");
+    let trusted = format!("{host} {key}\n");
+    // The harness accepts every unknown-key prompt, which must not override revocation.
+    for contents in [revoked.clone(), format!("{trusted}{revoked}"), format!("{revoked}{trusted}")] {
+        let path = harness.known_hosts.path().join("known_hosts");
+        std::fs::write(&path, &contents).unwrap();
+        let (recorder, _link) = harness.connect(PASSWORD);
+        match recorder.wait_event(WAIT, |e| matches!(e, Event::Closed(_))) {
+            Event::Closed(Some(reason)) => assert!(reason.contains("is revoked"), "{reason}"),
+            other => panic!("expected a revoked host key failure, got {other:?}"),
+        }
+        assert!(!recorder.events().contains(&Event::Connected));
+        assert!(!harness.authentication_attempted.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+    }
 }
 
 #[test]

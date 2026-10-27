@@ -122,6 +122,108 @@ fn records(dir: &tempfile::TempDir) -> Vec<serde_json::Value> {
 }
 
 #[test]
+fn app_themes_leave_game_rendering_and_geometry_unchanged() {
+    use snekkie::settings::{AppSettings, SettingsStore};
+
+    let mut expected: Option<Vec<_>> = None;
+    for name in AppSettings::default().theme_names() {
+        let dir = tempfile::tempdir().unwrap();
+        SettingsStore::new(dir.path().join("settings.json"))
+            .save(&AppSettings { theme: name.clone(), check_for_updates: false, ..Default::default() })
+            .unwrap();
+        let mut app = harness(&dir);
+        let app_visuals = app.ctx.global_style().visuals.clone();
+        open_loadout(&mut app);
+        app.event(egui::Event::PointerGone);
+        frames(&mut app, 12);
+
+        let mut screens = Vec::new();
+        for screen in ["loadout", "pause", "build"] {
+            if screen == "pause" {
+                start_run(&mut app);
+                *run(&mut app) = snekkie::invade::InvadeRun::new(42, Rig::Probe, [], 0);
+                play(&mut app);
+                press(&mut app, Key::P);
+            } else if screen == "build" {
+                app.get_by_label("Build").click();
+            }
+            app.event(egui::Event::PointerGone);
+            frames(&mut app, 12);
+            let arena = app.get_by_label("Invade arena").rect();
+            let shapes = &app.output().shapes;
+            let first = shapes
+                .iter()
+                .position(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.rect == arena && r.fill.is_opaque()))
+                .expect("the game paints its own background");
+            let mut game_shapes = shapes[first..].to_vec();
+            if let Some(expected) = &expected {
+                let (_, expected_shapes): &(egui::Rect, Vec<egui::epaint::ClippedShape>) = &expected[screens.len()];
+                assert_eq!(game_shapes.len(), expected_shapes.len(), "{name}: {screen}");
+                for (actual, expected) in game_shapes.iter_mut().zip(expected_shapes) {
+                    if let (egui::Shape::Text(a), egui::Shape::Text(b)) = (&mut actual.shape, &expected.shape) {
+                        assert_eq!(a.galley.job, b.galley.job, "{name}: {screen} text and fonts");
+                        assert_eq!(a.galley.rect, b.galley.rect, "{name}: {screen} text layout");
+                        // Font atlas packing varies with the app's earlier text.
+                        a.galley = b.galley.clone();
+                    }
+                }
+            }
+            screens.push((arena, game_shapes));
+            assert_eq!(app.ctx.global_style().visuals, app_visuals, "{name}: game styling leaked into the app");
+        }
+        if let Some(expected) = &expected {
+            for (i, actual) in screens.iter().enumerate() {
+                assert!(actual == &expected[i], "{name}: game screen {i} changed with the app theme");
+            }
+        } else {
+            expected = Some(screens);
+        }
+    }
+}
+
+#[test]
+fn every_starter_fires_without_keys_and_stops_for_countdowns_and_overlays() {
+    for weapon in snekkie::invade::WeaponKind::STARTERS {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness(&dir);
+        open_loadout(&mut app);
+        app.get_by_label(weapon.name()).click();
+        frames(&mut app, 20);
+        assert!(run(&mut app).shots().is_empty(), "loadout selection never fires");
+        start_run(&mut app);
+        run(&mut app).set_immortal();
+        run(&mut app).clear_asteroids();
+        frames(&mut app, 30);
+        assert!(run(&mut app).countdown() > 0.0);
+        assert!(run(&mut app).shots().is_empty(), "start countdown never fires");
+        frames(&mut app, 75);
+        assert_firing(&mut app);
+        assert!(app.state_mut().invade_tab().unwrap().held_keys().is_empty());
+
+        press(&mut app, Key::P);
+        assert_frozen(&mut app);
+        app.get_by_label("Automatic fire");
+        app.get_by_label("Resume").click();
+        let shots = shot_positions(&mut app);
+        frames(&mut app, 12);
+        assert!(run(&mut app).countdown() > 0.0);
+        assert_eq!(shot_positions(&mut app), shots, "resume countdown never fires or moves shots");
+        frames(&mut app, 90);
+        assert_firing(&mut app);
+
+        run(&mut app).skip_to_wave(3);
+        level_up(&mut app);
+        assert_frozen(&mut app);
+        press(&mut app, Key::Num1);
+        frames(&mut app, 90);
+        assert_firing(&mut app);
+        run(&mut app).lose();
+        frames(&mut app, 3);
+        assert_frozen(&mut app);
+    }
+}
+
+#[test]
 fn a_loadout_is_chosen_before_start_and_unstarted_setup_records_no_run() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = harness(&dir);
@@ -527,7 +629,7 @@ fn small_windows_pause_with_a_usable_close_and_the_threshold_window_plays() {
     frames(&mut app, 3);
     assert!(app.state().invade_status().is_none());
     assert!(app.state().workspace_titles().is_empty());
-    assert_eq!(records(&dir)[0]["ending"], "closed");
+    assert!(records(&dir).is_empty(), "closing the tab keeps the run");
 }
 
 #[test]
@@ -591,12 +693,12 @@ fn reordering_cycling_and_closing_keep_stable_targets() {
     frames(&mut app, 6);
     assert_eq!(run(&mut app).player().heading, heading, "releasing the turn key stops rotation");
 
-    // Closing the selected game selects its neighbor and records the run.
+    // Closing the selected game selects its neighbor and keeps the run.
     app.key_press_modifiers(app_keys(false), Key::W);
     frames(&mut app, 3);
     assert_eq!(app.state().workspace_titles(), ["second"]);
     assert_eq!(app.state().active_title().as_deref(), Some("second"));
-    assert_eq!(records(&dir).len(), 1);
+    assert!(records(&dir).is_empty());
 }
 
 #[test]
@@ -902,7 +1004,7 @@ fn game_origin_shortcuts_cannot_clear_a_terminal_selected_in_the_same_frame() {
         if key == Key::W {
             assert!(app.state().invade_status().is_none());
             assert_eq!(app.state().workspace_titles(), ["core"]);
-            assert_eq!(records(&dir).len(), 1, "Invade closes exactly once");
+            assert!(records(&dir).is_empty(), "closing Invade keeps its run");
         }
         assert_device_received_nothing(&mut device);
     }
@@ -968,7 +1070,7 @@ fn regression_upgrade_offers_accept_tab_then_enter() {
     });
     app.event(egui::Event::Text(" ".into()));
     frames(&mut app, 2);
-    assert_eq!(status(&app).state, "Choosing an upgrade", "held fire does not accept an offer");
+    assert_eq!(status(&app).state, "Choosing an upgrade", "held Space does not accept an offer");
     app.key_up(Key::Space);
     frames(&mut app, 2);
     press(&mut app, Key::Tab);
@@ -983,7 +1085,63 @@ fn regression_upgrade_offers_accept_tab_then_enter() {
 }
 
 #[test]
-fn held_fire_cannot_retry_after_game_over() {
+fn closing_the_tab_keeps_the_run_but_quitting_ends_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    open_invade(&mut app);
+    play(&mut app);
+    let r = run(&mut app);
+    r.skip_to_wave(3);
+    r.set_flight(0.7, (2.0, 1.0));
+    frames(&mut app, 10);
+    let before = status(&app);
+    let seed = run(&mut app).seed();
+    let snapshot = |app: &mut Harness<'static, SnekkieApp>| {
+        let player = run(app).player();
+        let flight = (player.x, player.y, player.heading, player.velocity);
+        (status(app), flight, run(app).elapsed())
+    };
+    let close = |app: &mut Harness<'static, SnekkieApp>| {
+        app.key_press_modifiers(app_keys(false), Key::W);
+        frames(app, 3);
+        assert!(app.state().invade_status().is_none());
+    };
+
+    close(&mut app);
+    assert!(records(&dir).is_empty(), "closing the tab is not the end of the run");
+    // Reopening shows the same run, paused.
+    open_loadout(&mut app);
+    let (paused, flight, elapsed) = snapshot(&mut app);
+    assert_eq!(paused.state, "Paused");
+    assert_eq!((paused.wave, paused.integrity), (before.wave, before.integrity));
+    assert_eq!(run(&mut app).seed(), seed);
+    // Time spent with the tab closed changes nothing.
+    close(&mut app);
+    frames(&mut app, 30);
+    open_loadout(&mut app);
+    assert_eq!(snapshot(&mut app), (paused, flight, elapsed));
+    app.get_by_label("Resume").click();
+    frames(&mut app, 40);
+    assert_eq!(status(&app).state, "Playing");
+
+    // Quitting Snekkie ends it, open or closed, and records it once.
+    close(&mut app);
+    app.state_mut().shutdown();
+    let saved = records(&dir);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0]["ending"], "app_closed");
+    assert_eq!(saved[0]["seed"], seed);
+
+    // The next Snekkie starts from a fresh loadout, keeping best scores.
+    let mut app = harness(&dir);
+    open_loadout(&mut app);
+    assert_eq!(status(&app).state, "Choose loadout");
+    assert_eq!(app.state_mut().invade_tab().unwrap().progress().records.len(), 1);
+    assert!(app.state_mut().invade_tab().unwrap().progress().best.contains_key("probe"));
+}
+
+#[test]
+fn held_space_cannot_retry_after_game_over() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = harness(&dir);
     open_invade(&mut app);
@@ -1005,7 +1163,7 @@ fn held_fire_cannot_retry_after_game_over() {
         egui::Event::Text(" ".into()),
     ]);
     frames(&mut app, 3);
-    assert_eq!(status(&app).state, "Game over", "held fire cannot activate Retry");
+    assert_eq!(status(&app).state, "Game over", "held Space cannot activate Retry");
     assert_eq!(records(&dir).len(), 1, "the completed run is recorded once");
     app.key_up(Key::Space);
     frames(&mut app, 2);
@@ -1046,7 +1204,9 @@ fn paced_pastes_keep_going_while_playing_and_app_dialogs_still_hold_them() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = harness(&dir);
     let mut device = open_raw_tab(&mut app, "core");
-    let lines: Vec<String> = (0..24).map(|i| format!("line {i:02}")).collect();
+    // About 6 s at the default 100 ms per line: long enough that a slow,
+    // loaded machine can't finish it before the dialog below opens.
+    let lines: Vec<String> = (0..60).map(|i| format!("line {i:02}")).collect();
     let expected: String = lines.iter().map(|l| format!("{l}\r")).collect();
     let ctx = app.ctx.clone();
     app.state_mut().paste_clipboard_text(&ctx, &format!("{}\n", lines.join("\n")));
@@ -1071,21 +1231,26 @@ fn paced_pastes_keep_going_while_playing_and_app_dialogs_still_hold_them() {
         }
         device.set_nonblocking(false).unwrap();
     };
-    for _ in 0..30 {
+    // Waits for the first line rather than a frame count, which would take
+    // longer the busier the machine is.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while received.is_empty() {
+        assert!(Instant::now() < deadline, "no lines went out while playing");
         frames(&mut app, 1);
         std::thread::sleep(Duration::from_millis(10));
+        read_now(&mut device, &mut received);
     }
-    read_now(&mut device, &mut received);
-    assert!(!received.is_empty(), "lines went out while playing");
     // A real app dialog still holds the queue.
     app.get_by_label("Help").click();
     frames(&mut app, 2);
     app.get_by_label("Keyboard shortcuts").click();
     frames(&mut app, 2);
+    assert!(app.state().paste_running(), "the paste finished before the dialog opened; lengthen it");
     std::thread::sleep(Duration::from_millis(150));
     read_now(&mut device, &mut received);
     let held = received.len();
-    for _ in 0..30 {
+    let hold = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < hold {
         frames(&mut app, 1);
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1128,7 +1293,7 @@ fn an_unfinished_run_blocks_automatic_update_installation() {
 }
 
 #[test]
-fn defeat_close_restart_and_shutdown_each_record_a_run_once() {
+fn defeat_restart_and_shutdown_each_record_a_run_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = harness(&dir);
     open_invade(&mut app);
@@ -1152,16 +1317,17 @@ fn defeat_close_restart_and_shutdown_each_record_a_run_once() {
     start_run(&mut app);
     app.get_by_role_and_label(Role::Label, "Invade").click_button(egui::PointerButton::Middle);
     frames(&mut app, 3);
-    assert_eq!(records(&dir).len(), 3);
+    assert_eq!(records(&dir).len(), 2, "closing the tab records nothing");
+    // Quitting records the closed tab's run once, however often it is asked.
     app.state_mut().shutdown();
-    assert_eq!(records(&dir).len(), 3, "nothing left to record");
+    assert_eq!(records(&dir).len(), 3);
     open_invade(&mut app);
     app.state_mut().shutdown();
     app.state_mut().shutdown();
     let endings: Vec<String> = records(&dir).iter().map(|r| r["ending"].as_str().unwrap().to_string()).collect();
     let mut sorted = endings.clone();
     sorted.sort();
-    assert_eq!(sorted, ["app_closed", "closed", "defeated", "restarted"]);
+    assert_eq!(sorted, ["app_closed", "defeated", "restarted"]);
 }
 
 #[test]
@@ -1234,15 +1400,30 @@ fn exports_cannot_overwrite_the_progress_store() {
     assert!(path.exists());
 }
 
+fn shot_positions(app: &mut Harness<'static, SnekkieApp>) -> Vec<(f32, f32)> {
+    run(app).shots().iter().map(|shot| (shot.x, shot.y)).collect()
+}
+
+fn assert_firing(app: &mut Harness<'static, SnekkieApp>) {
+    assert!(
+        (0..60).any(|_| {
+            app.step();
+            !run(app).shots().is_empty()
+        }),
+        "weapons fire without a key press, allowing for cooldowns"
+    );
+}
+
 /// The arena stays exactly as it was for a while: nothing moves, no time
 /// passes in the run.
 fn assert_frozen(app: &mut Harness<'static, SnekkieApp>) {
     let snapshot = |app: &mut Harness<'static, SnekkieApp>| {
+        let shots = shot_positions(app);
         let r = run(app);
         let enemies: Vec<(u32, f32, f32)> = r.enemies().map(|e| (e.id, e.x, e.y)).collect();
         let player = r.player();
         let flight = (player.x, player.y, player.heading, player.velocity, player.thrusting, player.braking);
-        (r.elapsed(), flight, enemies, r.asteroids().to_vec(), r.hostiles().len(), r.countdown())
+        (r.elapsed(), flight, enemies, r.asteroids().to_vec(), r.hostiles().len(), r.countdown(), shots)
     };
     let before = snapshot(app);
     frames(app, 20);
@@ -1351,12 +1532,11 @@ fn held_keys_let_go_during_the_upgrade_choice_do_not_steer_afterwards() {
     assert_ne!(status(&app).state, "Choosing an upgrade");
     let player = run(&mut app).player();
     let flight = (player.x, player.y, player.heading, player.velocity);
-    let shots = run(&mut app).shots().len();
     frames(&mut app, 40);
     let player = run(&mut app).player();
     assert_eq!((player.x, player.y, player.heading, player.velocity), flight, "no turn key is still held");
     assert!(!player.thrusting && !player.braking);
-    assert!(run(&mut app).shots().len() <= shots, "no fire key is still held");
+    assert!(!app.state_mut().invade_tab().unwrap().held_keys().contains(&Key::Space));
 }
 
 #[test]
@@ -1381,7 +1561,7 @@ fn closing_the_game_with_ctrl_w_sends_nothing_to_the_next_tab() {
     app.key_up(Key::Space);
     app.key_up(Key::D);
     frames(&mut app, 2);
-    assert_eq!(records(&dir).len(), 1);
+    assert!(records(&dir).is_empty());
 }
 
 #[test]
@@ -1595,4 +1775,58 @@ fn holding_ctrl_shift_cycles_backward_through_the_game_tab() {
     }
     app.event(egui::Event::ModifiersChanged(Modifiers::NONE));
     frames(&mut app, 2);
+}
+
+#[test]
+fn missile_pivot_and_elite_cargo_are_visible_and_reset_with_a_retried_run() {
+    use snekkie::invade::{ItemKind, PivotKind, WeaponKind};
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    open_loadout(&mut app);
+    app.get_by_label("Missile Pivot").click();
+    frames(&mut app, 2);
+    start_run(&mut app);
+    assert_eq!(run(&mut app).pivot_kind(), PivotKind::Missile);
+    let r = run(&mut app);
+    r.skip_to_wave(3);
+    r.set_immortal();
+    r.clear_asteroids();
+    assert!(r.grant_weapon(WeaponKind::Flamethrower));
+    assert!(r.grant_weapon(WeaponKind::Shield));
+    let at = (r.player().x, r.player().y + 0.5);
+    for kind in ItemKind::ALL {
+        r.spawn_item_drop(kind, at);
+    }
+    r.step(Default::default());
+    assert_eq!(r.items().count(), 2);
+    frames(&mut app, 3);
+    press(&mut app, Key::B);
+    assert!(app.query_by_label_contains("Jumbo Frame:").is_some());
+    assert!(app.query_by_label_contains("Port Mirroring:").is_some());
+    assert!(app.query_by_label_contains("Flamethrower — rank").is_some());
+    assert!(app.query_by_label_contains("Shield — rank").is_some());
+    press(&mut app, Key::Escape);
+    run(&mut app).lose();
+    frames(&mut app, 3);
+    app.get_by_label_contains("Retry").click();
+    frames(&mut app, 3);
+    start_run(&mut app);
+    assert_eq!(run(&mut app).pivot_kind(), PivotKind::Missile);
+    assert_eq!(run(&mut app).items().count(), 0);
+    assert_eq!(run(&mut app).weapons().len(), 1);
+}
+
+#[test]
+fn compact_loadout_scrolls_to_missile_pivot_and_back_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness_sized(&dir, [640.0, 400.0]);
+    open_loadout(&mut app);
+    app.get_by_label("Missile Pivot").scroll_to_me();
+    frames(&mut app, 5);
+    app.get_by_label("Missile Pivot").click();
+    frames(&mut app, 3);
+    app.get_by_label("Start run").scroll_to_me();
+    frames(&mut app, 5);
+    start_run(&mut app);
+    assert_eq!(run(&mut app).pivot_kind(), snekkie::invade::PivotKind::Missile);
 }

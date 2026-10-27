@@ -50,6 +50,8 @@ impl Qa {
 
     fn start(&mut self) {
         if self.app.query_by_label("Start run").is_some() {
+            self.app.get_by_label("Start run").scroll_to_me();
+            self.app.run_ok();
             self.app.get_by_label("Start run").click();
             self.app.step();
             self.app.step();
@@ -96,6 +98,31 @@ const UNLOCKED: &str = r#"{"version":1,"selected_rig":"ghost","unlocked":["ghost
 
 fn main() {
     std::fs::create_dir_all(OUT).unwrap();
+
+    if std::env::args().any(|a| a == "--auto-fire") {
+        for size in [[1000.0, 640.0], [640.0, 400.0]] {
+            let mut qa = Qa::new("Snekkie Dark", size, 1.0, None);
+            qa.run().set_immortal();
+            qa.run().clear_asteroids();
+            for _ in 0..220 {
+                qa.app.step();
+            }
+            assert!(!qa.run().shots().is_empty(), "the app fires without any Space input");
+            qa.capture("auto-fire");
+            qa.app.key_press(egui::Key::P);
+            qa.app.step();
+            qa.app.step();
+            qa.app.get_by_label("Automatic fire").scroll_to_me();
+            qa.app.run_ok();
+            qa.capture("auto-fire-controls");
+        }
+        return;
+    }
+
+    if std::env::args().any(|a| a == "--expansion") {
+        expansion_scenes();
+        return;
+    }
 
     // Every screen, in the default theme and window.
     let mut qa = Qa::setup("Snekkie Dark", [1000.0, 640.0], 1.0, None);
@@ -376,5 +403,63 @@ fn main() {
             assert_eq!(rewards.run().phase(), Phase::Upgrade);
             rewards.capture("upgrade");
         }
+    }
+}
+
+fn expansion_scenes() {
+    use snekkie::invade::{ItemKind, PivotKind, WeaponKind};
+    for (theme, size) in
+        [("Snekkie Dark", [1000.0, 640.0]), ("Frost Light", [1000.0, 640.0]), ("Snekkie Dark", [640.0, 400.0])]
+    {
+        let mut qa = Qa::setup(theme, size, 1.0, None);
+        qa.app.get_by_label("Missile Pivot").scroll_to_me();
+        qa.app.run_ok();
+        qa.app.get_by_label("Missile Pivot").click();
+        qa.app.step();
+        qa.capture("expansion-loadout");
+        qa.start();
+        assert_eq!(qa.run().pivot_kind(), PivotKind::Missile);
+        let run = qa.run();
+        run.set_immortal();
+        run.skip_to_wave(3);
+        run.clear_asteroids();
+        assert!(run.grant_weapon(WeaponKind::Flamethrower));
+        assert!(run.grant_weapon(WeaponKind::Shield));
+        let (x, y) = (run.player().x, run.player().y + 0.5);
+        run.place_elite((x + 9.0, y - 3.0));
+        run.place_elite((x - 15.0, y - 6.0));
+        run.spawn_item_drop(ItemKind::JumboFrame, (x - 18.0, y + 7.0));
+        run.spawn_item_drop(ItemKind::PortMirroring, (x + 8.0, y + 7.0));
+        for i in 0..5 {
+            run.step(Input { fire: true, special: i == 0, ..Default::default() });
+        }
+        qa.capture("expansion-missile-flight");
+        for _ in 0..20 {
+            qa.run().step(Input { fire: true, ..Default::default() });
+        }
+        qa.capture("expansion-combat");
+        let mut inventory = Qa::new(theme, size, 1.0, None);
+        let run = inventory.run();
+        run.set_immortal();
+        run.skip_to_wave(3);
+        run.clear_asteroids();
+        run.grant_weapon(WeaponKind::Flamethrower);
+        run.grant_weapon(WeaponKind::Shield);
+        let at = (run.player().x, run.player().y + 0.5);
+        for kind in ItemKind::ALL {
+            run.spawn_item_drop(kind, at);
+        }
+        run.step(Input::default());
+        assert_eq!(run.items().count(), 2);
+        for _ in 0..15 {
+            run.step(Input { fire: true, ..Default::default() });
+        }
+        inventory.capture("expansion-cargo-combat");
+        inventory.app.step();
+        inventory.app.step();
+        inventory.app.key_press(egui::Key::B);
+        inventory.app.step();
+        inventory.app.step();
+        inventory.capture("expansion-items-build");
     }
 }

@@ -10,6 +10,7 @@ pub mod arsenal;
 #[doc(hidden)]
 pub mod autoplay;
 pub mod content;
+pub mod loot;
 pub mod progress;
 pub mod rng;
 pub mod run;
@@ -17,6 +18,7 @@ pub mod upgrades;
 
 pub use arsenal::{Loadout, StarterModule, WeaponKind, WeaponSpec, WeaponState};
 pub use content::{BossKind, DeviceKind, EncounterKind, MinibossKind, Rig, Unlock};
+pub use loot::{ItemDrop, ItemKind, PivotKind};
 pub use progress::{Progress, ProgressStore};
 pub use run::{EndReason, Event, Input, InvadeRun, Phase, Summary};
 pub use upgrades::{Build, LevelChoice, Offer, UpgradeId, describe_level, level_offers};

@@ -12,6 +12,7 @@ use egui::{
 };
 use parking_lot::Mutex;
 
+use super::agents::{self, Motion};
 use super::fonts::{self, Fonts};
 use super::invade::{InvadeAction, InvadeOptions, InvadeTab};
 use super::paste::{Action as PasteAction, PastePreview};
@@ -24,6 +25,7 @@ use super::style;
 use super::terminal_view::{TerminalView, TextExport, ViewOptions};
 use super::updater::{self, Updater};
 use crate::invade::EndReason;
+use crate::mcp::Cue;
 use crate::network::{NetworkAccess, NetworkQuestion};
 use crate::paste::{PasteQueue, PasteTarget};
 use crate::profiles::{Auth, Kind, Profile, ProfileStore};
@@ -222,6 +224,9 @@ fn shortcut_label(shortcut: &str, macos: bool) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Most the status bar gives to agent status.
+const AGENT_BADGE_WIDTH: f32 = 260.0;
+
 struct Tab {
     session: Session,
     view: TerminalView,
@@ -266,9 +271,9 @@ pub struct SnekkieApp {
     active: Option<WorkspaceTabId>,
     /// The singleton game tab, and where it sits among the connection tabs.
     invade: Option<Box<InvadeTab>>,
-    /// Invade's records once its tab has closed, so progress that could not
-    /// be saved is neither lost nor read back stale on reopening.
-    invade_store: Option<crate::invade::ProgressStore>,
+    /// The game after its tab closed: reopening resumes the same run, and
+    /// progress that could not be saved is neither lost nor read back stale.
+    parked_invade: Option<Box<InvadeTab>>,
     invade_slot: usize,
     /// The session sidebar shown on request while Invade is selected; it is
     /// otherwise hidden there without changing the saved preference.
@@ -297,6 +302,20 @@ pub struct SnekkieApp {
     /// can have it back when the dialog closes.
     terminal_had_focus: bool,
     updater: Updater,
+    /// Listening for local AI agents, while Preferences allows it.
+    agents: Option<crate::mcp::Server>,
+    agents_file: PathBuf,
+    /// What agents are doing, as of this frame.
+    agent_activity: crate::mcp::Activity,
+    /// The notification-area icon. Made on the first frame, which has the
+    /// context it wakes; tests never ask for one.
+    #[cfg(windows)]
+    tray: Option<super::tray::AppTray>,
+    #[cfg(windows)]
+    want_tray: bool,
+    /// Chosen from the tray: close agents' bridges too, once Snekkie exits.
+    #[cfg(windows)]
+    close_bridges_on_exit: bool,
 }
 
 impl SnekkieApp {
@@ -307,6 +326,10 @@ impl SnekkieApp {
         if app.settings.check_for_updates && !app.settings.offline_mode {
             app.updater.check_at_startup();
         }
+        #[cfg(windows)]
+        {
+            app.want_tray = true;
+        }
         app
     }
 
@@ -315,6 +338,7 @@ impl SnekkieApp {
     pub fn with_port_lister(paths: Paths, list_ports: fn() -> Vec<PortInfo>) -> Self {
         let snippet_store = SnippetStore::open(paths.sessions.with_file_name("snippets.json"));
         let store = ProfileStore::open(paths.sessions);
+        let agents_file = paths.settings.with_file_name(crate::mcp::FILE_NAME);
         let settings_store = SettingsStore::new(paths.settings);
         let settings = settings_store.load();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -338,7 +362,7 @@ impl SnekkieApp {
             tabs: Vec::new(),
             active: None,
             invade: None,
-            invade_store: None,
+            parked_invade: None,
             invade_slot: 0,
             invade_sidebar: false,
             suppressed_keys: Vec::new(),
@@ -359,6 +383,15 @@ impl SnekkieApp {
             dragging_tab: None,
             terminal_had_focus: false,
             updater: Updater::new(),
+            agents: None,
+            agents_file,
+            agent_activity: Default::default(),
+            #[cfg(windows)]
+            tray: None,
+            #[cfg(windows)]
+            want_tray: false,
+            #[cfg(windows)]
+            close_bridges_on_exit: false,
         }
     }
 
@@ -429,7 +462,7 @@ impl SnekkieApp {
 
     /// An unfinished game counts as activity, like a connected session.
     fn invade_unfinished(&self) -> bool {
-        self.invade.as_ref().is_some_and(|game| game.unfinished())
+        self.invade.as_ref().or(self.parked_invade.as_ref()).is_some_and(|game| game.unfinished())
     }
 
     /// Every tab in the order the strip shows them.
@@ -494,27 +527,28 @@ impl SnekkieApp {
     /// From About Snekkie, open the game once or show the one that is open.
     fn open_invade(&mut self) {
         if self.invade.is_none() {
-            let seed =
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
-            let game = match self.invade_store.take() {
-                Some(store) => InvadeTab::with_store(store, seed),
-                None => InvadeTab::open(self.invade_path(), seed),
-            };
-            self.invade = Some(Box::new(game));
+            let game = self.parked_invade.take().unwrap_or_else(|| {
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64);
+                Box::new(InvadeTab::open(self.invade_path(), seed))
+            });
+            self.invade = Some(game);
             self.invade_slot = self.tabs.len();
         }
         self.select_workspace_tab(WorkspaceTabId::Invade);
     }
 
-    /// Closing the game's tab ends and records its run.
-    fn close_invade(&mut self, reason: EndReason) {
+    /// Closing the game's tab pauses and keeps its run for reopening; only
+    /// closing Snekkie ends and records it.
+    fn close_invade(&mut self) {
         let order = self.workspace_order();
         let position = order.iter().position(|t| *t == WorkspaceTabId::Invade);
         let Some(mut game) = self.invade.take() else { return };
-        game.finish(reason);
+        self.suppressed_keys.extend(game.held_keys());
+        game.pause();
         self.invade_sidebar = false;
         if self.active == Some(WorkspaceTabId::Invade) {
-            self.suppressed_keys.extend(game.held_keys());
             self.active = None;
             if let Some(next) = position.and_then(|p| neighbor(&order, p)) {
                 self.select_workspace_tab(next);
@@ -524,13 +558,13 @@ impl SnekkieApp {
         if let Some(warning) = game.save_warning() {
             self.message("Invade", warning);
         }
-        self.invade_store = Some(game.into_store());
+        self.parked_invade = Some(game);
     }
 
     fn close_workspace_tab(&mut self, id: WorkspaceTabId, confirmed: bool) {
         match id {
             WorkspaceTabId::Session(session) => self.close_tab(session, confirmed),
-            WorkspaceTabId::Invade => self.close_invade(EndReason::Closed),
+            WorkspaceTabId::Invade => self.close_invade(),
         }
     }
 
@@ -1109,6 +1143,9 @@ impl SnekkieApp {
             }
         }
         self.update_events(ctx);
+        #[cfg(windows)]
+        self.poll_tray(ctx);
+        self.sync_agents(ctx);
         let questions: Vec<HostKeyQuestion> = self.host_keys.lock().drain(..).collect();
         self.dialogs.extend(questions.into_iter().map(|q| Dialog::HostKey(Box::new(q))));
         // A host key question whose connection gave up (tab closed, timed
@@ -1143,6 +1180,133 @@ impl SnekkieApp {
         }
     }
 
+    /// Act on what was chosen from the notification-area icon's menu.
+    #[cfg(windows)]
+    fn poll_tray(&mut self, ctx: &egui::Context) {
+        use super::tray::{AppTray, TrayCommand};
+        if std::mem::take(&mut self.want_tray) {
+            let repaint = ctx.clone();
+            self.tray = Some(AppTray::new(move || repaint.request_repaint()));
+        }
+        let Some(tray) = &self.tray else { return };
+        tray.set_agents(self.agents.is_some());
+        let commands: Vec<TrayCommand> = tray.commands().collect();
+        for command in commands {
+            if matches!(command, TrayCommand::Show | TrayCommand::Quit | TrayCommand::QuitWithBridges) {
+                // Quit may need to ask about live sessions, so show it too.
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+            match command {
+                TrayCommand::Show | TrayCommand::OpenApp => {}
+                TrayCommand::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
+                TrayCommand::QuitWithBridges => {
+                    self.close_bridges_on_exit = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+                TrayCommand::CloseBridges => {
+                    crate::mcp::bridges::close();
+                    self.flash(ctx, "AI agent bridge closed");
+                }
+                TrayCommand::ToggleAgents => {
+                    let on = self.agents.is_none();
+                    self.settings.agent_access = on;
+                    // An open Preferences would otherwise undo this on OK.
+                    if let Some(preferences) = &mut self.preferences {
+                        preferences.settings.agent_access = on;
+                    }
+                    self.save_settings();
+                    let state = if on { "started" } else { "stopped" };
+                    self.flash(ctx, format!("AI agent server {state}"));
+                }
+            }
+        }
+    }
+
+    /// Start or stop the agent server to match Preferences, and show it the tabs.
+    fn sync_agents(&mut self, ctx: &egui::Context) {
+        if self.settings.agent_access != self.agents.is_some() {
+            self.agents = None;
+            if self.settings.agent_access {
+                let repaint = ctx.clone();
+                let file = self.agents_file.clone();
+                match crate::mcp::Server::start(self.runtime.handle(), file, move || repaint.request_repaint()) {
+                    Ok(server) => self.agents = Some(server),
+                    Err(e) => {
+                        // Not saved, so the next start tries again.
+                        self.settings.agent_access = false;
+                        self.message("AI agent access", format!("Could not start the agent server: {e}"));
+                    }
+                }
+            }
+        }
+        let Some(agents) = &self.agents else {
+            self.agent_activity = Default::default();
+            return;
+        };
+        let sessions: Vec<&Session> = self.tabs.iter().map(|tab| &tab.session).collect();
+        agents.sync(self.active_index().map(|index| self.tabs[index].session.id), &sessions);
+        self.agent_activity = agents.activity();
+        let now = std::time::Instant::now();
+        if self.agent_activity.sessions.values().any(|used| used.cue(now).is_some()) {
+            // Keep animating, or at least clear the cue once it is over.
+            let wait = if self.settings.agent_animations { 16 } else { 100 };
+            ctx.request_repaint_after(std::time::Duration::from_millis(wait));
+        }
+    }
+
+    fn agent_cue(&self, id: u64) -> Option<Cue> {
+        self.agent_activity.sessions.get(&id)?.cue(std::time::Instant::now())
+    }
+
+    fn agent_motion(&self, ctx: &egui::Context) -> Option<Motion> {
+        let speed = self.settings.animations.speed;
+        self.settings.agent_animations.then(|| Motion { time: ctx.input(|i| i.time) * f64::from(speed), speed })
+    }
+
+    /// Who is connected and, while one works, what it is doing. The slot's
+    /// width never changes, so the status bar can't wrap and resize the terminal.
+    fn agent_badge(&self, ui: &mut Ui) {
+        let width = (ui.available_width() * 0.4).min(AGENT_BADGE_WIDTH);
+        let agents = &self.agent_activity.agents;
+        let now = std::time::Instant::now();
+        let busiest = self
+            .agent_activity
+            .sessions
+            .iter()
+            .filter_map(|(id, used)| Some((used.cue(now)?, used, self.tabs.iter().find(|t| t.session.id == *id)?)))
+            .max_by_key(|(_, used, _)| used.last);
+        let (text, color) = match (agents.as_slice(), busiest) {
+            (_, Some((cue, used, tab))) => {
+                let name = &tab.session.profile.name;
+                let doing = match cue {
+                    Cue::Reading => format!("{} is reading {name}", used.agent),
+                    Cue::Writing(_) => format!("{} is typing in {name}", used.agent),
+                };
+                (doing, agents::text_color(ui, cue))
+            }
+            ([], None) => ("Agent access on".to_string(), style::secondary(ui)),
+            ([one], None) => (format!("{one} connected"), style::primary(ui)),
+            (many, None) => (format!("{} agents connected", many.len()), style::primary(ui)),
+        };
+        let hover = if agents.is_empty() {
+            format!("{text}\nLocal AI agents can use open sessions. None is connected.")
+        } else {
+            format!("{text}\nConnected: {}", agents.join(", "))
+        };
+        let height = ui.spacing().interact_size.y;
+        ui.allocate_ui_with_layout(vec2(width, height), Layout::left_to_right(Align::Center), |ui| {
+            ui.set_width(width);
+            if !agents.is_empty() || busiest.is_some() {
+                let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                let dot_color = if busiest.is_some() { color } else { self.accent };
+                ui.painter().circle_filled(dot.center(), 3.5, dot_color);
+            }
+            ui.add(egui::Label::new(RichText::new(&text).color(color)).truncate()).on_hover_text(hover);
+        });
+    }
+
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.viewport().close_requested()) || self.allow_close {
             return;
@@ -1164,6 +1328,7 @@ impl SnekkieApp {
         let saved: Vec<Profile> = self.store.profiles.clone();
         let mut open_saved: Option<Profile> = None;
         egui::MenuBar::new().ui(ui, |ui| {
+            style::wordmark(ui, self.accent);
             let buttons = ["Session", "Edit", "Terminal", "View", "Settings", "Help"].map(|label| ui.button(label));
             // Resolve hover switching before drawing any popup, so it works
             // in either direction and only one menu is drawn per frame.
@@ -1279,6 +1444,10 @@ impl SnekkieApp {
             self.flash = None;
         }
         ui.horizontal_wrapped(|ui| {
+            if self.agents.is_some() {
+                self.agent_badge(ui);
+                ui.separator();
+            }
             if let Some(queue) = &self.paste_queue {
                 ui.label(format!("Paste: {}/{} line(s) — {}", queue.submitted, queue.total, queue.target.description))
                     .on_hover_text("Progress counts lines submitted to the transport, not device acknowledgments.");
@@ -1463,6 +1632,8 @@ impl SnekkieApp {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 for (index, &entry) in order.iter().enumerate() {
                     let selected = self.active == Some(entry);
+                    // Hover fills must stay behind the labels and close button.
+                    let background = ui.painter().add(egui::Shape::Noop);
                     let WorkspaceTabId::Session(session_id) = entry else {
                         // The game's tab: game actions and Close, nothing
                         // about connections or profiles.
@@ -1486,7 +1657,7 @@ impl SnekkieApp {
                                                 .frame(false)
                                                 .small(),
                                         );
-                                        if close.on_hover_text("Close Invade (ends and records the run)").clicked() {
+                                        if close.on_hover_text("Close Invade (reopening resumes the run)").clicked() {
                                             action = Some((entry, TabAction::Close));
                                         }
                                     });
@@ -1496,9 +1667,12 @@ impl SnekkieApp {
                         let response = inner.response.on_hover_text(format!("Invade\n{state}"));
                         let rect = response.rect;
                         if selected {
-                            ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(2.0, self.accent));
+                            ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(1.0, self.accent));
                         } else if response.hovered() {
-                            ui.painter().rect_filled(rect, 3.0, Color32::from_white_alpha(8));
+                            ui.painter().set(
+                                background,
+                                egui::Shape::rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill),
+                            );
                         }
                         if response.clicked() {
                             action = Some((entry, TabAction::Select));
@@ -1612,10 +1786,21 @@ impl SnekkieApp {
                         ui.painter().hline(
                             rect.x_range(),
                             rect.bottom() - 1.0,
-                            Stroke::new(2.0, tab.color.unwrap_or(self.accent)),
+                            Stroke::new(1.0, tab.color.unwrap_or(self.accent)),
                         );
                     } else if response.hovered() {
-                        ui.painter().rect_filled(rect, 3.0, Color32::from_white_alpha(8));
+                        ui.painter().set(
+                            background,
+                            egui::Shape::rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill),
+                        );
+                    }
+                    if let Some(cue) = self.agent_cue(id) {
+                        let motion = self.agent_motion(ui.ctx());
+                        ui.painter()
+                            .set(background, egui::Shape::rect_filled(rect, 3.0, agents::tab_fill(cue, motion)));
+                        // The glow reaches past the strip's scroll area into the margin around it.
+                        let clip = ui.clip_rect().expand2(vec2(0.0, 6.0));
+                        agents::tab(&ui.ctx().layer_painter(ui.layer_id()).with_clip_rect(clip), rect, cue, motion);
                     }
                     if response.clicked() {
                         action = Some((entry, TabAction::Select));
@@ -1748,28 +1933,37 @@ impl SnekkieApp {
     fn central(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let game_was_selected = self.invade_selected();
-        let tab_action = ui
-            .horizontal(|ui| {
-                let label = if self.sidebar_visible() { "Hide sessions" } else { "Show sessions" };
-                let shortcut = shortcut_label("Ctrl+B", cfg!(target_os = "macos"));
-                if ui.button(label).on_hover_text(format!("Show or hide the session sidebar ({shortcut})")).clicked() {
-                    self.run_command(&ctx, Command::ToggleSidebar);
+        let strip = ui.horizontal(|ui| {
+            let label = if self.sidebar_visible() { "Hide sessions" } else { "Show sessions" };
+            let shortcut = shortcut_label("Ctrl+B", cfg!(target_os = "macos"));
+            if ui.button(label).on_hover_text(format!("Show or hide the session sidebar ({shortcut})")).clicked() {
+                self.run_command(&ctx, Command::ToggleSidebar);
+                ctx.request_repaint();
+            }
+            self.tab_strip(ui)
+        });
+        let tab_action = strip.inner;
+        ui.painter().hline(
+            ui.max_rect().x_range(),
+            strip.response.rect.bottom() + 2.0,
+            Stroke::new(1.0, style::border(ui)),
+        );
+        ui.add_space(6.0);
+        if self.tabs.is_empty() && self.invade.is_none() {
+            Frame::new().inner_margin(20.0).show(ui, |ui| {
+                ui.set_max_width(ui.available_width().min(420.0));
+                ui.add_space((ui.available_height() * 0.12).min(48.0));
+                ui.label(RichText::new("Workspace").size(24.0).strong());
+                ui.add_space(8.0);
+                ui.label("No session open.");
+                ui.add(
+                    egui::Label::new(RichText::new("SSH, serial, Telnet or TCP.").color(style::secondary(ui))).wrap(),
+                );
+                ui.add_space(12.0);
+                if ui.add(style::primary_button(ui, "New connection")).clicked() {
+                    self.run_command(&ctx, Command::NewSession);
                     ctx.request_repaint();
                 }
-                self.tab_strip(ui)
-            })
-            .inner;
-        if self.tabs.is_empty() && self.invade.is_none() {
-            ui.centered_and_justified(|ui| {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(
-                            "No session open.\nOpen New session in the session sidebar,\nor select a saved session and choose Connect selected.",
-                        )
-                        .color(style::secondary(ui)),
-                    )
-                    .selectable(false),
-                );
             });
             return;
         }
@@ -1867,6 +2061,7 @@ impl SnekkieApp {
         }
 
         let theme = self.settings.colors();
+        let (agent_cue, agent_motion) = (self.agent_cue(id), self.agent_motion(&ctx));
         let tab = &mut self.tabs[index];
         // egui moves keyboard focus on arrow and Tab presses before a newly
         // focused terminal can claim them, so a key still held from the game
@@ -1897,11 +2092,15 @@ impl SnekkieApp {
             right_click_paste: self.settings.right_click_paste,
             animations,
         };
+        let area = ui.available_rect_before_wrap();
         let out = if theme.effects.is_super() {
             style::monitor(ui, theme, |ui| tab.view.show(ui, &tab.session, &options))
         } else {
             tab.view.show(ui, &tab.session, &options)
         };
+        if let Some(cue) = agent_cue {
+            agents::terminal(&ui.painter().with_clip_rect(area.expand(8.0)), area, cue, agent_motion);
+        }
         if let Some(text) = out.copy {
             ctx.copy_text(text);
         }
@@ -1931,23 +2130,18 @@ impl SnekkieApp {
     }
 
     fn invade_ui(&mut self, ui: &mut Ui) {
-        let theme = self.settings.colors();
         // Menus, dialogs and the sidebar shown over the game pause it; none
         // of them is part of the game, and paced sends keep going.
         let interactive = !self.modal_open() && !egui::Popup::is_any_open(ui.ctx());
-        let options = InvadeOptions { theme, interactive };
+        let options = InvadeOptions { interactive };
         let Some(game) = self.invade.as_mut() else { return };
-        let action = if theme.effects.is_super() {
-            style::monitor(ui, theme, |ui| game.ui(ui, &options))
-        } else {
-            game.ui(ui, &options)
-        };
+        let action = game.ui(ui, &options);
         // Resuming puts the sidebar shown over the game away again.
         if self.invade_sidebar && game.is_running() {
             self.invade_sidebar = false;
         }
         if action == Some(InvadeAction::Close) {
-            self.close_invade(EndReason::Closed);
+            self.close_invade();
         }
     }
 
@@ -2256,6 +2450,9 @@ impl SnekkieApp {
                     }
                 }
             },
+            // Staying open keeps the agents' bridges too; a later plain Quit leaves them.
+            #[cfg(windows)]
+            (Dialog::Confirm { action: ConfirmAction::Quit, .. }, _) => self.close_bridges_on_exit = false,
             (Dialog::Update { release, installable }, DialogResult::Yes) => {
                 if installable {
                     self.updater.download(ctx);
@@ -2612,7 +2809,7 @@ impl SnekkieApp {
         let mut commands = if modal_open { Vec::new() } else { self.shortcuts(&ctx) };
 
         egui::Panel::top("menu")
-            .frame(Frame::new().fill(ui.visuals().panel_fill).inner_margin(Margin::symmetric(6, 3)))
+            .frame(Frame::new().fill(ui.visuals().panel_fill).inner_margin(Margin::symmetric(10, 5)))
             .show(ui, |ui| commands.extend(self.menu_bar(ui)));
         egui::Panel::bottom("status")
             .frame(
@@ -2627,15 +2824,15 @@ impl SnekkieApp {
                 .resizable(true)
                 .default_size(320.0)
                 .size_range(280.0..=460.0)
-                .frame(Frame::new().fill(ui.visuals().window_fill).inner_margin(Margin::same(10)))
+                .frame(Frame::new().fill(ui.visuals().panel_fill).inner_margin(Margin::same(12)))
                 .show(ui, |ui| self.sidebar_ui(ui));
         }
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(ui.visuals().panel_fill).inner_margin(Margin {
-                left: 2,
-                right: 0,
-                top: 2,
-                bottom: 0,
+            .frame(Frame::new().fill(ui.visuals().faint_bg_color).inner_margin(Margin {
+                left: 8,
+                right: 8,
+                top: 6,
+                bottom: 6,
             }))
             .show(ui, |ui| self.central(ui));
 
@@ -2676,15 +2873,10 @@ impl SnekkieApp {
 
     /// Hang up everything; called on exit.
     pub fn shutdown(&mut self) {
-        // Closing Snekkie ends the game's run; it is recorded once.
-        if let Some(game) = &mut self.invade {
+        // Closing Snekkie ends the game's run, open or parked; it is recorded once.
+        if let Some(game) = self.invade.as_mut().or(self.parked_invade.as_mut()) {
             game.finish(EndReason::AppClosed);
             game.retry_failed_save();
-        } else if let Some(store) = &mut self.invade_store
-            && store.save_error.is_some()
-        {
-            // One last try for progress a closed tab could not save.
-            let _ = store.save();
         }
         self.paste_queue = None;
         self.paste_preview = None;
@@ -2998,6 +3190,14 @@ impl eframe::App for SnekkieApp {
     }
 
     fn on_exit(&mut self) {
+        #[cfg(windows)]
+        {
+            self.tray = None;
+            if self.close_bridges_on_exit {
+                crate::mcp::bridges::close();
+            }
+        }
+        self.agents = None;
         self.shutdown();
         for tab in &self.tabs {
             tab.session.finish_logs();

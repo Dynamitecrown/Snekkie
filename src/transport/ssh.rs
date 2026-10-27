@@ -1,6 +1,7 @@
 //! SSH transport backed by russh (pure Rust, no OpenSSL to ship).
 
 use std::borrow::Cow;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,6 +10,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use russh::client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::client::AgentClient;
+use russh::keys::ssh_key::known_hosts::{Entry, HostPatterns};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect, MethodKind, Preferred, cipher, kex, mac};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -128,6 +130,8 @@ fn client_config(profile: &Profile) -> client::Config {
 enum Error {
     Ssh(russh::Error),
     HostKeyChanged { line: usize },
+    HostKeyRevoked { line: usize },
+    KnownHosts(String),
     HostKeyRejected { fingerprint: String },
 }
 
@@ -135,6 +139,56 @@ impl From<russh::Error> for Error {
     fn from(e: russh::Error) -> Self {
         Error::Ssh(e)
     }
+}
+
+fn matches_host(host: &str, patterns: &HostPatterns) -> Result<bool, Error> {
+    match patterns {
+        HostPatterns::Patterns(patterns) => {
+            let mut matched = false;
+            for pattern in patterns {
+                let (negated, pattern) = pattern.strip_prefix('!').map_or((false, pattern.as_str()), |p| (true, p));
+                let pattern = regex::escape(pattern).replace("\\*", ".*").replace("\\?", ".");
+                let regex =
+                    regex::Regex::new(&format!("(?i)\\A{pattern}\\z")).map_err(|e| Error::KnownHosts(e.to_string()))?;
+                if regex.is_match(host) {
+                    if negated {
+                        return Ok(false);
+                    }
+                    matched = true;
+                }
+            }
+            Ok(matched)
+        }
+        HostPatterns::HashedName { salt, hash } => {
+            let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, salt);
+            Ok(ring::hmac::verify(&key, host.as_bytes(), hash).is_ok())
+        }
+    }
+}
+
+fn check_revoked_host_key(host: &str, port: u16, key: &PublicKey, path: &Path) -> Result<(), Error> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::KnownHosts(e.to_string())),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    let host = if port == 22 { host } else { format!("[{host}]:{port}") };
+    // russh's ordinary known_hosts check ignores @revoked entries.
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| Error::KnownHosts(e.to_string()))?;
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("@revoked") {
+            continue;
+        }
+        let entry = format!("@revoked {}", fields.take(3).collect::<Vec<_>>().join(" "))
+            .parse::<Entry>()
+            .map_err(|e| Error::KnownHosts(format!("invalid revoked entry on line {}: {e}", index + 1)))?;
+        if entry.public_key().key_data() == key.key_data() && matches_host(&host, entry.host_patterns())? {
+            return Err(Error::HostKeyRevoked { line: index + 1 });
+        }
+    }
+    Ok(())
 }
 
 struct Client {
@@ -157,6 +211,7 @@ impl client::Handler for Client {
             // We never offer certificate algorithms, so a server can't pick one.
             return Ok(false);
         };
+        check_revoked_host_key(&self.host, self.port, key, &self.known_hosts)?;
         match russh::keys::check_known_hosts_path(&self.host, self.port, key, &self.known_hosts) {
             Ok(true) => return Ok(true),
             Err(russh::keys::Error::KeyChanged { line }) => return Err(Error::HostKeyChanged { line }),
@@ -216,6 +271,13 @@ impl client::Handler for Client {
 
 fn describe(error: &Error, host: &str, known_hosts: &Path) -> String {
     match error {
+        Error::HostKeyRevoked { line } => format!(
+            "The host key for {host} is revoked in {} (line {line}). The connection was refused.",
+            known_hosts.display()
+        ),
+        Error::KnownHosts(message) => {
+            format!("Could not verify the host key for {host} using {}: {message}", known_hosts.display())
+        }
         Error::HostKeyChanged { line } => format!(
             "The host key for {host} does not match the one recorded in known_hosts (line {line}). \
              This could mean someone is intercepting the connection, or the device was replaced \
@@ -525,6 +587,65 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+
+    #[test]
+    fn revocation_matches_host_patterns_ports_and_hashed_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let key = PublicKey::from_openssh(TEST_KEY).unwrap();
+        let hmac = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, b"test salt");
+        let hashed = HostPatterns::HashedName {
+            salt: b"test salt".to_vec(),
+            hash: ring::hmac::sign(&hmac, b"[switch.example]:2222").as_ref().try_into().unwrap(),
+        };
+        for (host, port, pattern, revoked) in [
+            ("switch.example", 22, "switch.example", true),
+            ("SWITCH.example", 22, "switch.example", true),
+            ("switch.example", 22, "*.example", true),
+            ("switch.example", 22, "swi??h.example,other.example", true),
+            ("switch.example", 22, "*.example,!switch.example", false),
+            ("switch.example", 22, "!switch.example,*.example", false),
+            ("switch.example", 22, "other.example", false),
+            ("switch.example", 2222, "[switch.example]:2222", true),
+            ("switch.example", 2222, "[*.example]:2222", true),
+            ("switch.example", 2222, "[switch.example]:22", false),
+            ("switch.example", 2222, "switch.example", false),
+            ("[::1]", 2222, "[::1]:2222", true),
+            ("switch.example", 2222, hashed.to_string().as_str(), true),
+            ("other.example", 2222, hashed.to_string().as_str(), false),
+        ] {
+            std::fs::write(&path, format!("# fixture\n  @revoked\t{pattern}\t{TEST_KEY} revoked fixture\n")).unwrap();
+            let result = check_revoked_host_key(host, port, &key, &path);
+            if revoked {
+                assert!(matches!(result, Err(Error::HostKeyRevoked { line: 2 })), "{pattern}: {result:?}");
+            } else {
+                assert!(result.is_ok(), "{pattern}: {result:?}");
+            }
+        }
+        std::fs::write(&path, format!("@revoked * {TEST_KEY}\n")).unwrap();
+        let other = russh::keys::parse_public_key_base64(
+            "AAAAC3NzaC1lZDI1NTE5AAAAILIG2T/B0l0gaqj3puu510tu9N1OkQ4znY3LYuEm5zCF",
+        )
+        .unwrap();
+        assert!(check_revoked_host_key("switch.example", 22, &other, &path).is_ok());
+    }
+
+    #[test]
+    fn revocation_check_fails_closed_on_invalid_or_unreadable_trust_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let key = PublicKey::from_openssh(TEST_KEY).unwrap();
+        assert!(check_revoked_host_key("switch.example", 22, &key, &path).is_ok());
+        assert!(matches!(check_revoked_host_key("switch.example", 22, &key, dir.path()), Err(Error::KnownHosts(_))));
+        for contents in [b"@revoked * ssh-ed25519 invalid\n".as_slice(), b"@revoked\n", b"\xff\n"] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(matches!(check_revoked_host_key("switch.example", 22, &key, &path), Err(Error::KnownHosts(_))));
+        }
+        std::fs::write(&path, format!("@cert-authority * {TEST_KEY}\n# @revoked * {TEST_KEY}\n")).unwrap();
+        assert!(check_revoked_host_key("switch.example", 22, &key, &path).is_ok());
+    }
 
     #[test]
     fn description_matches_python_format() {

@@ -116,7 +116,6 @@ fn update_button_downloads_installs_and_restarts_the_registered_copy() {
         .expect("GitHub returned no stable application release");
     assert!(update::is_newer(&release.version, &before.version), "the fixture must be older than the latest release");
     let asset = release.installer.as_ref().expect("the latest release has no full Windows installer").clone();
-    assert!(asset.sha256.is_some(), "the live installer must have a GitHub SHA-256 digest");
     let latest_version = release.version.clone();
     println!("Driving the actual Update button: {} -> {latest_version}", before.version);
 
@@ -158,7 +157,7 @@ fn update_button_downloads_installs_and_restarts_the_registered_copy() {
     let installer = std::env::temp_dir().join("snekkie-update").join(&asset.name);
     assert_eq!(std::fs::metadata(&installer).unwrap().len(), asset.size, "download size differs from GitHub");
     let digest = file_hash(&installer).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-    assert_eq!(Some(digest), asset.sha256, "the button did not download the published installer bytes");
+    assert_eq!(digest, asset.sha256, "the button did not download the published installer bytes");
 
     // The production installer waits on our mutex, making inspection of its
     // real /UPDATE command deterministic even when installation is very fast.

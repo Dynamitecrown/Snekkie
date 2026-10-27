@@ -21,6 +21,12 @@ use sha2::{Digest, Sha256};
 /// GitHub's description of the newest full release.
 pub const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Dynamitecrown/Snekkie/releases/latest";
 
+/// Release pages and installer downloads must come from here.
+const REPOSITORY_URL: &str = "https://github.com/Dynamitecrown/Snekkie";
+
+/// Far beyond any real installer; a bigger claim means something is wrong.
+const MAX_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
+
 /// This build's version.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -44,14 +50,13 @@ pub struct Asset {
     pub name: String,
     pub url: String,
     pub size: u64,
-    /// Lowercase hex SHA-256, if GitHub published one.
-    pub sha256: Option<String>,
+    /// Lowercase hex SHA-256, as GitHub published it.
+    pub sha256: String,
 }
 
 #[derive(Deserialize)]
 struct GitHubRelease {
     tag_name: String,
-    html_url: String,
     #[serde(default)]
     draft: bool,
     #[serde(default)]
@@ -82,13 +87,38 @@ pub fn parse_release(json: &str) -> Result<Option<Release>, String> {
         .map_err(|_| format!("the latest release is tagged “{tag}”, which isn't a version number"))?;
     // The version is checked above, so the name is safe to use as a file name.
     let installer_name = format!("Snekkie-Setup-{version}.exe");
-    let installer = release.assets.into_iter().find(|a| a.name == installer_name).map(|a| Asset {
-        sha256: a.digest.as_deref().and_then(|d| d.strip_prefix("sha256:")).map(str::to_ascii_lowercase),
-        name: a.name,
-        url: a.browser_download_url,
-        size: a.size,
-    });
-    Ok(Some(Release { version: version.to_string(), page: release.html_url, installer }))
+    let mut matching = release.assets.into_iter().filter(|a| a.name == installer_name);
+    let installer = match (matching.next(), matching.next()) {
+        (None, _) => None,
+        (Some(asset), None) => Some(checked_installer(asset, tag)?),
+        (Some(_), Some(_)) => return Err(format!("the latest release lists {installer_name} more than once")),
+    };
+    // Built from the checked tag, so the link always opens Snekkie's own page.
+    let page = format!("{REPOSITORY_URL}/releases/tag/{tag}");
+    Ok(Some(Release { version: version.to_string(), page, installer }))
+}
+
+/// The installer is only offered if it can be checked: it must download from
+/// this release on Snekkie's repository and GitHub must publish its SHA-256.
+fn checked_installer(asset: GitHubAsset, tag: &str) -> Result<Asset, String> {
+    let expected_url = format!("{REPOSITORY_URL}/releases/download/{tag}/{}", asset.name);
+    if asset.browser_download_url != expected_url {
+        return Err(format!(
+            "the latest release's installer would download from {}, not from Snekkie's release",
+            asset.browser_download_url
+        ));
+    }
+    let sha256 = asset
+        .digest
+        .as_deref()
+        .and_then(|d| d.strip_prefix("sha256:"))
+        .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or("GitHub published no valid SHA-256 digest for the latest installer, so it can't be checked")?
+        .to_ascii_lowercase();
+    if asset.size == 0 || asset.size > MAX_INSTALLER_BYTES {
+        return Err(format!("the latest installer claims an implausible size ({} bytes)", asset.size));
+    }
+    Ok(Asset { name: asset.name, url: asset.browser_download_url, size: asset.size, sha256 })
 }
 
 /// True if `candidate` is a later version than `current`. Anything that
@@ -138,8 +168,8 @@ pub fn fresh_download_dir() -> PathBuf {
     dir
 }
 
-/// Download `asset` into `dir` and check it's all there and, if GitHub
-/// published a digest, that it's the file GitHub has. `progress` is told
+/// Download `asset` into `dir` and check it's all there and that it's the
+/// file GitHub has. `progress` is told
 /// the number of bytes so far.
 pub fn download(asset: &Asset, dir: &Path, progress: impl FnMut(u64)) -> Result<PathBuf, String> {
     download_with(&agent(true), asset, dir, progress)
@@ -183,14 +213,12 @@ fn fetch_to(agent: &ureq::Agent, asset: &Asset, path: &Path, mut progress: impl 
     if received != asset.size {
         return Err(format!("the download was cut short ({received} of {} bytes)", asset.size));
     }
-    if let Some(expected) = &asset.sha256 {
-        let actual = hasher.finalize().iter().fold(String::with_capacity(64), |mut hex, byte| {
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        });
-        if &actual != expected {
-            return Err("the downloaded installer doesn't match the release (its SHA-256 differs)".into());
-        }
+    let actual = hasher.finalize().iter().fold(String::with_capacity(64), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    });
+    if actual != asset.sha256 {
+        return Err("the downloaded installer doesn't match the release (its SHA-256 differs)".into());
     }
     Ok(())
 }
@@ -337,7 +365,7 @@ mod tests {
                   "browser_download_url": "https://example.invalid/portable.exe",
                   "digest": "sha256:193b3b84a94c8ad00fca8b16fa20fb1abc3dae6564439040700b278b333db524"}},
                 {{"name": "Snekkie-Setup-2.2.0.exe", "size": 6313194,
-                  "browser_download_url": "https://example.invalid/Snekkie-Setup-2.2.0.exe",
+                  "browser_download_url": "https://github.com/Dynamitecrown/Snekkie/releases/download/{tag}/Snekkie-Setup-2.2.0.exe",
                   "digest": "sha256:EF53D89D66FA2DC0A38233E2A80CA7E13F92073AD339CCC1C07F7879AE115366"}}
               ]
             }}"#
@@ -353,11 +381,75 @@ mod tests {
             release.installer,
             Some(Asset {
                 name: "Snekkie-Setup-2.2.0.exe".into(),
-                url: "https://example.invalid/Snekkie-Setup-2.2.0.exe".into(),
+                url: "https://github.com/Dynamitecrown/Snekkie/releases/download/v2.2.0/Snekkie-Setup-2.2.0.exe".into(),
                 size: 6313194,
-                sha256: Some("ef53d89d66fa2dc0a38233e2a80ca7e13f92073ad339ccc1c07f7879ae115366".into()),
+                sha256: "ef53d89d66fa2dc0a38233e2a80ca7e13f92073ad339ccc1c07f7879ae115366".into(),
             })
         );
+    }
+
+    /// Parse the v2.2.0 release after `change` edits its JSON.
+    fn parse_changed(change: impl FnOnce(&mut serde_json::Value)) -> Result<Option<Release>, String> {
+        let mut json: serde_json::Value = serde_json::from_str(&release_json("v2.2.0", false)).unwrap();
+        change(&mut json);
+        parse_release(&json.to_string())
+    }
+
+    #[test]
+    fn an_installer_that_cant_be_checked_is_refused() {
+        type Change = fn(&mut serde_json::Value);
+        let installer = |change: Change| parse_changed(|json| change(&mut json["assets"][1]));
+        let cases: [(&str, Change, &str); 9] = [
+            ("no digest", |a| drop(a.as_object_mut().unwrap().remove("digest")), "SHA-256"),
+            ("null digest", |a| a["digest"] = serde_json::Value::Null, "SHA-256"),
+            ("short digest", |a| a["digest"] = "sha256:ef53".into(), "SHA-256"),
+            ("other algorithm", |a| a["digest"] = format!("md5:{}", "a".repeat(64)).into(), "SHA-256"),
+            ("not hex", |a| a["digest"] = format!("sha256:{}", "g".repeat(64)).into(), "SHA-256"),
+            (
+                "other repository",
+                |a| {
+                    a["browser_download_url"] =
+                        "https://github.com/someone/Snekkie/releases/download/v2.2.0/Snekkie-Setup-2.2.0.exe".into()
+                },
+                "would download from",
+            ),
+            (
+                "other tag",
+                |a| {
+                    a["browser_download_url"] =
+                        "https://github.com/Dynamitecrown/Snekkie/releases/download/v2.1.0/Snekkie-Setup-2.2.0.exe"
+                            .into()
+                },
+                "would download from",
+            ),
+            (
+                "plain http",
+                |a| {
+                    a["browser_download_url"] =
+                        "http://github.com/Dynamitecrown/Snekkie/releases/download/v2.2.0/Snekkie-Setup-2.2.0.exe"
+                            .into()
+                },
+                "would download from",
+            ),
+            ("empty", |a| a["size"] = 0.into(), "implausible size"),
+        ];
+        for (case, change, expected) in cases {
+            let error = installer(change).unwrap_err();
+            assert!(error.contains(expected), "{case}: {error}");
+        }
+        assert!(installer(|a| a["size"] = (MAX_INSTALLER_BYTES + 1).into()).unwrap_err().contains("implausible"));
+
+        let twice = parse_changed(|json| {
+            let copy = json["assets"][1].clone();
+            json["assets"].as_array_mut().unwrap().push(copy);
+        });
+        assert!(twice.unwrap_err().contains("more than once"));
+    }
+
+    #[test]
+    fn the_release_page_is_always_snekkies_own() {
+        let release = parse_changed(|json| json["html_url"] = "https://example.invalid/phish".into()).unwrap().unwrap();
+        assert_eq!(release.page, "https://github.com/Dynamitecrown/Snekkie/releases/tag/v2.2.0");
     }
 
     #[test]
@@ -382,7 +474,7 @@ mod tests {
         let release = fetch_latest(LATEST_RELEASE_URL).unwrap().expect("no full release");
         let installer = release.installer.expect("no installer");
         assert!(installer.url.starts_with("https://"));
-        assert_eq!(installer.sha256.map(|d| d.len()), Some(64));
+        assert_eq!(installer.sha256.len(), 64);
     }
 
     #[test]
@@ -442,13 +534,8 @@ mod tests {
         url
     }
 
-    fn asset(url: String, sha256: Option<&str>) -> Asset {
-        Asset {
-            name: "Snekkie-Setup-2.2.0.exe".into(),
-            url,
-            size: INSTALLER.len() as u64,
-            sha256: sha256.map(String::from),
-        }
+    fn asset(url: String, sha256: &str) -> Asset {
+        Asset { name: "Snekkie-Setup-2.2.0.exe".into(), url, size: INSTALLER.len() as u64, sha256: sha256.into() }
     }
 
     fn sha256_of(bytes: &[u8]) -> String {
@@ -459,7 +546,7 @@ mod tests {
     fn downloads_and_checks_the_installer() {
         let dir = tempfile::tempdir().unwrap();
         let expected = sha256_of(INSTALLER);
-        let asset = asset(serve(INSTALLER, INSTALLER.len()), Some(&expected));
+        let asset = asset(serve(INSTALLER, INSTALLER.len()), &expected);
         let mut seen = 0;
         let path = download_with(&agent(false), &asset, dir.path(), |bytes| seen = bytes).unwrap();
         assert_eq!(path, dir.path().join("Snekkie-Setup-2.2.0.exe"));
@@ -471,7 +558,7 @@ mod tests {
     fn a_corrupt_download_is_thrown_away() {
         let dir = tempfile::tempdir().unwrap();
         let wrong = "0".repeat(64);
-        let asset = asset(serve(INSTALLER, INSTALLER.len()), Some(&wrong));
+        let asset = asset(serve(INSTALLER, INSTALLER.len()), &wrong);
         let error = download_with(&agent(false), &asset, dir.path(), |_| {}).unwrap_err();
         assert!(error.contains("SHA-256"), "{error}");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
@@ -481,7 +568,7 @@ mod tests {
     fn a_short_download_is_thrown_away() {
         let dir = tempfile::tempdir().unwrap();
         // The server promises the whole file but hangs up half way.
-        let asset = asset(serve(&INSTALLER[..10], INSTALLER.len()), None);
+        let asset = asset(serve(&INSTALLER[..10], INSTALLER.len()), &sha256_of(INSTALLER));
         assert!(download_with(&agent(false), &asset, dir.path(), |_| {}).is_err());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
@@ -489,7 +576,7 @@ mod tests {
     #[test]
     fn a_download_bigger_than_promised_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let mut asset = asset(serve(INSTALLER, INSTALLER.len()), None);
+        let mut asset = asset(serve(INSTALLER, INSTALLER.len()), &sha256_of(INSTALLER));
         asset.size -= 1;
         assert!(download_with(&agent(false), &asset, dir.path(), |_| {}).is_err());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);

@@ -44,6 +44,14 @@ fn main() {
             };
             app.key_press_modifiers(modifiers, Key::Comma);
             app.run_ok();
+            for tab in ["Terminal", "Input & paste", "Network", "Highlighting", "Animations", "Appearance"] {
+                if tab == "Appearance" {
+                    page(&mut app, "Terminal");
+                }
+                app.get_all_by_role_and_label(Role::Button, tab).next_back().unwrap().hover();
+                app.run_ok();
+                capture(&mut app, &format!("{name}-{viewport}-hover-{tab}"));
+            }
             for section in ["Appearance", "Terminal", "Input & paste", "Network", "Highlighting", "Animations"] {
                 page(&mut app, section);
                 capture(&mut app, &format!("{name}-{viewport}-{section}"));
@@ -62,6 +70,9 @@ fn main() {
                     app.get_by_label("New lines").scroll_to_me();
                     app.run_ok();
                     capture(&mut app, &format!("{name}-{viewport}-animations-output"));
+                    app.get_by_label("Animate agent activity").scroll_to_me();
+                    app.run_ok();
+                    capture(&mut app, &format!("{name}-{viewport}-animations-agents"));
                 }
             }
             page(&mut app, "Terminal");

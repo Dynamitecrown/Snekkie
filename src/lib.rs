@@ -3,6 +3,7 @@
 pub mod config;
 pub mod invade;
 pub mod logging;
+pub mod mcp;
 pub mod network;
 pub mod paste;
 pub mod profiles;

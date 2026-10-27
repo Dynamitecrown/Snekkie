@@ -564,6 +564,10 @@ fn imported_profile(value: &serde_json::Value) -> Result<(Profile, Vec<String>),
         return Err(format!("{name}: unsupported terminal settings"));
     }
     let mut notes = Vec::new();
+    if !profile.log_path.is_empty() {
+        profile.log_path.clear();
+        notes.push("logging disabled on import; choose a local log path to enable it".into());
+    }
     if profile.log_passwords {
         profile.log_passwords = false;
         notes.push("password logging disabled on import; enable it explicitly on this installation".into());
@@ -872,8 +876,49 @@ mod tests {
         assert_eq!(payload["version"], 1);
         assert_eq!(payload["sessions"].as_array().unwrap().len(), 4);
         let imported = parse_import(text.as_bytes()).unwrap();
-        assert!(imported.warnings.is_empty());
-        assert_eq!(imported.profiles, profiles);
+        assert_eq!(imported.warnings.len(), profiles.len());
+        let expected = profiles.map(|mut profile| {
+            profile.log_path.clear();
+            profile
+        });
+        assert_eq!(imported.profiles, expected);
+    }
+
+    #[test]
+    fn imports_disable_logging_without_touching_files_or_existing_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("startup.sh");
+        fs::write(&target, "original startup contents\n").unwrap();
+        let existing = Profile {
+            name: "Existing".into(),
+            host: "192.0.2.1".into(),
+            log_path: target.display().to_string(),
+            ..Default::default()
+        };
+        let incoming = ["raw", "text"].map(|format| Profile {
+            name: format!("Imported {format}"),
+            log_format: format.into(),
+            log_passwords: true,
+            ..existing.clone()
+        });
+        let mut payload: serde_json::Value = serde_json::from_str(&export_profiles(&incoming).unwrap()).unwrap();
+        // An untrusted export may try to enable password logging as well.
+        for profile in payload["sessions"].as_array_mut().unwrap() {
+            profile["log_passwords"] = true.into();
+        }
+        let imported = parse_import(payload.to_string().as_bytes()).unwrap();
+        assert_eq!(imported.profiles.len(), 2);
+        assert!(imported.profiles.iter().all(|p| p.log_path.is_empty() && !p.log_passwords));
+        assert_eq!(imported.warnings.iter().filter(|note| note.contains("choose a local log path")).count(), 2);
+        let store = ProfileStore {
+            path: dir.path().join("sessions.json"),
+            profiles: merge_import(std::slice::from_ref(&existing), imported.profiles),
+        };
+        store.save().unwrap();
+        let loaded = ProfileStore::open(store.path);
+        assert_eq!(loaded.get("Existing"), Some(&existing));
+        assert!(loaded.profiles[1..].iter().all(|p| p.log_path.is_empty() && !p.log_passwords));
+        assert_eq!(fs::read_to_string(target).unwrap(), "original startup contents\n");
     }
 
     #[test]

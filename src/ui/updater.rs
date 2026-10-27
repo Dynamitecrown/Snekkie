@@ -230,7 +230,7 @@ mod tests {
                 name: "test.exe".into(),
                 url: "https://example.invalid".into(),
                 size: 1,
-                sha256: None,
+                sha256: "0".repeat(64),
             }),
         });
         updater.download(&ctx);

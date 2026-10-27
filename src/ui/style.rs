@@ -1,18 +1,11 @@
 //! Look of the app chrome: sidebar, menus, tabs, buttons, dialogs.
 //!
-//! Most themes use dark chrome with the cursor color as an accent.
-//! CRT Super also gives the controls a retro appearance.
+//! Standard chrome follows the terminal palette; special appearances retain
+//! their monitor treatments.
 
 use crate::settings::{AppAppearance, Theme};
 use egui::{Color32, CornerRadius, Stroke, Visuals};
 
-pub const BG_WINDOW: Color32 = Color32::from_rgb(0x1b, 0x1c, 0x1b);
-pub const BG_PANEL: Color32 = Color32::from_rgb(0x20, 0x21, 0x20);
-pub const BG_INPUT: Color32 = Color32::from_rgb(0x2a, 0x2b, 0x2a);
-pub const BG_LIST: Color32 = Color32::from_rgb(0x1e, 0x1f, 0x1e);
-pub const BORDER: Color32 = Color32::from_rgb(0x34, 0x34, 0x32);
-pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xe8, 0xe8, 0xe6);
-pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0x9a, 0x9a, 0x96);
 pub const BANNER_BG: Color32 = Color32::from_rgb(0x55, 0x22, 0x22);
 pub const BANNER_INFO_BG: Color32 = Color32::from_rgb(0x2a, 0x3a, 0x4a);
 
@@ -23,69 +16,94 @@ pub fn lighter(c: Color32, factor: f32) -> Color32 {
 
 /// Black or near-white, whichever reads better on the given color.
 pub fn text_on(c: Color32) -> Color32 {
-    let luminance = 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
-    if luminance > 140.0 { Color32::from_rgb(0x10, 0x11, 0x10) } else { Color32::from_rgb(0xf5, 0xf5, 0xf3) }
+    let dark = Color32::from_rgb(0x10, 0x11, 0x10);
+    let light = Color32::from_rgb(0xf5, 0xf5, 0xf3);
+    if contrast(c, dark) >= contrast(c, light) { dark } else { light }
 }
 
-pub fn apply(ctx: &egui::Context, accent: Color32) {
-    let mut visuals = Visuals::dark();
-    visuals.panel_fill = BG_WINDOW;
-    visuals.window_fill = BG_PANEL;
-    visuals.window_stroke = Stroke::new(1.0, BORDER);
-    visuals.extreme_bg_color = BG_INPUT;
-    visuals.faint_bg_color = BG_LIST;
-    visuals.code_bg_color = BG_INPUT;
-    visuals.selection.bg_fill = accent;
-    visuals.selection.stroke = Stroke::new(1.0, text_on(accent));
-    visuals.hyperlink_color = accent;
-    visuals.weak_text_color = Some(TEXT_SECONDARY);
+fn luminance(c: Color32) -> f32 {
+    let linear = |v: u8| {
+        let v = f32::from(v) / 255.0;
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
+}
+
+fn contrast(a: Color32, b: Color32) -> f32 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+pub fn apply_theme(ctx: &egui::Context, theme: Theme) {
+    let light = luminance(theme.bg) > luminance(theme.fg);
+    let mut visuals = if light { Visuals::light() } else { Visuals::dark() };
+    let panel = theme.bg.lerp_to_gamma(theme.fg, 0.025);
+    let surface = theme.bg.lerp_to_gamma(theme.fg, 0.045);
+    let input = if light { theme.bg.lerp_to_gamma(Color32::WHITE, 0.6) } else { surface };
+    let hover = theme.bg.lerp_to_gamma(theme.fg, 0.10);
+    let selected = theme.bg.lerp_to_gamma(theme.fg, 0.14);
+    let ink = if contrast(theme.fg, selected) >= 4.5 { theme.fg } else { text_on(theme.bg) };
+    let muted = ink.lerp_to_gamma(theme.bg, if light { 0.16 } else { 0.22 });
+    let muted = if contrast(muted, input).min(contrast(muted, surface)) >= 4.5 { muted } else { ink };
+    let border = theme.bg.lerp_to_gamma(ink, 0.18);
+    let focus = if contrast(theme.cursor, input) >= 3.0 { theme.cursor } else { ink };
+    visuals.panel_fill = panel;
+    visuals.window_fill = surface;
+    visuals.window_stroke = Stroke::new(1.0, border);
+    visuals.extreme_bg_color = input;
+    visuals.faint_bg_color = theme.bg;
+    visuals.code_bg_color = input;
+    visuals.selection.bg_fill = selected;
+    visuals.selection.stroke = Stroke::new(1.0, ink);
+    visuals.hyperlink_color = focus;
+    visuals.weak_text_color = Some(muted);
     visuals.window_corner_radius = CornerRadius::same(6);
     visuals.menu_corner_radius = CornerRadius::same(4);
 
     let radius = CornerRadius::same(4);
     let w = &mut visuals.widgets;
-    w.noninteractive.bg_fill = BG_PANEL;
-    w.noninteractive.weak_bg_fill = BG_PANEL;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-    w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    w.noninteractive.bg_fill = surface;
+    w.noninteractive.weak_bg_fill = surface;
+    w.noninteractive.bg_stroke = Stroke::new(1.0, border);
+    w.noninteractive.fg_stroke = Stroke::new(1.0, ink);
     w.noninteractive.corner_radius = radius;
 
-    w.inactive.bg_fill = BG_INPUT;
-    w.inactive.weak_bg_fill = BG_INPUT;
-    w.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-    w.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    w.inactive.bg_fill = input;
+    w.inactive.weak_bg_fill = input;
+    w.inactive.bg_stroke = Stroke::new(1.0, border);
+    w.inactive.fg_stroke = Stroke::new(1.0, ink);
     w.inactive.corner_radius = radius;
 
-    w.hovered.bg_fill = lighter(BG_INPUT, 1.3);
-    w.hovered.weak_bg_fill = lighter(BG_INPUT, 1.3);
-    w.hovered.bg_stroke = Stroke::new(1.0, lighter(BORDER, 1.4));
-    w.hovered.fg_stroke = Stroke::new(1.5, TEXT_PRIMARY);
+    w.hovered.bg_fill = hover;
+    w.hovered.weak_bg_fill = hover;
+    w.hovered.bg_stroke = Stroke::new(1.0, focus);
+    w.hovered.fg_stroke = Stroke::new(1.0, ink);
     w.hovered.corner_radius = radius;
 
-    w.active.bg_fill = BG_WINDOW;
-    w.active.weak_bg_fill = BG_WINDOW;
-    w.active.bg_stroke = Stroke::new(1.0, accent);
-    w.active.fg_stroke = Stroke::new(1.5, TEXT_PRIMARY);
+    w.active.bg_fill = selected;
+    w.active.weak_bg_fill = selected;
+    w.active.bg_stroke = Stroke::new(1.0, focus);
+    w.active.fg_stroke = Stroke::new(1.0, ink);
     w.active.corner_radius = radius;
 
-    w.open.bg_fill = BG_INPUT;
-    w.open.weak_bg_fill = BG_INPUT;
-    w.open.bg_stroke = Stroke::new(1.0, accent);
-    w.open.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    w.open.bg_fill = hover;
+    w.open.weak_bg_fill = hover;
+    w.open.bg_stroke = Stroke::new(1.0, focus);
+    w.open.fg_stroke = Stroke::new(1.0, ink);
     w.open.corner_radius = radius;
 
     ctx.set_visuals(visuals);
     ctx.global_style_mut(|style| {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(10.0, 4.0);
-        style.spacing.interact_size.y = 24.0;
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.interact_size.y = 26.0;
         style.spacing.combo_width = 160.0;
         style.text_styles = egui::Style::default().text_styles;
+        for text in [egui::TextStyle::Body, egui::TextStyle::Button] {
+            style.text_styles.insert(text, egui::FontId::proportional(14.0));
+        }
+        style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
     });
-}
-
-pub fn apply_theme(ctx: &egui::Context, theme: Theme) {
-    apply(ctx, theme.cursor);
     let appearance = theme.effects.appearance();
     if appearance == AppAppearance::Standard {
         return;
@@ -208,6 +226,18 @@ pub fn monitor<R>(ui: &mut egui::Ui, theme: Theme, draw: impl FnOnce(&mut egui::
     let rect = outer.response.rect;
     let painter = ui.painter();
     let y = rect.bottom() - 15.0;
+    let label_width =
+        ui.fonts_mut(|f| f.layout_no_wrap(label.into(), egui::FontId::monospace(10.0), theme.fg).size().x);
+    let label = if label_width <= rect.width() - 96.0 {
+        label
+    } else {
+        match appearance {
+            AppAppearance::EInk => "E-INK",
+            AppAppearance::Blueprint => "BLUEPRINT",
+            AppAppearance::Amber => "AMBER",
+            _ => "CRT",
+        }
+    };
     painter.text(
         egui::pos2(rect.center().x, y),
         egui::Align2::CENTER_CENTER,
@@ -245,10 +275,11 @@ pub fn monitor<R>(ui: &mut egui::Ui, theme: Theme, draw: impl FnOnce(&mut egui::
     outer.inner
 }
 
-/// The accent-filled Connect button.
-pub fn accent_button(text: &str, accent: Color32) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(text.to_string()).color(text_on(accent)).strong())
-        .fill(accent)
+/// A single high-contrast action; colour stays on data and selection lines.
+pub fn primary_button(ui: &egui::Ui, text: &str) -> egui::Button<'static> {
+    let fill = primary(ui);
+    egui::Button::new(egui::RichText::new(text.to_string()).color(text_on(fill)).strong())
+        .fill(fill)
         .stroke(Stroke::NONE)
         .min_size(egui::vec2(0.0, 30.0))
 }
@@ -264,6 +295,8 @@ pub fn accent_pill(text: &str, accent: Color32) -> egui::Button<'static> {
 /// A tab-strip button: plain text, underlined in the accent color when
 /// selected, greyed out when disabled.
 pub fn tab_button(ui: &mut egui::Ui, text: &str, selected: bool, enabled: bool, accent: Color32) -> egui::Response {
+    // Reserve the fill before the button paints its label.
+    let background = ui.painter().add(egui::Shape::Noop);
     let color = if !enabled {
         lighter(secondary(ui), 0.6)
     } else if selected {
@@ -275,11 +308,23 @@ pub fn tab_button(ui: &mut egui::Ui, text: &str, selected: bool, enabled: bool, 
     let response = ui.add_enabled(enabled, egui::Button::new(label).frame(false).min_size(egui::vec2(0.0, 26.0)));
     if selected {
         let rect = response.rect;
-        ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(2.0, accent));
+        ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, accent));
     } else if enabled && response.hovered() {
-        ui.painter().rect_filled(response.rect, 3.0, Color32::from_white_alpha(8));
+        ui.painter()
+            .set(background, egui::Shape::rect_filled(response.rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill));
     }
     response
+}
+
+pub fn wordmark(ui: &mut egui::Ui, accent: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+    let points = [(15.0, 3.0), (4.0, 3.0), (4.0, 9.0), (14.0, 9.0), (14.0, 15.0), (2.0, 15.0)];
+    ui.painter().add(egui::Shape::line(
+        points.into_iter().map(|(x, y)| rect.min + egui::vec2(x, y)).collect(),
+        Stroke::new(1.5, accent),
+    ));
+    ui.label(egui::RichText::new("Snekkie").size(16.0).strong());
+    ui.add_space(8.0);
 }
 
 /// A small grey section heading with a rule under it.
@@ -313,6 +358,63 @@ mod tests {
     #[test]
     fn contrast_text() {
         assert_eq!(text_on(Color32::from_rgb(0x3a, 0xd9, 0x00)), Color32::from_rgb(0x10, 0x11, 0x10));
-        assert_eq!(text_on(Color32::from_rgb(0x26, 0x8b, 0xd2)), Color32::from_rgb(0xf5, 0xf5, 0xf3));
+        for (_, colors) in crate::settings::THEMES {
+            let accent = crate::settings::parse_hex(colors[2]).unwrap();
+            assert!(contrast(accent, text_on(accent)) >= 4.5, "{accent:?}");
+        }
+    }
+
+    #[test]
+    fn standard_chrome_follows_each_palette_and_keeps_controls_readable() {
+        let ctx = egui::Context::default();
+        for (name, _) in crate::settings::THEMES {
+            let theme = crate::settings::AppSettings { theme: name.into(), ..Default::default() }.colors();
+            apply_theme(&ctx, theme);
+            if theme.effects.is_super() {
+                continue;
+            }
+            let style = ctx.global_style();
+            let v = &style.visuals;
+            assert_eq!(v.dark_mode, luminance(theme.bg) < luminance(theme.fg), "{name}");
+            for bg in [
+                v.panel_fill,
+                v.window_fill,
+                v.extreme_bg_color,
+                v.selection.bg_fill,
+                v.widgets.hovered.bg_fill,
+                v.widgets.active.bg_fill,
+            ] {
+                assert!(contrast(v.text_color(), bg) >= 4.5, "{name}: primary on {bg:?}");
+            }
+            for bg in [v.panel_fill, v.window_fill, v.extreme_bg_color] {
+                assert!(contrast(v.weak_text_color(), bg) >= 4.5, "{name}: secondary on {bg:?}");
+            }
+            assert!(contrast(v.selection.stroke.color, v.selection.bg_fill) >= 4.5, "{name}: selected");
+            assert!(contrast(v.hyperlink_color, v.extreme_bg_color) >= 3.0, "{name}: focus");
+        }
+        apply_theme(&ctx, Theme::default());
+        assert!(ctx.global_style().visuals.dark_mode);
+        assert!(ctx.global_style().visuals.override_text_color.is_none());
+    }
+
+    #[test]
+    fn narrow_monitor_labels_fit_between_the_bezel_controls() {
+        for name in ["CRT Super", "E-Ink Super", "Blueprint Super", "Amber Super"] {
+            let ctx = egui::Context::default();
+            let theme = crate::settings::AppSettings { theme: name.into(), ..Default::default() }.colors();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                monitor(ui, theme, |ui| ui.allocate_exact_size(egui::vec2(100.0, 80.0), egui::Sense::hover()));
+            });
+            output.textures_delta.clear();
+            let label = output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(text) => Some(text),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(label.galley.size().x <= 64.0, "{name}: {:?}", label.galley.text());
+        }
     }
 }

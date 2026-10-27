@@ -45,6 +45,10 @@ fn report_startup_error(message: &str) {
 }
 
 fn main() -> std::process::ExitCode {
+    // An agent starting the MCP bridge: no window, and no claim to be the running app.
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "--mcp") {
+        return snekkie::mcp::bridge(&config::config_dir().join(snekkie::mcp::FILE_NAME));
+    }
     announce_running();
     // Before anything reads config: the app used to store it elsewhere.
     config::migrate_legacy_config(&config::config_dir());

@@ -21,7 +21,7 @@ pub const DEFAULT_THEME: &str = "Snekkie Dark";
 
 /// Built-in presets: foreground, background, cursor, selection.
 pub const THEMES: [(&str, [&str; 4]); 21] = [
-    ("Snekkie Dark", ["#d0d0d0", "#1a1a1a", "#3ad900", "#3a5a80"]),
+    ("Snekkie Dark", ["#e1e4df", "#151716", "#9bc88a", "#334436"]),
     ("Solarized Dark", ["#93a1a1", "#002b36", "#268bd2", "#073642"]),
     ("Solarized Light", ["#52676f", "#fdf6e3", "#268bd2", "#eee8d5"]),
     ("Monokai", ["#f8f8f2", "#272822", "#a6e22e", "#49483e"]),
@@ -38,10 +38,10 @@ pub const THEMES: [(&str, [&str; 4]); 21] = [
     ("Ocean", ["#c7ece8", "#0c242b", "#5de0c7", "#24535d"]),
     ("Purple Haze", ["#e8dcf5", "#21182d", "#c19aff", "#4b3665"]),
     ("Soft Grey", ["#dddddd", "#242424", "#f0f0f0", "#505050"]),
-    ("Paper Light", ["#303642", "#f5f2e9", "#356d92", "#c9dce8"]),
-    ("Frost Light", ["#26364a", "#eff5fb", "#245c98", "#c3d7ec"]),
-    ("Copper Night", ["#f3dfcb", "#211812", "#eeac76", "#59402c"]),
-    ("Forest Night", ["#d8eadc", "#111f19", "#84d6a5", "#304f3c"]),
+    ("Paper Light", ["#30372f", "#f3f3ed", "#496b49", "#d6dfcf"]),
+    ("Frost Light", ["#293b44", "#f0f5f5", "#236d7b", "#c9dfe2"]),
+    ("Copper Night", ["#eee2d6", "#1c1a18", "#d5a57e", "#4b3b30"]),
+    ("Forest Night", ["#dce8dd", "#171d19", "#94c6a3", "#33493a"]),
 ];
 
 /// Themes that have been renamed. A settings.json written before the app
@@ -244,6 +244,12 @@ pub struct AppSettings {
     /// No update requests; ask before DNS and non-local connections.
     #[serde(deserialize_with = "lenient")]
     pub offline_mode: bool,
+    /// Let AI agents on this computer use open sessions over MCP.
+    #[serde(deserialize_with = "lenient")]
+    pub agent_access: bool,
+    /// Glow, sweep and pulse while an agent reads or types; off holds the cues steady.
+    #[serde(deserialize_with = "lenient_right_click_paste")]
+    pub agent_animations: bool,
     /// Automatically press Space at paging prompts during show commands.
     #[serde(deserialize_with = "lenient")]
     pub auto_paging: bool,
@@ -266,10 +272,10 @@ impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
             theme: DEFAULT_THEME.into(),
-            custom_fg: "#d0d0d0".into(),
-            custom_bg: "#1a1a1a".into(),
-            custom_cursor: "#3ad900".into(),
-            custom_selection: "#3a5a80".into(),
+            custom_fg: "#e1e4df".into(),
+            custom_bg: "#151716".into(),
+            custom_cursor: "#9bc88a".into(),
+            custom_selection: "#334436".into(),
             custom_effects: ThemeEffects::default(),
             saved_themes: BTreeMap::new(),
             font_family: String::new(),
@@ -278,6 +284,8 @@ impl Default for AppSettings {
             show_sidebar: true,
             check_for_updates: true,
             offline_mode: false,
+            agent_access: false,
+            agent_animations: true,
             auto_paging: false,
             right_click_paste: true,
             preview_multiline_paste: true,

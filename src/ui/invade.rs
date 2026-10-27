@@ -20,10 +20,9 @@ use crate::invade::run::{
 };
 use crate::invade::upgrades::{Card, Stats, weapon_details};
 use crate::invade::{
-    EncounterKind, EndReason, Event as GameEvent, Input, InvadeRun, Loadout, Phase, ProgressStore, Rig, StarterModule,
-    Unlock, WeaponKind,
+    EncounterKind, EndReason, Event as GameEvent, Input, InvadeRun, Loadout, Phase, PivotKind, ProgressStore, Rig,
+    StarterModule, Unlock, WeaponKind,
 };
-use crate::settings::Theme;
 
 mod sprites;
 
@@ -33,7 +32,9 @@ pub const MIN_VIEWPORT: Vec2 = vec2(640.0, 400.0);
 const COLUMNS: f32 = ARENA_W + 2.0;
 const ROWS: f32 = ARENA_H + 7.0;
 const ARENA_TOP_ROW: f32 = 4.0;
-const DETAIL: f32 = 4.0;
+const DETAIL: f32 = 8.0;
+/// One fine glyph's width and height, in simulation cells.
+const GLYPH: f32 = 1.0 / DETAIL;
 /// At most this much game time is caught up after a slow frame.
 const MAX_CATCH_UP: u32 = 12;
 const NOTICE_SECONDS: f64 = 4.0;
@@ -55,6 +56,7 @@ struct Held {
     w: bool,
     down_arrow: bool,
     s: bool,
+    /// Suppress held Space across tab switches and menu transitions.
     space: bool,
 }
 
@@ -91,7 +93,6 @@ impl Held {
 
 /// What the app tells the game about this frame.
 pub struct InvadeOptions {
-    pub theme: Theme,
     /// False while an app menu, dialog or other window is in front.
     pub interactive: bool,
 }
@@ -119,6 +120,7 @@ pub struct InvadeTab {
     base_devices: u64,
     next_rig: Rig,
     loadout: Loadout,
+    pivot_kind: PivotKind,
     selecting_loadout: bool,
     has_started_run: bool,
     setup_armed: bool,
@@ -156,8 +158,7 @@ impl InvadeTab {
         InvadeTab::with_store(ProgressStore::open(path), seed)
     }
 
-    /// Choose a loadout with a store already in memory: one kept from an
-    /// earlier Invade tab, with anything that could not be saved yet.
+    /// Choose a loadout with a store already in memory.
     pub fn with_store(store: ProgressStore, seed: u64) -> InvadeTab {
         let rig = store.progress.selected_rig();
         let mut tab = InvadeTab {
@@ -166,6 +167,7 @@ impl InvadeTab {
             base_devices: 0,
             next_rig: rig,
             loadout: Loadout { rig, ..Loadout::default() },
+            pivot_kind: PivotKind::Chain,
             selecting_loadout: true,
             has_started_run: false,
             setup_armed: false,
@@ -199,11 +201,6 @@ impl InvadeTab {
         &self.store.path
     }
 
-    /// The store, kept by the app after the tab closes.
-    pub fn into_store(self) -> ProgressStore {
-        self.store
-    }
-
     /// Why the latest save failed, if it did. The game shows this itself
     /// while it is open; the app reports it when the tab closes.
     pub fn save_warning(&self) -> Option<String> {
@@ -218,7 +215,7 @@ impl InvadeTab {
         }
     }
 
-    /// Still playable: closing it records the run.
+    /// Still playable: closing Snekkie records the run.
     pub fn unfinished(&self) -> bool {
         self.has_started_run && self.run.is_unfinished()
     }
@@ -227,7 +224,7 @@ impl InvadeTab {
         self.selecting_loadout
     }
 
-    /// Movement and fire keys held right now, so the app can keep them
+    /// Movement and Space keys held right now, so the app can keep them
     /// from reaching a terminal after a tab switch.
     pub fn held_keys(&self) -> Vec<Key> {
         self.held.keys()
@@ -363,6 +360,7 @@ impl InvadeTab {
         self.base_devices = self.store.progress.devices_compromised;
         let unlocks: Vec<Unlock> = self.store.progress.unlocks().collect();
         self.run = InvadeRun::new_with_loadout(self.seed, self.loadout, unlocks, self.base_devices);
+        self.run.set_pivot_kind(self.pivot_kind);
         self.selecting_loadout = false;
         self.has_started_run = true;
         self.choice_visible = false;
@@ -405,6 +403,9 @@ impl InvadeTab {
     fn process_events(&mut self) {
         for event in self.run.take_events() {
             match event {
+                GameEvent::ItemCollected(item) => {
+                    self.pending_notices.push(format!("{} acquired — B: inspect items", item.name()));
+                }
                 GameEvent::Unlocked(unlock) => {
                     self.store.progress.unlocked.insert(unlock.id().into());
                     self.pending_notices.push(format!("UNLOCKED  {}", unlock.name()));
@@ -434,6 +435,17 @@ impl InvadeTab {
     // -- the frame -------------------------------------------------------
 
     pub fn ui(&mut self, ui: &mut Ui, options: &InvadeOptions) -> Option<InvadeAction> {
+        let palette = Palette::new();
+        ui.scope(|ui| {
+            // Keep game controls and fonts independent of the app's theme.
+            *ui.visuals_mut() = palette.visuals();
+            ui.style_mut().text_styles = egui::Style::default().text_styles;
+            self.show(ui, options, &palette)
+        })
+        .inner
+    }
+
+    fn show(&mut self, ui: &mut Ui, options: &InvadeOptions, palette: &Palette) -> Option<InvadeAction> {
         let now = ui.input(|i| i.time);
         let rect = ui.available_rect_before_wrap();
         ui.allocate_rect(rect, Sense::hover());
@@ -521,7 +533,7 @@ impl InvadeTab {
                     turn_right: self.held.right(),
                     thrust: self.held.up(),
                     brake: self.held.down(),
-                    fire: self.held.space,
+                    fire: true,
                     special: self.special && !stepped,
                     mobility: self.mobility && !stepped,
                     aim: None,
@@ -559,14 +571,13 @@ impl InvadeTab {
         }
         self.notices.retain(|(_, until)| *until > now);
 
-        let palette = Palette::new(options.theme);
         let layout = Layout::fit(ui, rect);
         ui.painter().rect_filled(rect, 0.0, palette.bg);
-        self.draw(ui, &layout, &palette, now);
+        self.draw(ui, &layout, palette, now);
         if self.has_started_run && self.overlay.is_none() && !too_small && self.run.is_advancing() {
-            self.hud_buttons(ui, &layout, &palette);
+            self.hud_buttons(ui, &layout, palette);
         }
-        let overlay_action = self.overlays(ui, rect, &layout, &palette, too_small, options.interactive);
+        let overlay_action = self.overlays(ui, rect, &layout, palette, too_small, options.interactive);
         action = action.or(overlay_action);
 
         if self.running() {
@@ -631,7 +642,7 @@ impl InvadeTab {
                         && !self.selecting_loadout
                         && overlay.is_none()
                         && matches!(phase, Phase::Combat | Phase::Intermission { .. });
-                    // Held fire must never activate a newly focused menu
+                    // Held Space must never activate a newly focused menu
                     // control. A fresh Space press still works like Enter.
                     if game_focused && !playing && *key == Key::Space && *pressed && *repeat {
                         return false;
@@ -803,13 +814,13 @@ impl InvadeTab {
             palette.experience,
         );
 
-        // The world has four small ASCII glyphs per logical cell in each
+        // The world has eight small ASCII glyphs per logical cell in each
         // direction; the HUD and controls keep their readable font.
         let rule = format!("+{}+", "-".repeat((ARENA_W * DETAIL) as usize));
-        layout.detail_text(&painter, -0.25, -0.25, &rule, palette.dim);
-        layout.detail_text(&painter, -0.25, ARENA_H, &rule, palette.dim);
+        layout.detail_text(&painter, -GLYPH, -GLYPH, &rule, palette.dim);
+        layout.detail_text(&painter, -GLYPH, ARENA_H, &rule, palette.dim);
         for row in 0..(ARENA_H * DETAIL) as usize {
-            layout.detail_text(&painter, -0.25, row as f32 / DETAIL, "|", palette.dim);
+            layout.detail_text(&painter, -GLYPH, row as f32 / DETAIL, "|", palette.dim);
             layout.detail_text(&painter, ARENA_W, row as f32 / DETAIL, "|", palette.dim);
         }
         for (row, footer) in control_footer(run.rig()).lines().enumerate() {
@@ -881,30 +892,50 @@ impl InvadeTab {
                 && orb.y >= camera.1 - 1.0
                 && orb.y <= camera.1 + ARENA_H + 1.0
         }) {
-            put(orb.x - 0.25, orb.y - 0.125, "<>", palette.experience);
+            put(orb.x - GLYPH, orb.y - GLYPH / 2.0, "<>", palette.experience);
         }
 
         // Warnings first, so everything else draws over them.
+        for drop in run.item_drops() {
+            put(drop.x - 1.5 * GLYPH, drop.y - GLYPH / 2.0, "[+]", palette.experience);
+            world_label(drop.x, drop.y - 0.7, drop.kind.name(), palette.experience);
+            let at = layout.at(drop.x - camera.0, drop.y - camera.1);
+            ui.interact(
+                Rect::from_center_size(at, vec2(layout.cell.x * 3.0, layout.cell.y * 2.0)),
+                Id::new(("invade_item", drop.kind)),
+                Sense::hover(),
+            )
+            .on_hover_text(format!(
+                "{}\n{}\nFly over [+] to collect for this run.",
+                drop.kind.name(),
+                drop.kind.description()
+            ));
+        }
         for scan in run.scans() {
             let left = scan.x - SCAN_WIDTH / 2.0;
             let top = scan.top.max(camera.1);
             let bottom = scan.bottom.min(camera.1 + ARENA_H);
             let rows = ((top * DETAIL).floor() as i32)..((bottom * DETAIL).ceil() as i32);
+            let width = (SCAN_WIDTH * DETAIL) as usize;
             if scan.warn > 0.0 {
-                for row in rows.step_by(4) {
-                    put(left, row as f32 / DETAIL, ":          :", palette.warning);
+                let edge = format!(":{}:", " ".repeat(width - 2));
+                for row in rows.step_by(DETAIL as usize) {
+                    put(left, row as f32 / DETAIL, &edge, palette.warning);
                 }
             } else {
+                let beam = "|".repeat(width);
                 for row in rows {
-                    put(left, row as f32 / DETAIL, "||||||||||||", palette.danger);
+                    put(left, row as f32 / DETAIL, &beam, palette.danger);
                 }
             }
         }
         for mark in run.marks() {
             if mark.is_shot() {
-                put(mark.x - 0.125, mark.y - 0.125, "+", palette.warning);
+                put(mark.x - GLYPH / 2.0, mark.y - GLYPH / 2.0, "+", palette.warning);
             } else {
-                put(mark.x - 2.5, mark.y - 0.125, ">        !!        <", palette.warning);
+                // Brackets five cells across, whatever the glyph size.
+                let gap = " ".repeat((2.5 * DETAIL) as usize - 2);
+                put(mark.x - 2.5, mark.y - GLYPH / 2.0, &format!(">{gap}!!{gap}<"), palette.warning);
             }
         }
         for curtain in run.curtains() {
@@ -920,13 +951,15 @@ impl InvadeTab {
                 palette.warning
             } else if enemy.telegraphing && device {
                 palette.danger
+            } else if enemy.elite {
+                palette.experience
             } else {
                 palette.fg
             };
             if enemy.telegraphing {
                 // Above the ship when there is room, otherwise just below it.
                 let row = if enemy.y - camera.1 >= 1.0 { enemy.y - 1.0 } else { enemy.y + enemy.h };
-                put(enemy.x + enemy.w / 2.0 - 0.125, row, "!", palette.danger);
+                put(enemy.x + enemy.w / 2.0 - GLYPH / 2.0, row, "!", palette.danger);
             }
             match enemy.role {
                 Role::Device(kind) => {
@@ -973,16 +1006,51 @@ impl InvadeTab {
                 ShotKind::Primary | ShotKind::Fork => direction_glyph(shot.vx, shot.vy * ASPECT),
                 ShotKind::Fragment => "~",
                 ShotKind::Pivot => "@",
+                ShotKind::Missile => "=>",
+                ShotKind::Flame => "^",
+                ShotKind::Reflected => "+",
             };
-            put(shot.x - 0.125, shot.y - 0.125, glyph, palette.friendly);
+            let base_radius = if shot.kind == ShotKind::Missile { 0.45 } else { 0.15 };
+            let mut font = layout.bullet_font.clone();
+            font.size *= shot.radius / base_radius;
+            arena.text(
+                layout.at(shot.x - camera.0, shot.y - camera.1),
+                Align2::CENTER_CENTER,
+                glyph,
+                font,
+                if shot.kind == ShotKind::Flame { palette.warning } else { palette.friendly },
+            );
         }
         for orbital in run.orbitals() {
-            put(orbital.x - 0.125, orbital.y - 0.125, "O", palette.friendly);
+            if orbital.shield {
+                for point in 0..16 {
+                    let a = point as f32 / 16.0 * std::f32::consts::TAU;
+                    put(
+                        orbital.x + a.cos() * orbital.size - GLYPH / 2.0,
+                        orbital.y + a.sin() * orbital.size / ASPECT - GLYPH / 2.0,
+                        ":",
+                        palette.friendly,
+                    );
+                }
+            } else {
+                let mut font = layout.bullet_font.clone();
+                font.size *= orbital.size / 0.3;
+                arena.text(
+                    layout.at(orbital.x - camera.0, orbital.y - camera.1),
+                    Align2::CENTER_CENTER,
+                    "O",
+                    font,
+                    palette.friendly,
+                );
+            }
         }
         for hostile in run.hostiles() {
-            let glyph = hostile.kind.glyph().to_string();
+            let glyph =
+                if hostile.unblockable && hostile.kind != HostileKind::Stream { '#' } else { hostile.kind.glyph() }
+                    .to_string();
             let color = if hostile.kind == HostileKind::Aimed { palette.warning } else { palette.danger };
-            put(hostile.x - 0.125, hostile.y - 0.125, &glyph, color);
+            let at = layout.at(hostile.x - camera.0, hostile.y - camera.1);
+            arena.text(at, Align2::CENTER_CENTER, glyph, layout.bullet_font.clone(), color);
         }
 
         // Effects, kept small, and only while things move.
@@ -998,31 +1066,31 @@ impl InvadeTab {
                     } else {
                         " . "
                     };
-                    put(effect.x - 0.375, effect.y - 0.125, glyph, palette.warning);
+                    put(effect.x - 1.5 * GLYPH, effect.y - GLYPH / 2.0, glyph, palette.warning);
                 }
-                EffectKind::Spark => put(effect.x - 0.125, effect.y - 0.125, "'", palette.friendly),
+                EffectKind::Spark => put(effect.x - GLYPH / 2.0, effect.y - GLYPH / 2.0, "'", palette.friendly),
                 EffectKind::Chain => {
                     let (dx, dy) = (effect.to.0 - effect.x, effect.to.1 - effect.y);
                     let steps = ((dx.abs()).max(dy.abs() * ASPECT) / 0.75).ceil().max(1.0) as usize;
                     for i in 0..=steps {
                         let t = i as f32 / steps as f32;
                         put(
-                            effect.x + dx * t - 0.125,
-                            effect.y + dy * t - 0.125,
+                            effect.x + dx * t - GLYPH / 2.0,
+                            effect.y + dy * t - GLYPH / 2.0,
                             if i == steps { "*" } else { "." },
                             palette.friendly,
                         );
                     }
                 }
-                EffectKind::Absorb => put(effect.x - 0.875, effect.y - 0.125, "(     )", palette.friendly),
-                EffectKind::Damage => put(effect.x - 0.625, effect.y - 0.125, "## ##", palette.danger),
+                EffectKind::Absorb => put(effect.x - 3.5 * GLYPH, effect.y - GLYPH / 2.0, "(     )", palette.friendly),
+                EffectKind::Damage => put(effect.x - 2.5 * GLYPH, effect.y - GLYPH / 2.0, "## ##", palette.danger),
                 EffectKind::Pulse => {
                     let color = palette.friendly.gamma_multiply(1.0 - age * 0.75);
                     for point in 0..72 {
                         let angle = point as f32 / 72.0 * std::f32::consts::TAU;
                         put(
-                            effect.x + angle.cos() * effect.radius - 0.125,
-                            effect.y + angle.sin() * effect.radius / ASPECT - 0.125,
+                            effect.x + angle.cos() * effect.radius - GLYPH / 2.0,
+                            effect.y + angle.sin() * effect.radius / ASPECT - GLYPH / 2.0,
                             ":",
                             color,
                         );
@@ -1058,7 +1126,7 @@ impl InvadeTab {
             } else {
                 format!(":{}:", " ".repeat((width * DETAIL) as usize))
             };
-            put(player.x - width / 2.0 - 0.25, player.y - 0.25, &shield, palette.friendly);
+            put(player.x - width / 2.0 - GLYPH, player.y - GLYPH, &shield, palette.friendly);
         }
 
         // Miniboss or boss health.
@@ -1161,8 +1229,6 @@ impl InvadeTab {
         let panel = Rect::from_min_size(pos2(area.center().x - width / 2.0, top), vec2(width, height));
         let mut action = None;
         let mut child = ui.new_child(UiBuilder::new().max_rect(panel).id_salt("invade_overlay"));
-        let overlay_visuals = palette.overlay_visuals(child.visuals());
-        *child.visuals_mut() = overlay_visuals;
         if !interactive {
             child.disable();
         }
@@ -1214,7 +1280,7 @@ impl InvadeTab {
             MIN_VIEWPORT.x as u32, MIN_VIEWPORT.y as u32
         ));
         ui.add_space(6.0);
-        let close = ui.button("Close Invade").on_hover_text("End and record this run");
+        let close = ui.button("Close Invade").on_hover_text("Close the tab; reopening resumes this run");
         self.focus_first(&close);
         if close.clicked() {
             return Some(InvadeAction::Close);
@@ -1270,6 +1336,20 @@ impl InvadeTab {
             }
         });
         ui.label(self.loadout.weapon.summary());
+        if self.loadout.rig == Rig::Probe {
+            ui.separator();
+            ui.label(RichText::new("Pivot weapon").strong());
+            ui.horizontal_wrapped(|ui| {
+                for kind in PivotKind::ALL {
+                    let radio = ui.radio(self.pivot_kind == kind, kind.name());
+                    self.overlay_controls.push(radio.id);
+                    if radio.clicked() {
+                        self.pivot_kind = kind;
+                    }
+                }
+            });
+            ui.label(self.pivot_kind.description());
+        }
         ui.separator();
         ui.label(RichText::new("Starter module").strong());
         ui.horizontal_wrapped(|ui| {
@@ -1306,7 +1386,7 @@ impl InvadeTab {
                 self.overlay = Some(Overlay::ConfirmRestart);
                 self.focus_overlay = true;
             }
-            let close = ui.button("Close Invade").on_hover_text("End and record this run");
+            let close = ui.button("Close Invade").on_hover_text("Close the tab; reopening resumes this run");
             self.overlay_controls.push(close.id);
             if close.clicked() {
                 action = Some(InvadeAction::Close);
@@ -1352,7 +1432,7 @@ impl InvadeTab {
                 ("A/D or Left/Right", "Turn the ship's nose".to_string()),
                 ("W or Up", "Thrust along the nose; release to coast".to_string()),
                 ("S or Down", "Brake without reversing (overrides thrust)".to_string()),
-                ("Hold Space", "Fire at the nearest visible device".to_string()),
+                ("Automatic fire", "Weapons fire continuously; aim tracks the nearest visible device".to_string()),
                 ("Shift", format!("{} along the nose", rig.mobility_name())),
                 ("X", format!("{} (special)", rig.special_name())),
                 ("Esc or P", "Pause".to_string()),
@@ -1408,6 +1488,12 @@ impl InvadeTab {
         let run = &self.run;
         ui.label(format!("{} · {}", run.rig().name(), run.rig().summary()));
         ui.label(RichText::new("Weapons").strong());
+        if run.rig() == Rig::Probe {
+            ui.label(format!("{}: {}", run.pivot_kind().name(), run.pivot_kind().description()));
+        }
+        for item in run.items() {
+            ui.label(format!("{}: {}", item.name(), item.description()));
+        }
         for weapon in run.weapons() {
             ui.label(format!(
                 "{} — rank {} of {}: {}",
@@ -1422,6 +1508,18 @@ impl InvadeTab {
         ui.separator();
         egui::Grid::new("invade_stats").num_columns(2).spacing(vec2(12.0, 2.0)).show(ui, |ui| {
             for (name, value) in stat_lines(run.rig(), s) {
+                let (name, value) = if name == "Pivot" && run.pivot_kind() == PivotKind::Missile {
+                    (
+                        "Missile Pivot",
+                        format!(
+                            "{:.0} splash damage, {:.0} radius",
+                            s.pivot_direct * 2.0,
+                            8.0 + f32::from(s.pivot_jumps.saturating_sub(3))
+                        ),
+                    )
+                } else {
+                    (name, value)
+                };
                 ui.label(name);
                 ui.label(RichText::new(value).monospace());
                 ui.end_row();
@@ -1665,7 +1763,7 @@ fn direction_glyph(dx: f32, dy: f32) -> &'static str {
 fn control_footer(rig: Rig) -> String {
     format!(
         "[A/D or Left/Right] Turn [W/Up] Thrust [S/Down] Brake - release to coast\n\
-         [Space] Auto-fire [Shift] {} [X] {} [Esc/P] Pause [B] Build",
+         Auto-fire: always on [Shift] {} [X] {} [Esc/P] Pause [B] Build",
         rig.mobility_name(),
         rig.special_name()
     )
@@ -1690,19 +1788,19 @@ fn draw_flight_markers(
 ) {
     let edge = flight_marker_distance(size, nose);
     put(
-        center.0 + nose.0 * (edge + 0.5) - 0.125,
-        center.1 + nose.1 * (edge + 0.5) / ASPECT - 0.125,
+        center.0 + nose.0 * (edge + 0.5) - GLYPH / 2.0,
+        center.1 + nose.1 * (edge + 0.5) / ASPECT - GLYPH / 2.0,
         direction_glyph(nose.0, nose.1),
         color,
     );
     if thrusting {
         for i in 0..3 {
             let rear = edge + 0.5 + i as f32 * 0.4;
-            put(center.0 - nose.0 * rear - 0.125, center.1 - nose.1 * rear / ASPECT - 0.125, ":", color);
+            put(center.0 - nose.0 * rear - GLYPH / 2.0, center.1 - nose.1 * rear / ASPECT - GLYPH / 2.0, ":", color);
         }
     } else if braking {
         let rear = edge + 0.5;
-        put(center.0 - nose.0 * rear - 0.125, center.1 - nose.1 * rear / ASPECT - 0.125, "=", color);
+        put(center.0 - nose.0 * rear - GLYPH / 2.0, center.1 - nose.1 * rear / ASPECT - GLYPH / 2.0, "=", color);
     }
 }
 
@@ -1730,6 +1828,8 @@ fn weapon_summary(run: &InvadeRun) -> String {
                 WeaponKind::Arc => "ARC",
                 WeaponKind::Orbit => "ORB",
                 WeaponKind::Pulse => "PLS",
+                WeaponKind::Flamethrower => "FLM",
+                WeaponKind::Shield => "SHLD",
             };
             format!("{glyph}{}", weapon.rank)
         })
@@ -1739,7 +1839,11 @@ fn weapon_summary(run: &InvadeRun) -> String {
 
 fn special_meter(run: &InvadeRun, stats: &Stats) -> String {
     let player = run.player();
-    let name = run.rig().special_name().to_uppercase();
+    let name = if run.rig() == Rig::Probe && run.pivot_kind() == PivotKind::Missile {
+        "MISSILE".into()
+    } else {
+        run.rig().special_name().to_uppercase()
+    };
     let filled = if player.charges >= stats.max_charges {
         10
     } else {
@@ -1839,6 +1943,8 @@ struct Layout {
     cell: Vec2,
     font: FontId,
     detail_font: FontId,
+    /// Projectiles use larger glyphs than the fine art so they stay visible.
+    bullet_font: FontId,
 }
 
 impl Layout {
@@ -1848,6 +1954,7 @@ impl Layout {
         let size = (16.0 * rect.width() / COLUMNS / glyph).min(16.0 * rect.height() / ROWS / row).clamp(4.0, 28.0);
         let font = FontId::monospace(size);
         let detail_font = FontId::monospace(size / DETAIL);
+        let bullet_font = FontId::monospace(size / 2.0);
         let (glyph, row) = ui.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
         let cell = vec2(glyph.max(1.0), row.max(1.0));
         let size = vec2(cell.x * COLUMNS, cell.y * ROWS);
@@ -1857,7 +1964,7 @@ impl Layout {
             pos2(min.x + cell.x, min.y + cell.y * ARENA_TOP_ROW),
             vec2(cell.x * ARENA_W, cell.y * ARENA_H),
         );
-        Layout { grid, arena, cell, font, detail_font }
+        Layout { grid, arena, cell, font, detail_font, bullet_font }
     }
 
     /// A grid cell, counting the border.
@@ -1883,8 +1990,7 @@ impl Layout {
     }
 }
 
-/// The selected theme's colors, with readable accents for danger,
-/// warnings and the player's own ship and packets.
+/// Invade's own colors, shared by the arena, combat effects and controls.
 struct Palette {
     bg: Color32,
     fg: Color32,
@@ -1900,6 +2006,7 @@ struct Palette {
     friendly_text: Color32,
 }
 
+#[cfg(test)]
 fn luminance(c: Color32) -> f32 {
     let linear = |v: u8| {
         let v = f32::from(v) / 255.0;
@@ -1908,7 +2015,8 @@ fn luminance(c: Color32) -> f32 {
     0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
 }
 
-pub(crate) fn contrast(a: Color32, b: Color32) -> f32 {
+#[cfg(test)]
+fn contrast(a: Color32, b: Color32) -> f32 {
     let (a, b) = (luminance(a), luminance(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
@@ -1918,16 +2026,9 @@ fn mix_colors(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
-fn most_readable(candidates: &[Color32], bg: Color32) -> Color32 {
-    candidates.iter().copied().max_by(|a, b| contrast(*a, bg).total_cmp(&contrast(*b, bg))).unwrap()
-}
-
 impl Palette {
-    /// Keep the app's control geometry while adapting every overlay label
-    /// and widget state to the game's panel, including light themes.
-    fn overlay_visuals(&self, base: &egui::Visuals) -> egui::Visuals {
-        let mut visuals = base.clone();
-        visuals.dark_mode = luminance(self.panel) < 0.5;
+    fn visuals(&self) -> egui::Visuals {
+        let mut visuals = egui::Visuals::dark();
         visuals.override_text_color = Some(self.panel_text);
         visuals.weak_text_color = Some(self.dim_text);
         visuals.disabled_alpha = 0.85;
@@ -1935,6 +2036,11 @@ impl Palette {
         visuals.window_fill = self.panel;
         visuals.extreme_bg_color = self.panel;
         visuals.faint_bg_color = self.panel;
+        visuals.code_bg_color = self.panel;
+        visuals.hyperlink_color = self.friendly_text;
+        visuals.warn_fg_color = self.warning;
+        visuals.error_fg_color = self.danger_text;
+        visuals.window_stroke = Stroke::new(1.0, self.dim);
         visuals.selection.bg_fill = mix_colors(self.panel, self.panel_text, 0.15);
         visuals.selection.stroke = Stroke::new(1.0, self.panel_text);
         for (widget, tint) in [
@@ -1955,35 +2061,20 @@ impl Palette {
         visuals
     }
 
-    fn new(theme: Theme) -> Palette {
-        let (bg, fg) = (theme.bg, theme.fg);
+    fn new() -> Palette {
+        let bg = Color32::from_rgb(0x0c, 0x12, 0x1c);
+        let fg = Color32::from_rgb(0xe0, 0xe9, 0xf4);
         let dim = mix_colors(fg, bg, 0.45);
-        let mono = theme.effects.monochrome;
-        let accent = |candidates: &[Color32]| {
-            let best = most_readable(candidates, bg);
-            if mono || contrast(best, bg) < 3.0 { fg } else { best }
-        };
-        let danger = accent(&[
-            Color32::from_rgb(0xf0, 0x5a, 0x5a),
-            Color32::from_rgb(0xff, 0x7a, 0x6e),
-            Color32::from_rgb(0xc0, 0x26, 0x26),
-            Color32::from_rgb(0x9e, 0x1a, 0x1a),
-        ]);
-        let warning = accent(&[
-            Color32::from_rgb(0xf2, 0xc0, 0x4a),
-            Color32::from_rgb(0xff, 0xd8, 0x6a),
-            Color32::from_rgb(0x9a, 0x62, 0x00),
-            Color32::from_rgb(0x7a, 0x4a, 0x00),
-        ]);
-        let friendly = if mono || contrast(theme.cursor, bg) < 3.0 { fg } else { theme.cursor };
-        // Panels follow the theme too, a step off the background.
+        let danger = Color32::from_rgb(0xff, 0x8b, 0x80);
+        let warning = Color32::from_rgb(0xff, 0xd8, 0x6a);
+        let friendly = Color32::from_rgb(0x6e, 0xe7, 0xb7);
         let panel = mix_colors(bg, fg, 0.08);
         Palette {
             bg,
             fg,
             dim,
             friendly,
-            experience: accent(&[Color32::from_rgb(0x49, 0xd8, 0xf0), Color32::from_rgb(0x00, 0x62, 0x78)]),
+            experience: Color32::from_rgb(0x49, 0xd8, 0xf0),
             danger,
             warning,
             panel,
@@ -2000,48 +2091,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_preset_theme_gets_readable_accents() {
-        let settings = crate::settings::AppSettings::default();
-        for name in settings.theme_names() {
-            let theme = settings.theme_named(&name);
-            let p = Palette::new(theme);
-            for (label, color) in [
-                ("fg", p.fg),
-                ("friendly", p.friendly),
-                ("xp", p.experience),
-                ("danger", p.danger),
-                ("warning", p.warning),
-            ] {
-                assert!(contrast(color, p.bg) >= 3.0, "{name} {label}: {:.2}", contrast(color, p.bg));
-            }
-            assert!(contrast(p.panel_text, p.panel) >= 4.0, "{name} panel text");
-            if theme.effects.monochrome {
-                assert_eq!((p.danger, p.friendly), (p.fg, p.fg), "{name}: monochrome stays one color");
-            }
+    fn game_palette_has_distinct_readable_accents() {
+        let p = Palette::new();
+        let colors = [p.fg, p.friendly, p.experience, p.danger, p.warning];
+        for (i, color) in colors.into_iter().enumerate() {
+            assert!(contrast(color, p.bg) >= 4.5, "arena text: {:.2}", contrast(color, p.bg));
+            assert!(!colors[..i].contains(&color), "combat roles keep distinct colors");
         }
+        assert!(contrast(p.dim, p.bg) >= 4.5, "HUD hints");
+        assert!(contrast(p.panel_text, p.panel) >= 4.5, "panel text");
     }
 
     #[test]
-    fn overlay_text_and_disabled_rigs_stay_readable_in_every_theme() {
-        let settings = crate::settings::AppSettings::default();
-        for name in settings.theme_names() {
-            let palette = Palette::new(settings.theme_named(&name));
-            let base = egui::Visuals::dark();
-            let visuals = palette.overlay_visuals(&base);
-            assert_eq!(visuals.override_text_color, Some(palette.panel_text), "{name}");
-            assert_eq!(visuals.widgets.inactive.corner_radius, base.widgets.inactive.corner_radius);
-            for widget in [
-                visuals.widgets.noninteractive,
-                visuals.widgets.inactive,
-                visuals.widgets.hovered,
-                visuals.widgets.active,
-                visuals.widgets.open,
-            ] {
-                assert!(contrast(palette.panel_text, widget.bg_fill) >= 3.0, "{name}: widget text");
+    fn overlay_text_and_disabled_rigs_stay_readable() {
+        let palette = Palette::new();
+        let visuals = palette.visuals();
+        assert_eq!(visuals.override_text_color, Some(palette.panel_text));
+        for widget in [
+            visuals.widgets.noninteractive,
+            visuals.widgets.inactive,
+            visuals.widgets.hovered,
+            visuals.widgets.active,
+            visuals.widgets.open,
+        ] {
+            for color in [palette.panel_text, palette.dim_text, palette.danger_text, palette.friendly_text] {
+                assert!(contrast(color, widget.bg_fill) >= 4.5, "widget text");
             }
-            let disabled_text = mix_colors(palette.panel, palette.panel_text, visuals.disabled_alpha);
-            assert!(contrast(disabled_text, palette.panel) >= 3.0, "{name}: disabled rig");
         }
+        let disabled_text = mix_colors(palette.panel, palette.panel_text, visuals.disabled_alpha);
+        assert!(contrast(disabled_text, palette.panel) >= 4.5, "disabled rig");
     }
 
     #[test]
@@ -2138,6 +2216,7 @@ mod tests {
         for rig in Rig::ALL {
             let footer = control_footer(rig);
             assert!(footer.is_ascii() && footer.lines().all(|line| line.len() <= COLUMNS as usize), "{footer}");
+            assert!(!footer.contains("[Space]"));
             for control in ["Turn", "Thrust", "Brake", "coast", "Auto-fire", "[Esc/P] Pause", "[B] Build"] {
                 assert!(footer.contains(control), "missing {control}: {footer}");
             }
@@ -2155,7 +2234,7 @@ mod tests {
         ] {
             let drawn = RefCell::new(Vec::new());
             draw_flight_markers(
-                &|x, y, glyph, _| drawn.borrow_mut().push((x + 0.125, y + 0.125, glyph.to_string())),
+                &|x, y, glyph, _| drawn.borrow_mut().push((x + GLYPH / 2.0, y + GLYPH / 2.0, glyph.to_string())),
                 (40.0, 14.0),
                 (4.0, 1.0),
                 nose,
