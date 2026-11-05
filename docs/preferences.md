@@ -52,13 +52,17 @@ Every built-in palette is regression-checked for at least 4.5:1 base-text contra
 
 ![Paper Light across the workspace](screenshots/workspace-light.png)
 
+## Files
+
+**Open with** sets the program that **Edit** in a file explorer opens server files in, such as your IDE. Use **Choose…** to find it, or type a program on your `PATH`. **Use default app** goes back to the app your system picks for each file type. Saving applies it to open explorers too; files already open stay where they are. See [File transfers](file-transfers.md#editing-a-server-file).
+
 ## Network privacy
 
 Enabling **Offline mode** disables update checks and downloads, asks before DNS lookups or connections outside private/local IP ranges, and closes existing network sessions when saved. Serial sessions remain connected. Preferences displays a warning with the current number of open network sessions before applying this change. Cancel leaves those sessions and the saved policy intact.
 
 While an update is busy, the offline-mode control is disabled and explains why. Turning Offline mode off does not automatically re-enable startup update checks; enable that option separately if desired.
 
-**Let AI agents on this computer use open sessions (MCP)** is off by default. When saved on, local MCP agents such as Claude Code, Claude Desktop, OpenAI Codex or a self-hosted agent can list open tabs, read their output and type commands into them; the section shows how to add Snekkie to an agent. **Animate agent activity**, on by default, controls whether the cyan reading and amber typing cues move or hold steady. The same switch is also on the Animations page under **AI agent activity**, where it works even while Animations is off. See [AI agent access](ai-agents.md).
+**Let AI agents on this computer use open sessions (MCP)** is off by default. When saved on, local MCP agents such as Claude Code, Claude Desktop, OpenAI Codex or a self-hosted agent can list open tabs, read their output and type commands into them; the section shows how to add Snekkie to an agent. **Let agents transfer and change files**, also off by default, adds tools for reading, writing, copying and deleting files over SFTP, and reading and copying them over SCP on devices without SFTP. **Animate agent activity**, on by default, controls whether the cyan reading and amber typing cues move or hold steady. The same switch is also on the Animations page under **AI agent activity**, where it works even while Animations is off. See [AI agent access](ai-agents.md).
 
 ## Compact animation controls
 

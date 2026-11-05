@@ -13,8 +13,10 @@ use egui::{
 use parking_lot::Mutex;
 
 use super::agents::{self, Motion};
+use super::explorer::{self, BannerSink, ExplorerAction, ExplorerContext, ExplorerOptions, ExplorerTab};
 use super::fonts::{self, Fonts};
 use super::invade::{InvadeAction, InvadeOptions, InvadeTab};
+use super::layout::{Divider, Edge, TabLayout};
 use super::paste::{Action as PasteAction, PastePreview};
 use super::preferences::{self, Preferences};
 use super::profile_transfer::ProfileTransfer;
@@ -28,13 +30,14 @@ use crate::invade::EndReason;
 use crate::mcp::Cue;
 use crate::network::{NetworkAccess, NetworkQuestion};
 use crate::paste::{PasteQueue, PasteTarget};
-use crate::profiles::{Auth, Kind, Profile, ProfileStore};
+use crate::profiles::{self, Auth, Kind, Profile, ProfileStore};
 use crate::session::{ConnectContext, LogStatus, NoticeLevel, Session, State};
 use crate::settings::{AppSettings, SettingsStore, Theme};
 use crate::snippets::{Snippet, SnippetStore};
 use crate::terminal::keys;
 use crate::transport::serial::PortInfo;
 use crate::transport::ssh::{self, HostKeyAsker, HostKeyQuestion};
+use crate::transport::transfer::Direction;
 use crate::update::{self, Release};
 
 /// How long a status bar message stays up, in seconds.
@@ -88,6 +91,8 @@ Ctrl+C/X/V      Send terminal control characters";
 enum Target {
     NewTab,
     Reconnect(u64),
+    /// Log an explorer tab in again, on its own connection.
+    ReconnectExplorer(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -98,8 +103,10 @@ struct PendingConnect {
 
 enum ConfirmAction {
     CloseTab(u64),
+    CloseExplorer(u64),
     Quit,
     DeleteSaved(String),
+    DeleteFolder(String),
     DeleteSnippet(u64),
     ReplaceTheme(String),
     DeleteTheme(String),
@@ -110,6 +117,12 @@ enum InputAction {
     Password(Box<PendingConnect>),
     Passphrase(Box<PendingConnect>),
     SaveSession(Box<Profile>),
+    /// A new folder under this one, and the saved session to put in it, if any.
+    NewFolder {
+        parent: String,
+        session: Option<String>,
+    },
+    RenameFolder(String),
     OtherDevice,
     OtherBaud,
     SaveTheme,
@@ -126,6 +139,7 @@ enum Dialog {
     Import(Box<PuttyImport>),
     ProfileTransfer(Box<ProfileTransfer>),
     TabColor { id: u64, color: Color32 },
+    Transfer { id: u64, direction: Direction, local: Option<std::path::PathBuf>, remote: String, replace: bool },
     ProfileColor { name: String, color: Color32, enabled: bool },
 }
 
@@ -237,11 +251,16 @@ struct Tab {
 
 /// What a tab in the strip shows: a real connection, found by its stable
 /// session ID, or the Invade game. The game is never a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum WorkspaceTabId {
     Session(u64),
     Invade,
+    Explorer(u64),
 }
+
+/// Tabs showing together. Selecting another tab shows it alone; selecting any
+/// of these brings them all back.
+type SplitView = TabLayout<WorkspaceTabId>;
 
 /// Where the app keeps its files; replaced in tests.
 pub struct Paths {
@@ -263,12 +282,17 @@ pub struct SnekkieApp {
     paste_queue: Option<PasteQueue>,
     retired_log_workers: Vec<std::thread::JoinHandle<()>>,
     settings_store: SettingsStore,
+    /// Shared with open explorers, so a new choice reaches them straight away.
+    explorer_editor: Arc<Mutex<String>>,
     settings: AppSettings,
     sidebar: Sidebar,
     /// Connection tabs, in the order they are shown.
     tabs: Vec<Tab>,
+    /// File explorer tabs, in the order they are shown. Each knows its slot.
+    explorers: Vec<ExplorerTab>,
     /// The selected tab, if any.
     active: Option<WorkspaceTabId>,
+    split: Option<SplitView>,
     /// The singleton game tab, and where it sits among the connection tabs.
     invade: Option<Box<InvadeTab>>,
     /// The game after its tab closed: reopening resumes the same run, and
@@ -298,6 +322,14 @@ pub struct SnekkieApp {
     accent: Color32,
     styled_theme: Option<Theme>,
     dragging_tab: Option<usize>,
+    /// The tab a dragged tab would go beside, if dropped on the workspace.
+    tab_drag_target: Option<WorkspaceTabId>,
+    /// A dragged tab, on the frame it was let go.
+    tab_dropped: Option<WorkspaceTabId>,
+    /// Where tabs draw, last frame. A tab dragged here isn't being reordered.
+    workspace_area: Option<egui::Rect>,
+    /// What showed before the current tab, to go beside it.
+    last_shown: Option<WorkspaceTabId>,
     /// Whether the terminal had the keyboard when a dialog opened, so it
     /// can have it back when the dialog closes.
     terminal_had_focus: bool,
@@ -358,8 +390,11 @@ impl SnekkieApp {
             paste_queue: None,
             retired_log_workers: Vec::new(),
             settings_store,
+            explorer_editor: Arc::new(Mutex::new(settings.explorer_editor.clone())),
             settings,
             tabs: Vec::new(),
+            explorers: Vec::new(),
+            split: None,
             active: None,
             invade: None,
             parked_invade: None,
@@ -381,6 +416,10 @@ impl SnekkieApp {
             accent: Color32::TRANSPARENT,
             styled_theme: None,
             dragging_tab: None,
+            tab_drag_target: None,
+            tab_dropped: None,
+            workspace_area: None,
+            last_shown: None,
             terminal_had_focus: false,
             updater: Updater::new(),
             agents: None,
@@ -471,6 +510,9 @@ impl SnekkieApp {
         if self.invade.is_some() {
             order.insert(self.invade_slot.min(order.len()), WorkspaceTabId::Invade);
         }
+        for explorer in &self.explorers {
+            order.insert(explorer.slot.min(order.len()), WorkspaceTabId::Explorer(explorer.id));
+        }
         order
     }
 
@@ -478,8 +520,17 @@ impl SnekkieApp {
     fn set_workspace_order(&mut self, order: &[WorkspaceTabId]) {
         let mut tabs = std::mem::take(&mut self.tabs);
         let mut sorted = Vec::with_capacity(tabs.len());
-        for id in order {
+        let mut explorers = std::mem::take(&mut self.explorers);
+        let mut sorted_explorers = Vec::with_capacity(explorers.len());
+        for (position, id) in order.iter().enumerate() {
             match id {
+                WorkspaceTabId::Explorer(explorer) => {
+                    if let Some(index) = explorers.iter().position(|e| e.id == *explorer) {
+                        let mut explorer = explorers.remove(index);
+                        explorer.slot = position;
+                        sorted_explorers.push(explorer);
+                    }
+                }
                 WorkspaceTabId::Invade => self.invade_slot = sorted.len(),
                 WorkspaceTabId::Session(session) => {
                     if let Some(index) = tabs.iter().position(|t| t.session.id == *session) {
@@ -490,10 +541,15 @@ impl SnekkieApp {
         }
         sorted.append(&mut tabs);
         self.tabs = sorted;
+        sorted_explorers.append(&mut explorers);
+        self.explorers = sorted_explorers;
     }
 
     /// Show a tab. Leaving Invade pauses it; returning takes Resume.
     fn select_workspace_tab(&mut self, id: WorkspaceTabId) {
+        if self.active != Some(id) && self.active.is_some() {
+            self.last_shown = self.active;
+        }
         match id {
             WorkspaceTabId::Session(session) => {
                 let Some(index) = self.tab_index(session) else { return };
@@ -509,6 +565,69 @@ impl SnekkieApp {
                     self.invade_sidebar = false;
                 }
             }
+            WorkspaceTabId::Explorer(explorer) => {
+                if !self.explorers.iter().any(|e| e.id == explorer) {
+                    return;
+                }
+                if self.invade_selected() {
+                    self.leave_invade();
+                }
+                self.active = Some(id);
+            }
+        }
+    }
+
+    /// A tab is closing: take it out of the layout and name the tab to show
+    /// in its place.
+    fn take_split_partner(&mut self, closing: WorkspaceTabId) -> Option<WorkspaceTabId> {
+        let split = self.split.as_mut().filter(|split| split.contains(closing))?;
+        split.remove(closing);
+        let tabs = split.tabs();
+        if tabs.len() < 2 {
+            self.split = None;
+        }
+        tabs.first().copied()
+    }
+
+    /// The layout to draw now: one of its tabs is selected.
+    fn visible_split(&self) -> Option<&SplitView> {
+        let active = self.active?;
+        self.split.as_ref().filter(|split| split.contains(active))
+    }
+
+    /// Put a tab beside another: in the other's layout if there's room, or
+    /// else as a new pair.
+    fn start_split(&mut self, entry: WorkspaceTabId, other: WorkspaceTabId) {
+        let area = self.workspace_area;
+        let added = self.split.as_ref().and_then(|split| {
+            [Edge::Right, Edge::Bottom]
+                .into_iter()
+                .filter_map(|edge| split.dropped(entry, other, edge).filter(|(landed, _)| *landed == edge))
+                .map(|(_, next)| next)
+                .find(|next| area.is_none_or(|area| next.fits(area)))
+        });
+        self.split = Some(added.unwrap_or_else(|| TabLayout::pair(other, entry)));
+        self.select_workspace_tab(entry);
+    }
+
+    /// Other tabs that can go beside this one. The game always plays alone.
+    fn split_candidates(&self, entry: WorkspaceTabId) -> Vec<(WorkspaceTabId, String)> {
+        self.workspace_order()
+            .into_iter()
+            .zip(self.workspace_titles())
+            .filter(|(id, _)| *id != entry && *id != WorkspaceTabId::Invade)
+            .collect()
+    }
+
+    /// Rename or move a folder, with its sessions and subfolders.
+    fn rename_folder(&mut self, from: String, to: String) {
+        if from == to {
+            return;
+        }
+        if let Some(problem) = self.store.folder_move_error(&from, &to) {
+            self.message("Saved sessions", problem);
+        } else if let Err(e) = self.store.rename_folder(&from, &to) {
+            self.message("Saved sessions", format!("Could not save sessions: {e}"));
         }
     }
 
@@ -535,6 +654,9 @@ impl SnekkieApp {
             });
             self.invade = Some(game);
             self.invade_slot = self.tabs.len();
+            // Explorer slots count every tab, so the game takes the far end.
+            let order = self.workspace_order();
+            self.set_workspace_order(&order);
         }
         self.select_workspace_tab(WorkspaceTabId::Invade);
     }
@@ -545,6 +667,8 @@ impl SnekkieApp {
         let order = self.workspace_order();
         let position = order.iter().position(|t| *t == WorkspaceTabId::Invade);
         let Some(mut game) = self.invade.take() else { return };
+        let remaining: Vec<_> = order.iter().copied().filter(|t| *t != WorkspaceTabId::Invade).collect();
+        self.set_workspace_order(&remaining);
         self.suppressed_keys.extend(game.held_keys());
         game.pause();
         self.invade_sidebar = false;
@@ -565,7 +689,92 @@ impl SnekkieApp {
         match id {
             WorkspaceTabId::Session(session) => self.close_tab(session, confirmed),
             WorkspaceTabId::Invade => self.close_invade(),
+            WorkspaceTabId::Explorer(explorer) => self.close_explorer(explorer, confirmed),
         }
+    }
+
+    /// Close a file explorer, asking first if that would cut off a transfer.
+    fn close_explorer(&mut self, id: u64, confirmed: bool) {
+        let Some(index) = self.explorers.iter().position(|e| e.id == id) else { return };
+        if !confirmed && let Some(warning) = self.explorers[index].close_warning() {
+            let text = format!("{warning} Close “{}”?", self.explorers[index].title());
+            self.confirm("Close file explorer", text, ConfirmAction::CloseExplorer(id));
+            return;
+        }
+        let order = self.workspace_order();
+        let position = order.iter().position(|t| *t == WorkspaceTabId::Explorer(id));
+        let partner = self.take_split_partner(WorkspaceTabId::Explorer(id));
+        let tab = self.explorers.remove(index);
+        let remaining: Vec<_> = order.iter().copied().filter(|t| *t != WorkspaceTabId::Explorer(id)).collect();
+        self.set_workspace_order(&remaining);
+        self.remember_folders(&tab);
+        if self.active == Some(WorkspaceTabId::Explorer(id)) {
+            self.active = None;
+            if let Some(next) = partner.or_else(|| position.and_then(|p| neighbor(&order, p))) {
+                self.select_workspace_tab(next);
+            }
+        }
+    }
+
+    /// Reopen at these folders next time, if this is a saved session.
+    fn remember_folders(&mut self, tab: &ExplorerTab) {
+        let (local, remote) = tab.folders();
+        if local.is_empty() && remote.is_empty() {
+            return;
+        }
+        let Some(mut profile) =
+            self.store.get(&tab.profile.name).cloned().filter(|p| same_destination(p, &tab.profile))
+        else {
+            return;
+        };
+        if profile.explorer_local != local || profile.explorer_remote != remote {
+            local.clone_into(&mut profile.explorer_local);
+            remote.clone_into(&mut profile.explorer_remote);
+            self.save_profile_metadata(profile);
+        }
+    }
+
+    fn explorer_context(&self, ctx: &egui::Context) -> ExplorerContext {
+        let repaint = ctx.clone();
+        let editor = self.explorer_editor.clone();
+        ExplorerContext {
+            runtime: self.runtime.handle().clone(),
+            repaint: Arc::new(move || repaint.request_repaint()),
+            opener: Arc::new(move |path| {
+                let editor = editor.lock().clone();
+                explorer::open_with(&editor, path)
+            }),
+            show_hidden: self.settings.explorer_show_hidden,
+        }
+    }
+
+    /// Show a new explorer tab that's waiting on `connection`.
+    fn add_explorer(
+        &mut self,
+        ctx: &egui::Context,
+        profile: Profile,
+        connection: crate::transport::sftp::Task<Result<ssh::Connection, String>>,
+        banner: Option<Arc<BannerSink>>,
+    ) {
+        let id = crate::session::next_tab_id();
+        let context = self.explorer_context(ctx);
+        let mut tab = ExplorerTab::new(id, profile, connection, banner, context);
+        tab.slot = self.workspace_order().len();
+        self.explorers.push(tab);
+        self.select_workspace_tab(WorkspaceTabId::Explorer(id));
+    }
+
+    /// Open an explorer on an SSH tab's connection, with no second login.
+    fn open_explorer_from_session(&mut self, ctx: &egui::Context, id: u64) {
+        let Some(index) = self.tab_index(id) else { return };
+        let session = &self.tabs[index].session;
+        let profile = session.profile.clone();
+        let Some(shared) = session.share_connection() else {
+            self.message("File explorer", "The explorer needs a connected SSH session.");
+            return;
+        };
+        let connection = explorer::shared_connection(self.runtime.handle(), shared);
+        self.add_explorer(ctx, profile, connection, None);
     }
 
     /// The active stores an export must never overwrite.
@@ -616,7 +825,7 @@ impl SnekkieApp {
     }
 
     fn live_sessions(&self) -> usize {
-        self.tabs.iter().filter(|t| t.session.is_live()).count()
+        self.tabs.iter().filter(|t| t.session.is_live()).count() + self.explorers.iter().filter(|e| e.is_live()).count()
     }
 
     /// Close the window without asking, hanging up every session.
@@ -624,6 +833,10 @@ impl SnekkieApp {
         self.allow_close = true;
         for tab in &self.tabs {
             tab.session.shutdown();
+        }
+        // Remember where they were, and delete any copies open for editing.
+        for tab in std::mem::take(&mut self.explorers) {
+            self.remember_folders(&tab);
         }
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }
@@ -705,7 +918,7 @@ impl SnekkieApp {
 
     /// Collect anything we deliberately don't store, then connect.
     fn request_connect(&mut self, ctx: &egui::Context, profile: Profile, target: Target) {
-        if profile.kind() == Kind::Ssh {
+        if profile.kind().is_ssh() {
             match profile.auth() {
                 Auth::Password => {
                     let user = if profile.username.is_empty() { "(user)" } else { &profile.username };
@@ -767,7 +980,40 @@ impl SnekkieApp {
                 }))
             },
         };
+        // A session of its own for the explorer, whichever way it came to need one.
+        let explorer = match pending.target {
+            Target::ReconnectExplorer(id) => Some(Some(id)),
+            Target::NewTab if pending.profile.kind() == Kind::Sftp => Some(None),
+            _ => None,
+        };
+        if let Some(existing) = explorer {
+            let banner = Arc::new(BannerSink::default());
+            let credentials = ssh::Credentials {
+                password: cx.password,
+                key_passphrase: cx.key_passphrase,
+                known_hosts: ssh::known_hosts_path(),
+            };
+            let connection = ssh::connect(
+                self.runtime.handle(),
+                pending.profile.clone(),
+                credentials,
+                cx.ask_host_key,
+                banner.clone(),
+                cx.network,
+            );
+            match existing {
+                Some(id) => {
+                    if let Some(tab) = self.explorers.iter_mut().find(|e| e.id == id) {
+                        tab.reconnect(connection, Some(banner));
+                        self.select_workspace_tab(WorkspaceTabId::Explorer(id));
+                    }
+                }
+                None => self.add_explorer(ctx, pending.profile, connection, Some(banner)),
+            }
+            return;
+        }
         match pending.target {
+            Target::ReconnectExplorer(_) => {}
             Target::NewTab => {
                 let repaint = {
                     let ctx = ctx.clone();
@@ -810,19 +1056,22 @@ impl SnekkieApp {
         }
         let order = self.workspace_order();
         let position = order.iter().position(|t| *t == WorkspaceTabId::Session(id));
+        let partner = self.take_split_partner(WorkspaceTabId::Session(id));
         let tab = self.tabs.remove(index);
         if index < self.invade_slot {
             self.invade_slot -= 1;
         }
+        let remaining: Vec<_> = order.iter().copied().filter(|t| *t != WorkspaceTabId::Session(id)).collect();
+        self.set_workspace_order(&remaining);
         if self.paste_queue.as_ref().is_some_and(|q| q.target.id == id) {
             self.paste_queue = None;
         }
         tab.session.shutdown();
         self.retired_log_workers.extend(tab.session.take_log_workers());
         if self.active == Some(WorkspaceTabId::Session(id)) {
-            // Its neighbor takes its place.
+            // The tab beside it, or else its neighbor, takes its place.
             self.active = None;
-            if let Some(next) = position.and_then(|p| neighbor(&order, p)) {
+            if let Some(next) = partner.or_else(|| position.and_then(|p| neighbor(&order, p))) {
                 self.select_workspace_tab(next);
             }
         } else if let Some(tab) = self.current_mut() {
@@ -1156,7 +1405,13 @@ impl SnekkieApp {
         self.dialogs.retain(|d| !matches!(d, Dialog::Network(q) if q.reply.is_closed()));
 
         let mut notices = Vec::new();
+        for tab in &mut self.explorers {
+            tab.poll(ctx);
+        }
         for tab in &self.tabs {
+            if tab.session.poll_transfer() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
             for notice in tab.session.take_notices() {
                 notices.push((tab.session.profile.name.clone(), notice));
             }
@@ -1246,6 +1501,7 @@ impl SnekkieApp {
             return;
         };
         let sessions: Vec<&Session> = self.tabs.iter().map(|tab| &tab.session).collect();
+        agents.sync_files(self.settings.agent_file_access, self.explorers.iter().map(ExplorerTab::agent_entry));
         agents.sync(self.active_index().map(|index| self.tabs[index].session.id), &sessions);
         self.agent_activity = agents.activity();
         let now = std::time::Instant::now();
@@ -1275,16 +1531,21 @@ impl SnekkieApp {
             .agent_activity
             .sessions
             .iter()
-            .filter_map(|(id, used)| Some((used.cue(now)?, used, self.tabs.iter().find(|t| t.session.id == *id)?)))
+            .filter_map(|(id, used)| {
+                let name = match self.tabs.iter().find(|t| t.session.id == *id) {
+                    Some(tab) => tab.session.profile.name.clone(),
+                    None => self.explorers.iter().find(|e| e.id == *id)?.title(),
+                };
+                Some((used.cue(now)?, used, name))
+            })
             .max_by_key(|(_, used, _)| used.last);
-        let (text, color) = match (agents.as_slice(), busiest) {
-            (_, Some((cue, used, tab))) => {
-                let name = &tab.session.profile.name;
-                let doing = match cue {
+        let (text, color) = match (agents.as_slice(), &busiest) {
+            (_, Some((cue, used, name))) => {
+                let doing = match *cue {
                     Cue::Reading => format!("{} is reading {name}", used.agent),
                     Cue::Writing(_) => format!("{} is typing in {name}", used.agent),
                 };
-                (doing, agents::text_color(ui, cue))
+                (doing, agents::text_color(ui, *cue))
             }
             ([], None) => ("Agent access on".to_string(), style::secondary(ui)),
             ([one], None) => (format!("{one} connected"), style::primary(ui)),
@@ -1462,7 +1723,12 @@ impl SnekkieApp {
                     let status = game.status();
                     format!("Invade — {} · wave {} · score {}", status.state, status.wave, status.score)
                 }
-                _ => self.current().map_or_else(|| "No session".to_string(), |t| t.session.status_text()),
+                _ => match self.active {
+                    Some(WorkspaceTabId::Explorer(id)) => {
+                        self.explorers.iter().find(|e| e.id == id).map_or_else(String::new, ExplorerTab::status_text)
+                    }
+                    _ => self.current().map_or_else(|| "No session".to_string(), |t| t.session.status_text()),
+                },
             };
             if self.settings.offline_mode {
                 ui.label(RichText::new("Offline mode").strong())
@@ -1471,6 +1737,13 @@ impl SnekkieApp {
             }
             ui.label(RichText::new(text).color(style::secondary(ui)));
             if let Some(tab) = self.current() {
+                if let Some((direction, local, progress)) = tab.session.transfer_progress() {
+                    ui.separator();
+                    ui.label(transfer_status(direction, &local, progress.bytes()));
+                    if ui.button("Cancel transfer").clicked() {
+                        progress.cancel();
+                    }
+                }
                 ui.separator();
                 let mut private = tab.session.private_input();
                 if ui.checkbox(&mut private, "Private input").on_hover_text("Suppress input and output logging until switched off. Use this for unrecognized sensitive prompts.").changed() {
@@ -1518,10 +1791,60 @@ impl SnekkieApp {
                 sidebar::Action::Connect(profile) => self.request_connect(&ctx, profile, Target::NewTab),
                 sidebar::Action::Save(profile) => {
                     let suggested = profile.name.clone();
-                    self.input("Save session", "Name:", suggested, false, InputAction::SaveSession(Box::new(profile)));
+                    let label = if profile.folder.is_empty() {
+                        "Name:".to_string()
+                    } else {
+                        format!("Name (in {}):", profile.folder)
+                    };
+                    self.input("Save session", label, suggested, false, InputAction::SaveSession(Box::new(profile)));
                 }
                 sidebar::Action::Delete(name) => {
                     self.confirm("Delete session", format!("Delete “{name}”?"), ConfirmAction::DeleteSaved(name));
+                }
+                sidebar::Action::NewFolder { parent, session } => {
+                    self.input("New folder", "Name:", "", false, InputAction::NewFolder { parent, session });
+                }
+                sidebar::Action::RenameFolder(path) => {
+                    let name = profiles::folder_leaf(&path).to_string();
+                    self.input("Rename folder", "Name:", name, false, InputAction::RenameFolder(path));
+                }
+                sidebar::Action::DeleteFolder(path) => {
+                    let count = self.store.sessions_in(&path);
+                    let name = profiles::folder_leaf(&path);
+                    let parent = match profiles::folder_parent(&path) {
+                        "" => "the top of the list".to_string(),
+                        parent => format!("“{parent}”"),
+                    };
+                    let text = if count == 0 {
+                        format!("Delete the folder “{name}”?")
+                    } else {
+                        format!(
+                            "Delete the folder “{name}”? Its {count} saved session(s) stay, and move up to {parent}."
+                        )
+                    };
+                    self.confirm("Delete folder", text, ConfirmAction::DeleteFolder(path));
+                }
+                sidebar::Action::MoveFolder { path, into } => {
+                    let to = profiles::join_folder(&into, profiles::folder_leaf(&path));
+                    self.rename_folder(path, to);
+                }
+                sidebar::Action::MoveSession { name, folder } => {
+                    if let Err(e) = self.store.move_session(&name, &folder) {
+                        self.message("Move session", format!("Could not save sessions: {e}"));
+                    }
+                    // The form keeps saving to where its session now lives.
+                    if self.sidebar.selected_saved() == Some(name.as_str()) || self.sidebar.draft_name() == name {
+                        self.sidebar.set_folder(folder);
+                    }
+                }
+                sidebar::Action::ToggleFolder(path) => {
+                    if let Err(e) = self.store.toggle_collapsed(&path) {
+                        self.message("Saved sessions", format!("Could not save sessions: {e}"));
+                    }
+                }
+                sidebar::Action::NewSessionIn(path) => {
+                    self.run_command(&ctx, Command::NewSession);
+                    self.sidebar.set_folder(path);
                 }
                 sidebar::Action::ToggleFavorite(name) => {
                     if let Some(mut profile) = self.store.get(&name).cloned() {
@@ -1630,10 +1953,106 @@ impl SnekkieApp {
         egui::ScrollArea::horizontal().id_salt("tab_strip").auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
+                let shown = self.visible_split().map_or_else(Vec::new, SplitView::tabs);
+                let arranged = self.split.as_ref().map_or_else(Vec::new, SplitView::tabs);
+                let columns = self.split.as_ref().map_or(0, SplitView::column_count);
                 for (index, &entry) in order.iter().enumerate() {
-                    let selected = self.active == Some(entry);
+                    let candidates =
+                        if entry == WorkspaceTabId::Invade { Vec::new() } else { self.split_candidates(entry) };
+                    let selected = self.active == Some(entry) || shown.contains(&entry);
+                    let in_split = arranged.contains(&entry);
                     // Hover fills must stay behind the labels and close button.
                     let background = ui.painter().add(egui::Shape::Noop);
+                    if let WorkspaceTabId::Explorer(explorer_id) = entry {
+                        let Some(tab) = self.explorers.iter().find(|e| e.id == explorer_id) else { continue };
+                        let color = if selected { style::primary(ui) } else { style::secondary(ui) };
+                        let tint = crate::settings::parse_hex(&tab.profile.tab_color);
+                        let (connected, connecting) = tab.status();
+                        let status = match (connected, connecting) {
+                            (true, _) => "Connected",
+                            (_, true) => "Connecting",
+                            _ => "Disconnected",
+                        };
+                        let waiting = tab.needs_attention();
+                        let title = if waiting { format!("{} (needs you)", tab.title()) } else { tab.title() };
+                        let inner = ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .id(Id::new(("tab", "explorer", explorer_id)))
+                                .sense(Sense::click_and_drag()),
+                            |ui| {
+                                Frame::new()
+                                    .fill(tint.map_or(Color32::TRANSPARENT, |c| {
+                                        c.gamma_multiply(if selected { 0.16 } else { 0.08 })
+                                    }))
+                                    .inner_margin(Margin::symmetric(10, 5))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 6.0;
+                                            let dot = if connected { self.accent } else { style::secondary(ui) };
+                                            ui.add(egui::Label::new(RichText::new("📁").color(dot)).selectable(false));
+                                            ui.add(
+                                                egui::Label::new(RichText::new(title).color(color)).selectable(false),
+                                            );
+                                            let close = ui.add(
+                                                egui::Button::new(RichText::new("×").color(style::secondary(ui)))
+                                                    .frame(false)
+                                                    .small(),
+                                            );
+                                            if close.on_hover_text("Close tab").clicked() {
+                                                action = Some((entry, TabAction::Close));
+                                            }
+                                        });
+                                    });
+                            },
+                        );
+                        let response = inner.response.on_hover_text(format!(
+                            "{}\nSFTP {} — {status}",
+                            tab.title(),
+                            tab.profile.host
+                        ));
+                        let rect = response.rect;
+                        if let Some(cue) = self.agent_cue(explorer_id) {
+                            let motion = self.agent_motion(ui.ctx());
+                            ui.painter()
+                                .set(background, egui::Shape::rect_filled(rect, 3.0, agents::tab_fill(cue, motion)));
+                            let clip = ui.clip_rect().expand2(vec2(0.0, 6.0));
+                            agents::tab(&ui.ctx().layer_painter(ui.layer_id()).with_clip_rect(clip), rect, cue, motion);
+                        }
+                        if selected {
+                            ui.painter().hline(
+                                rect.x_range(),
+                                rect.bottom() - 1.0,
+                                Stroke::new(1.0, tint.unwrap_or(self.accent)),
+                            );
+                        } else if response.hovered() {
+                            ui.painter().set(
+                                background,
+                                egui::Shape::rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill),
+                            );
+                        }
+                        if response.clicked() {
+                            action = Some((entry, TabAction::Select));
+                        }
+                        if response.middle_clicked() {
+                            action = Some((entry, TabAction::Close));
+                        }
+                        if response.drag_started() {
+                            self.dragging_tab = Some(index);
+                            action = Some((entry, TabAction::PickUp));
+                        }
+                        response.context_menu(|ui| {
+                            if ui.add_enabled(!connected, egui::Button::new("Reconnect")).clicked() {
+                                action = Some((entry, TabAction::Reconnect));
+                            }
+                            split_menu(ui, entry, in_split, columns, &candidates, &mut action);
+                            ui.separator();
+                            if ui.button("Close").clicked() {
+                                action = Some((entry, TabAction::Close));
+                            }
+                        });
+                        rects.push(rect);
+                        continue;
+                    }
                     let WorkspaceTabId::Session(session_id) = entry else {
                         // The game's tab: game actions and Close, nothing
                         // about connections or profiles.
@@ -1682,7 +2101,7 @@ impl SnekkieApp {
                         }
                         if response.drag_started() {
                             self.dragging_tab = Some(index);
-                            action = Some((entry, TabAction::Select));
+                            action = Some((entry, TabAction::PickUp));
                         }
                         response.context_menu(|ui| {
                             if ui.button("Pause").clicked() {
@@ -1811,7 +2230,7 @@ impl SnekkieApp {
                     if response.drag_started() {
                         // Like a browser: the tab you pick up is the one shown.
                         self.dragging_tab = Some(index);
-                        action = Some((entry, TabAction::Select));
+                        action = Some((entry, TabAction::PickUp));
                     }
                     response.context_menu(|ui| {
                         if ui.button("Reconnect").clicked() {
@@ -1853,6 +2272,24 @@ impl SnekkieApp {
                                 ui.close();
                             }
                         });
+                        if tab.session.profile.kind() == Kind::Ssh {
+                            ui.separator();
+                            let ready = tab.session.can_transfer();
+                            if ui.add_enabled(ready, egui::Button::new("Upload file…")).clicked() {
+                                action = Some((entry, TabAction::Transfer(Direction::Upload)));
+                            }
+                            if ui.add_enabled(ready, egui::Button::new("Download file…")).clicked() {
+                                action = Some((entry, TabAction::Transfer(Direction::Download)));
+                            }
+                            let connected = tab.session.is_connected();
+                            if ui.add_enabled(connected, egui::Button::new("Open file explorer")).clicked() {
+                                action = Some((entry, TabAction::OpenExplorer));
+                            }
+                            if ui.add_enabled(connected, egui::Button::new("Open file explorer beside")).clicked() {
+                                action = Some((entry, TabAction::OpenExplorerBeside));
+                            }
+                        }
+                        split_menu(ui, entry, in_split, columns, &candidates, &mut action);
                         ui.separator();
                         if ui.button("Close").clicked() {
                             action = Some((entry, TabAction::Close));
@@ -1868,7 +2305,9 @@ impl SnekkieApp {
             let (down, pointer) = ui.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos()));
             if !down {
                 self.dragging_tab = None;
+                self.tab_dropped = order.get(from).copied();
             } else if let Some(pos) = pointer
+                && !self.workspace_area.is_some_and(|area| area.contains(pos))
                 && let Some(to) = rects.iter().position(|r| r.x_range().contains(pos.x))
                 && to != from
                 && from < order.len()
@@ -1887,7 +2326,15 @@ impl SnekkieApp {
     /// A connection tab's own actions, always aimed at its stable session.
     fn session_tab_action(&mut self, ctx: &egui::Context, id: u64, action: TabAction) {
         match action {
-            TabAction::Select | TabAction::Close | TabAction::Pause | TabAction::Build => {}
+            TabAction::Select
+            | TabAction::PickUp
+            | TabAction::Close
+            | TabAction::Pause
+            | TabAction::Build
+            | TabAction::ShowBeside(_)
+            | TabAction::EndSplit
+            | TabAction::TakeOutOfSplit
+            | TabAction::SwapSplit => {}
             TabAction::Color(color) => {
                 if let Some(index) = self.tab_index(id) {
                     self.tabs[index].color = color;
@@ -1920,6 +2367,24 @@ impl SnekkieApp {
                     self.dialogs.push(Dialog::TabColor { id, color: self.tabs[index].color.unwrap_or(self.accent) });
                 }
             }
+            TabAction::OpenExplorer => self.open_explorer_from_session(ctx, id),
+            TabAction::OpenExplorerBeside => {
+                let before = self.explorers.len();
+                self.open_explorer_from_session(ctx, id);
+                if self.explorers.len() != before {
+                    let explorer = self.explorers[before].id;
+                    self.start_split(WorkspaceTabId::Explorer(explorer), WorkspaceTabId::Session(id));
+                }
+            }
+            TabAction::Transfer(direction) => {
+                self.dialogs.push(Dialog::Transfer {
+                    id,
+                    direction,
+                    local: None,
+                    remote: String::new(),
+                    replace: false,
+                });
+            }
             TabAction::Reconnect | TabAction::Duplicate => {
                 if let Some(index) = self.tab_index(id) {
                     let profile = self.tabs[index].session.profile.clone();
@@ -1949,7 +2414,7 @@ impl SnekkieApp {
             Stroke::new(1.0, style::border(ui)),
         );
         ui.add_space(6.0);
-        if self.tabs.is_empty() && self.invade.is_none() {
+        if self.tabs.is_empty() && self.invade.is_none() && self.explorers.is_empty() {
             Frame::new().inner_margin(20.0).show(ui, |ui| {
                 ui.set_max_width(ui.available_width().min(420.0));
                 ui.add_space((ui.available_height() * 0.12).min(48.0));
@@ -1957,7 +2422,8 @@ impl SnekkieApp {
                 ui.add_space(8.0);
                 ui.label("No session open.");
                 ui.add(
-                    egui::Label::new(RichText::new("SSH, serial, Telnet or TCP.").color(style::secondary(ui))).wrap(),
+                    egui::Label::new(RichText::new("SSH, SFTP, serial, Telnet or TCP.").color(style::secondary(ui)))
+                        .wrap(),
                 );
                 ui.add_space(12.0);
                 if ui.add(style::primary_button(ui, "New connection")).clicked() {
@@ -1971,7 +2437,21 @@ impl SnekkieApp {
         if let Some((entry, action)) = tab_action {
             match (entry, action) {
                 (_, TabAction::Select) => self.select_workspace_tab(entry),
+                (_, TabAction::PickUp) => {
+                    self.tab_drag_target = self.drag_target(entry);
+                    self.select_workspace_tab(entry);
+                }
                 (_, TabAction::Close) => self.close_workspace_tab(entry, false),
+                (_, TabAction::ShowBeside(other)) => self.start_split(entry, other),
+                (_, TabAction::EndSplit) => self.split = None,
+                (_, TabAction::TakeOutOfSplit) => {
+                    self.take_split_partner(entry);
+                }
+                (_, TabAction::SwapSplit) => {
+                    if let Some(split) = &mut self.split {
+                        split.mirror();
+                    }
+                }
                 (WorkspaceTabId::Invade, TabAction::Pause) => {
                     if let Some(game) = &mut self.invade {
                         game.pause();
@@ -1983,11 +2463,13 @@ impl SnekkieApp {
                         game.show_build();
                     }
                 }
-                (WorkspaceTabId::Invade, _) | (_, TabAction::Pause | TabAction::Build) => {}
+                (WorkspaceTabId::Explorer(id), TabAction::Reconnect) => self.reconnect_explorer(&ctx, id),
+                (WorkspaceTabId::Invade | WorkspaceTabId::Explorer(_), _)
+                | (_, TabAction::Pause | TabAction::Build) => {}
                 (WorkspaceTabId::Session(id), action) => self.session_tab_action(&ctx, id, action),
             }
         }
-        if self.tabs.is_empty() && self.invade.is_none() {
+        if self.tabs.is_empty() && self.invade.is_none() && self.explorers.is_empty() {
             return;
         }
         let order = self.workspace_order();
@@ -1996,6 +2478,9 @@ impl SnekkieApp {
         {
             self.select_workspace_tab(*first);
         }
+        let area = ui.available_rect_before_wrap();
+        self.workspace_area = Some(area);
+        self.tab_drag_ui(&ctx, area);
         if self.invade_selected() {
             self.invade_ui(ui);
             return;
@@ -2017,7 +2502,191 @@ impl SnekkieApp {
         }
         // Keys still held after this frame remain quarantined until release.
         self.suppress_held_game_keys(&ctx);
-        let Some(index) = self.active_index() else { return };
+        if let Some(split) = self.visible_split().cloned() {
+            self.split_ui(ui, &split);
+        } else if let Some(active) = self.active {
+            self.pane_ui(ui, active, true, true);
+        }
+    }
+
+    /// What a tab picked up now would go beside: the other tab of its pair,
+    /// the tab on show, or else the one shown last or next to it.
+    fn drag_target(&self, entry: WorkspaceTabId) -> Option<WorkspaceTabId> {
+        if entry == WorkspaceTabId::Invade {
+            return None;
+        }
+        if let Some(split) = self.visible_split().filter(|split| split.contains(entry))
+            && let Some(other) = split.tabs().into_iter().find(|tab| *tab != entry)
+        {
+            return Some(other);
+        }
+        let order = self.workspace_order();
+        let usable = |id: &WorkspaceTabId| *id != entry && *id != WorkspaceTabId::Invade && order.contains(id);
+        self.active
+            .filter(usable)
+            .or(self.last_shown.filter(usable))
+            .or_else(|| order.iter().copied().find(|id| usable(id)))
+    }
+
+    /// Where a dropped tab would land: that part of the workspace, and the
+    /// layout it would make. `target` shows alone unless it's in the layout.
+    fn tab_drop_zone(
+        &self,
+        area: egui::Rect,
+        entry: WorkspaceTabId,
+        target: WorkspaceTabId,
+        position: egui::Pos2,
+    ) -> Option<(egui::Rect, SplitView)> {
+        let base = self
+            .split
+            .clone()
+            .filter(|split| split.contains(target) && split.fits(area))
+            .unwrap_or_else(|| TabLayout::single(target));
+        let (pane, rect) = base.panes(area).into_iter().find(|(_, rect)| rect.contains(position))?;
+        let edge = Edge::at(rect, position, base.tabs().len() > 1);
+        let (edge, next) = base.dropped(entry, pane, edge)?;
+        next.fits(area).then(|| (edge.zone(rect), next))
+    }
+
+    /// A tab dragged out of the strip: show what it would go beside, mark the
+    /// side it would land on, and make the pair when it's let go.
+    fn tab_drag_ui(&mut self, ctx: &egui::Context, area: egui::Rect) {
+        let position = ctx.input(|i| i.pointer.latest_pos());
+        let order = self.workspace_order();
+        let target = self.tab_drag_target.filter(|id| order.contains(id));
+        if let Some(entry) = self.tab_dropped.take() {
+            let zone = target.zip(position).and_then(|(target, at)| self.tab_drop_zone(area, entry, target, at));
+            if let Some((_, split)) = zone {
+                self.split = Some(split);
+            }
+            self.tab_drag_target = None;
+            if order.contains(&entry) {
+                self.active = None;
+                self.select_workspace_tab(entry);
+            }
+            return;
+        }
+        let Some(entry) = self.dragging_tab.and_then(|from| order.get(from).copied()) else { return };
+        let (Some(target), Some(position)) = (target, position) else { return };
+        // Moving off the strip shows the tab it would go beside. No focus
+        // moves until the drop, so nothing typed lands anywhere new.
+        let over = area.contains(position);
+        self.active = Some(if over { target } else { entry });
+        let Some((zone, _)) = self.tab_drop_zone(area, entry, target, position) else { return };
+        let title = self.workspace_titles().get(self.dragging_tab.unwrap_or(0)).cloned().unwrap_or_default();
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::new("tab_drop_zone")));
+        painter.rect_filled(zone, 4.0, self.accent.gamma_multiply(0.18));
+        painter.rect_stroke(zone, 4.0, Stroke::new(2.0, self.accent), egui::StrokeKind::Inside);
+        painter.text(
+            zone.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("Show “{title}” here"),
+            egui::FontId::proportional(16.0),
+            self.accent,
+        );
+    }
+
+    /// The tabs of a layout with draggable dividers. The active one has the keyboard.
+    fn split_ui(&mut self, ui: &mut Ui, split: &SplitView) {
+        let ctx = ui.ctx().clone();
+        let area = ui.available_rect_before_wrap();
+        let Some(active) = self.active else { return };
+        if !split.fits(area) {
+            self.pane_ui(ui, active, true, true);
+            return;
+        }
+        let panes = split.panes(area);
+        let tabs = split.tabs();
+
+        // Clicking in a pane gives it the keyboard before it draws, so a
+        // right-click paste can only ever reach the pane that was clicked.
+        if !self.modal_open()
+            && !egui::Popup::is_any_open(&ctx)
+            && !self.explorers.iter().any(|tab| tabs.contains(&WorkspaceTabId::Explorer(tab.id)) && tab.shows_dialog())
+            && let Some(position) = ctx.input(|i| i.pointer.press_origin().filter(|_| i.pointer.any_pressed()))
+        {
+            for (id, rect) in &panes {
+                if rect.contains(position) && self.active != Some(*id) {
+                    self.select_workspace_tab(*id);
+                }
+            }
+        }
+        let active = self.active.unwrap_or(active);
+
+        for (divider, rect) in split.dividers(area) {
+            let response = ui.interact(rect, ui.id().with(("split_divider", divider)), Sense::drag());
+            let (label, cursor, vertical) = match divider {
+                Divider::Column(_) => ("Split divider", egui::CursorIcon::ResizeHorizontal, true),
+                Divider::Row(_) => ("Row divider", egui::CursorIcon::ResizeVertical, false),
+            };
+            response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, label));
+            let live = response.hovered() || response.dragged();
+            if live {
+                ctx.set_cursor_icon(cursor);
+            }
+            if response.dragged()
+                && let Some(pointer) = response.interact_pointer_pos()
+                && let Some(split) = &mut self.split
+            {
+                split.drag_divider(area, divider, pointer);
+            }
+            let stroke = Stroke::new(1.0, if live { self.accent } else { style::border(ui) });
+            if vertical {
+                ui.painter().vline(rect.center().x, rect.y_range(), stroke);
+            } else {
+                ui.painter().hline(rect.x_range(), rect.center().y, stroke);
+            }
+        }
+
+        // A terminal keeps egui's focus while drawn, which would hold back
+        // the shortcuts of an explorer that is active beside it.
+        if matches!(active, WorkspaceTabId::Explorer(_)) {
+            for tab in &tabs {
+                if let WorkspaceTabId::Session(session) = tab {
+                    let terminal = Id::new(("terminal", *session));
+                    ctx.memory_mut(|memory| {
+                        if memory.has_focus(terminal) {
+                            memory.surrender_focus(terminal);
+                        }
+                    });
+                }
+            }
+        }
+
+        // One explorer takes desktop drops: the active one, else the first.
+        let drops = if matches!(active, WorkspaceTabId::Explorer(_)) {
+            Some(active)
+        } else {
+            tabs.iter().copied().find(|tab| matches!(tab, WorkspaceTabId::Explorer(_)))
+        };
+        for (id, rect) in panes {
+            // Clear of the line that marks the active pane.
+            let inner = rect.with_min_y(rect.top() + 4.0);
+            let mut pane = ui.new_child(egui::UiBuilder::new().max_rect(inner).id_salt(("split_pane", id)));
+            pane.set_clip_rect(inner.intersect(ui.clip_rect()));
+            self.pane_ui(&mut pane, id, id == active, Some(id) == drops);
+            if id == active {
+                let line = egui::Rect::from_x_y_ranges(rect.x_range(), rect.top()..=rect.top() + 2.0);
+                ui.painter().rect_filled(line, 0.0, self.accent);
+            }
+        }
+        ui.allocate_rect(area, Sense::hover());
+    }
+
+    fn pane_ui(&mut self, ui: &mut Ui, id: WorkspaceTabId, focused: bool, drops: bool) {
+        match id {
+            WorkspaceTabId::Explorer(explorer) => self.explorer_ui(ui, explorer, focused, drops),
+            WorkspaceTabId::Session(session) => {
+                if let Some(index) = self.tab_index(session) {
+                    self.session_pane(ui, index, focused);
+                }
+            }
+            WorkspaceTabId::Invade => {}
+        }
+    }
+
+    fn session_pane(&mut self, ui: &mut Ui, index: usize, focused: bool) {
+        let ctx = ui.ctx().clone();
         ui.add_space(2.0);
 
         // Banner: why the session ended, or that it's still connecting.
@@ -2061,12 +2730,16 @@ impl SnekkieApp {
         }
 
         let theme = self.settings.colors();
+        // A dialog from the explorer beside this terminal takes the input too.
+        let beside_dialog = self.visible_split().is_some_and(|split| {
+            self.explorers.iter().any(|tab| split.contains(WorkspaceTabId::Explorer(tab.id)) && tab.shows_dialog())
+        });
         let (agent_cue, agent_motion) = (self.agent_cue(id), self.agent_motion(&ctx));
         let tab = &mut self.tabs[index];
         // egui moves keyboard focus on arrow and Tab presses before a newly
         // focused terminal can claim them, so a key still held from the game
         // could strand its focus. Keep it here until those keys are let go.
-        if !self.suppressed_keys.is_empty() {
+        if focused && !self.suppressed_keys.is_empty() {
             tab.view.focus();
         }
         let family = self.fonts.family(&ctx, &tab.session.profile.font_family);
@@ -2078,8 +2751,9 @@ impl SnekkieApp {
             && self.preferences.is_none()
             && self.snippets.is_none()
             && self.paste_preview.is_none()
-            && !sending;
-        let keyboard = mouse_input && (!self.settings.show_sidebar || !self.sidebar.blocks_terminal_input());
+            && !sending
+            && !beside_dialog;
+        let keyboard = focused && mouse_input && (!self.settings.show_sidebar || !self.sidebar.blocks_terminal_input());
         let animations = self.settings.animations;
         let options = ViewOptions {
             theme,
@@ -2104,7 +2778,9 @@ impl SnekkieApp {
         if let Some(text) = out.copy {
             ctx.copy_text(text);
         }
-        if let Some(text) = out.paste_text {
+        // Pasting goes to the active tab, so nothing else may ask for it.
+        if !focused {
+        } else if let Some(text) = out.paste_text {
             self.request_paste(&ctx, &text);
         } else if out.paste_requested
             && let Some(text) = self.clipboard_text()
@@ -2126,6 +2802,31 @@ impl SnekkieApp {
                 TextExport::Append(_) => picker.set_title("Append terminal text to existing file").pick_file(),
             };
             self.finish_text_export(&ctx, path, export);
+        }
+    }
+
+    fn explorer_ui(&mut self, ui: &mut Ui, id: u64, keyboard: bool, drops: bool) {
+        let ctx = ui.ctx().clone();
+        let options = ExplorerOptions {
+            keyboard,
+            drops,
+            interactive: !self.modal_open(),
+            show_hidden: self.settings.explorer_show_hidden,
+        };
+        let Some(tab) = self.explorers.iter_mut().find(|e| e.id == id) else { return };
+        match tab.ui(ui, &options) {
+            Some(ExplorerAction::Reconnect) => self.reconnect_explorer(&ctx, id),
+            Some(ExplorerAction::ShowHidden(show)) => {
+                self.settings.explorer_show_hidden = show;
+                self.save_settings();
+            }
+            None => {}
+        }
+    }
+
+    fn reconnect_explorer(&mut self, ctx: &egui::Context, id: u64) {
+        if let Some(profile) = self.explorers.iter().find(|e| e.id == id).map(|e| e.profile.clone()) {
+            self.request_connect(ctx, profile, Target::ReconnectExplorer(id));
         }
     }
 
@@ -2200,6 +2901,37 @@ impl SnekkieApp {
                     });
                     ui.horizontal(|ui| {
                         if ui.button("Apply").clicked() {
+                            result = Some(DialogResult::Yes);
+                        }
+                        if ui.button("Cancel").clicked() || escape {
+                            close = true;
+                        }
+                    });
+                }
+                Dialog::Transfer { direction, local, remote, replace, .. } => {
+                    let upload = *direction == Direction::Upload;
+                    ui.heading(if upload { "Upload file" } else { "Download file" });
+                    ui.horizontal(|ui| {
+                        if ui.button(if upload { "Choose file…" } else { "Save as…" }).clicked() {
+                            let picker = rfd::FileDialog::new();
+                            let picked = if upload { picker.pick_file() } else { picker.save_file() };
+                            *local = picked.or(local.take());
+                        }
+                        ui.label(local.as_ref().map_or("Nothing chosen".into(), |p| p.display().to_string()));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Remote file");
+                        ui.add(egui::TextEdit::singleline(remote).hint_text("/tmp/file.txt or flash:file.bin"));
+                    });
+                    if upload {
+                        ui.checkbox(replace, "Replace the remote file if it exists");
+                        if *replace {
+                            ui.label("On devices with only SCP, a failed upload can leave the remote file incomplete.");
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        let ready = local.is_some() && !remote.trim().is_empty();
+                        if ui.add_enabled(ready, egui::Button::new("Start")).clicked() {
                             result = Some(DialogResult::Yes);
                         }
                         if ui.button("Cancel").clicked() || escape {
@@ -2417,6 +3149,11 @@ impl SnekkieApp {
                     self.tabs[index].color_override = true;
                 }
             }
+            (Dialog::Transfer { id, direction, local: Some(local), remote, replace }, DialogResult::Yes) => {
+                if let Some(index) = self.tab_index(id) {
+                    self.tabs[index].session.start_transfer(direction, local, remote.trim().to_string(), replace);
+                }
+            }
             (Dialog::HostKey(question), result) => {
                 let _ = question.reply.send(result == DialogResult::Yes);
             }
@@ -2425,11 +3162,17 @@ impl SnekkieApp {
             }
             (Dialog::Confirm { action, .. }, DialogResult::Yes) => match action {
                 ConfirmAction::CloseTab(id) => self.close_tab(id, true),
+                ConfirmAction::CloseExplorer(id) => self.close_explorer(id, true),
                 ConfirmAction::Quit => self.quit_now(ctx),
                 ConfirmAction::InstallUpdate => self.install_update(ctx),
                 ConfirmAction::DeleteSaved(name) => {
                     if let Err(e) = self.store.remove(&name) {
                         self.message("Delete session", format!("Could not save sessions: {e}"));
+                    }
+                }
+                ConfirmAction::DeleteFolder(path) => {
+                    if let Err(e) = self.store.delete_folder(&path) {
+                        self.message("Delete folder", format!("Could not save sessions: {e}"));
                     }
                 }
                 ConfirmAction::DeleteSnippet(id) => {
@@ -2474,6 +3217,31 @@ impl SnekkieApp {
                         self.message("Save session", format!("Could not save sessions: {e}"));
                     }
                 }
+                InputAction::NewFolder { parent, session } => {
+                    let path = profiles::join_folder(&parent, text.trim());
+                    if let Some(problem) = profiles::folder_name_error(text.trim())
+                        .map(str::to_string)
+                        .or_else(|| self.store.folder_create_error(&path))
+                    {
+                        self.message("New folder", problem);
+                        return;
+                    }
+                    let saved = self.store.create_folder(&path).and_then(|()| match &session {
+                        Some(name) => self.store.move_session(name, &path),
+                        None => Ok(()),
+                    });
+                    if let Err(e) = saved {
+                        self.message("New folder", format!("Could not save sessions: {e}"));
+                    }
+                }
+                InputAction::RenameFolder(path) => {
+                    if let Some(problem) = profiles::folder_name_error(text.trim()) {
+                        self.message("Rename folder", problem);
+                        return;
+                    }
+                    let to = profiles::join_folder(profiles::folder_parent(&path), text.trim());
+                    self.rename_folder(path, to);
+                }
                 InputAction::OtherDevice => {
                     let device = text.trim();
                     if !device.is_empty() {
@@ -2509,7 +3277,8 @@ impl SnekkieApp {
             .tabs
             .iter()
             .filter(|t| t.session.profile.kind().is_network() && !matches!(t.session.state(), State::Closed(_)))
-            .count();
+            .count()
+            + self.explorers.iter().filter(|e| e.is_live()).count();
         let mut outcome = preferences::Outcome::Open;
         let modal = egui::Modal::new(Id::new("preferences")).show(ctx, |ui| {
             ui.set_width((ctx.content_rect().width() - 48.0).clamp(200.0, preferences::WIDTH));
@@ -2523,14 +3292,18 @@ impl SnekkieApp {
             preferences::Outcome::Cancel => self.preferences = None,
             preferences::Outcome::Save(settings) => {
                 let enabling_offline = settings.offline_mode && !self.settings.offline_mode;
-                self.settings = AppSettings { show_sidebar: self.settings.show_sidebar, ..settings };
+                self.settings = AppSettings { show_sidebar: self.settings.show_sidebar, ..*settings };
                 self.network.set_offline(self.settings.offline_mode);
                 self.updater.set_offline(self.settings.offline_mode);
+                self.explorer_editor.lock().clone_from(&self.settings.explorer_editor);
                 if enabling_offline {
                     for tab in &self.tabs {
                         if tab.session.profile.kind() != Kind::Serial {
                             tab.session.shutdown();
                         }
+                    }
+                    for tab in &mut self.explorers {
+                        tab.shutdown("Offline mode closed this connection.");
                     }
                     self.dialogs.retain(|d| !matches!(d, Dialog::Update { .. }));
                 }
@@ -2899,11 +3672,24 @@ impl SnekkieApp {
 
     /// Every tab's title in strip order; the game's is "Invade".
     #[doc(hidden)]
+    /// The titles of the tabs showing together, by column and then from the top.
+    #[doc(hidden)]
+    pub fn split_titles(&self) -> Option<Vec<Vec<String>>> {
+        let split = self.split.as_ref()?;
+        let order = self.workspace_order();
+        let titles = self.workspace_titles();
+        let title = |id: &WorkspaceTabId| order.iter().position(|tab| tab == id).map(|at| titles[at].clone());
+        Some(split.rows().iter().map(|column| column.iter().filter_map(title).collect()).collect())
+    }
+
     pub fn workspace_titles(&self) -> Vec<String> {
         self.workspace_order()
             .into_iter()
             .map(|entry| match entry {
                 WorkspaceTabId::Invade => "Invade".to_string(),
+                WorkspaceTabId::Explorer(id) => {
+                    self.explorers.iter().find(|e| e.id == id).map(ExplorerTab::title).unwrap_or_default()
+                }
                 WorkspaceTabId::Session(id) => {
                     self.tab_index(id).map(|i| self.tabs[i].session.title()).unwrap_or_default()
                 }
@@ -2915,6 +3701,7 @@ impl SnekkieApp {
     pub fn active_title(&self) -> Option<String> {
         match self.active? {
             WorkspaceTabId::Invade => Some("Invade".into()),
+            WorkspaceTabId::Explorer(id) => self.explorers.iter().find(|e| e.id == id).map(ExplorerTab::title),
             WorkspaceTabId::Session(_) => self.current().map(|t| t.session.title()),
         }
     }
@@ -2984,6 +3771,7 @@ impl SnekkieApp {
                     }
                 }
                 Dialog::TabColor { .. } => "Session tab color".into(),
+                Dialog::Transfer { .. } => "File transfer".into(),
                 Dialog::ProfileColor { name, .. } => format!("Default tab color for {name}"),
             })
             .collect()
@@ -3083,6 +3871,8 @@ fn append_terminal_text(path: &Path, text: &str) -> std::io::Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabAction {
     Select,
+    /// A drag began on this tab.
+    PickUp,
     Close,
     /// Game tab only.
     Pause,
@@ -3093,6 +3883,58 @@ enum TabAction {
     CustomColor,
     UseProfileColor,
     SaveProfileColor,
+    Transfer(Direction),
+    OpenExplorer,
+    OpenExplorerBeside,
+    /// Show this tab on the left and the named tab on the right.
+    ShowBeside(WorkspaceTabId),
+    EndSplit,
+    TakeOutOfSplit,
+    SwapSplit,
+}
+
+/// The side by side items of a tab's right-click menu.
+fn split_menu(
+    ui: &mut Ui,
+    entry: WorkspaceTabId,
+    in_split: bool,
+    columns: usize,
+    candidates: &[(WorkspaceTabId, String)],
+    action: &mut Option<(WorkspaceTabId, TabAction)>,
+) {
+    ui.separator();
+    ui.add_enabled_ui(!candidates.is_empty(), |ui| {
+        ui.menu_button("Show side by side with", |ui| {
+            for (other, title) in candidates {
+                if ui.button(title).clicked() {
+                    *action = Some((entry, TabAction::ShowBeside(*other)));
+                    ui.close();
+                }
+            }
+        });
+    });
+    if in_split {
+        if columns > 1 && ui.button("Swap sides").clicked() {
+            *action = Some((entry, TabAction::SwapSplit));
+        }
+        if ui.button("Take out of side by side").clicked() {
+            *action = Some((entry, TabAction::TakeOutOfSplit));
+        }
+        if ui.button("End side by side").clicked() {
+            *action = Some((entry, TabAction::EndSplit));
+        }
+    }
+}
+
+/// A status bar line for a running file transfer.
+fn transfer_status(direction: Direction, local: &std::path::Path, (done, total): (u64, u64)) -> String {
+    let verb = if direction == Direction::Upload { "Uploading" } else { "Downloading" };
+    let file = local.file_name().unwrap_or_default().to_string_lossy();
+    let megabytes = done as f64 / 1_048_576.0;
+    match done.saturating_mul(100).checked_div(total) {
+        Some(percent) => format!("{verb} {file}: {megabytes:.1} MB ({percent}%)"),
+        None => format!("{verb} {file}: {megabytes:.1} MB"),
+    }
 }
 
 /// The tab that takes a closed tab's place: the next one, or the previous
@@ -3303,6 +4145,44 @@ mod tests {
         assert!(app.sidebar.draft.favorite);
         assert_eq!(app.tabs[0].color, crate::settings::parse_hex("#abcdef"));
         assert!(app.dialog_texts()[0].contains("Could not save profile changes"));
+    }
+
+    #[test]
+    fn transfer_dialog_starts_only_with_a_file_and_a_remote_path() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = SnekkieApp::with_port_lister(paths, Vec::new);
+        app.dialogs.push(Dialog::Transfer {
+            id: 1,
+            direction: Direction::Upload,
+            local: None,
+            remote: String::new(),
+            replace: false,
+        });
+        let mut harness = egui_kittest::Harness::builder().with_size([700.0, 400.0]).build_ui_state(
+            |ui, app: &mut SnekkieApp| {
+                app.dialogs_ui(ui.ctx());
+            },
+            app,
+        );
+        harness.run();
+        assert!(harness.get_by_label("Start").accesskit_node().is_disabled());
+        assert!(harness.query_by_label_contains("incomplete").is_none());
+
+        harness.get_by_label("Replace the remote file if it exists").click();
+        harness.run();
+        assert!(harness.query_by_label_contains("incomplete").is_some());
+
+        if let Dialog::Transfer { local, remote, .. } = &mut harness.state_mut().dialogs[0] {
+            *local = Some("source.bin".into());
+            *remote = "flash:source.bin".into();
+        }
+        harness.run();
+        assert!(!harness.get_by_label("Start").accesskit_node().is_disabled());
+        harness.get_by_label("Start").click();
+        harness.run();
+        assert!(harness.state().dialogs.is_empty());
     }
 
     #[test]

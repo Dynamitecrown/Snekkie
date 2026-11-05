@@ -8,9 +8,11 @@
 //! app needs to know how it works.
 
 pub mod serial;
+pub mod sftp;
 pub mod ssh;
 pub mod tcp;
 pub mod telnet;
+pub mod transfer;
 
 use std::time::Duration;
 
@@ -81,6 +83,10 @@ pub enum Command {
     /// passes it on as a telnet BREAK, which console servers turn into a
     /// real one on the device's line.
     Break,
+    /// Move a file beside the shell. SSH only.
+    Transfer(transfer::Request),
+    /// Hand over the logged-in connection for a file explorer. SSH only.
+    ShareConnection(tokio::sync::oneshot::Sender<ssh::Connection>),
     Close,
 }
 

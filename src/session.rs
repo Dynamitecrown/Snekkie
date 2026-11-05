@@ -17,6 +17,7 @@ use crate::terminal::emulator::{Emulator, Responder};
 use crate::terminal::keys;
 use crate::terminal::paging::{AutoPager, PROMPT_WAIT};
 use crate::transport::ssh::{Credentials, HostKeyAsker};
+use crate::transport::transfer::{self, Direction, Progress};
 use crate::transport::{Command, Link, Sink, serial, ssh, tcp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +209,16 @@ impl Remote {
         self.profile.kind()
     }
 
+    /// Borrow this session's login, while it's connected.
+    pub fn share_connection(&self) -> Option<tokio::sync::oneshot::Receiver<ssh::Connection>> {
+        if self.kind() != Kind::Ssh || self.state() != State::Connected {
+            return None;
+        }
+        let (reply, connection) = tokio::sync::oneshot::channel();
+        self.link.lock().as_ref()?.send(Command::ShareConnection(reply));
+        Some(connection)
+    }
+
     pub fn state(&self) -> State {
         self.shared.state.lock().clone()
     }
@@ -348,9 +359,16 @@ pub struct Session {
     /// The current transport, also used by the emulator to answer queries.
     link: Arc<Mutex<Option<Link>>>,
     resolved_log_path: std::path::PathBuf,
+    /// The running file transfer: one at a time per session.
+    transfer: Mutex<Option<(Direction, std::path::PathBuf, Arc<Progress>)>>,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// An ID no other tab has, whatever its type, so agents can name any of them.
+pub fn next_tab_id() -> u64 {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 impl Session {
     pub fn new(profile: Profile, theme: Theme, repaint: impl Fn() + Send + Sync + 'static) -> Session {
@@ -380,9 +398,9 @@ impl Session {
             taps: Mutex::new(Vec::new()),
             repaint: Box::new(repaint),
         });
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let id = next_tab_id();
         let resolved_log_path = Self::resolve_log_path(&profile, id);
-        Session { id, profile, shared, link, resolved_log_path }
+        Session { id, profile, shared, link, resolved_log_path, transfer: Mutex::new(None) }
     }
 
     /// Start (or restart) the connection.
@@ -419,7 +437,7 @@ impl Session {
             Kind::Telnet | Kind::Raw => {
                 tcp::start_with_access(cx.runtime, self.profile.clone(), size, sink, cx.network)
             }
-            Kind::Ssh => {
+            Kind::Ssh | Kind::Sftp => {
                 let credentials = Credentials {
                     password: cx.password,
                     key_passphrase: cx.key_passphrase,
@@ -597,7 +615,7 @@ impl Session {
 
     pub fn send_break(&self) {
         match (self.profile.kind(), self.state()) {
-            (Kind::Ssh | Kind::Raw, _) => {
+            (Kind::Ssh | Kind::Sftp | Kind::Raw, _) => {
                 let text = format!("{} sessions do not support break", self.profile.kind().label());
                 self.shared.notify(NoticeLevel::Warning, text);
             }
@@ -609,6 +627,52 @@ impl Session {
             }
             (Kind::Serial | Kind::Telnet, _) => self.shared.notify(NoticeLevel::Warning, "Not connected".into()),
         }
+    }
+
+    /// Whether a file transfer could start right now.
+    pub fn can_transfer(&self) -> bool {
+        self.profile.kind() == Kind::Ssh && self.is_connected() && self.transfer.lock().is_none()
+    }
+
+    /// Borrow this session's login for a file explorer, while it's connected.
+    pub fn share_connection(&self) -> Option<tokio::sync::oneshot::Receiver<ssh::Connection>> {
+        self.remote().share_connection()
+    }
+
+    /// Start moving a file beside the shell, if [`Self::can_transfer`].
+    pub fn start_transfer(&self, direction: Direction, local: std::path::PathBuf, remote: String, replace: bool) {
+        if !self.can_transfer() {
+            self.shared.notify(NoticeLevel::Warning, "File transfer needs a connected SSH session".into());
+            return;
+        }
+        let request = transfer::Request::new(direction, local.clone(), remote, replace);
+        *self.transfer.lock() = Some((direction, local, request.progress.clone()));
+        if let Some(link) = self.link.lock().as_ref() {
+            link.send(Command::Transfer(request));
+        }
+    }
+
+    /// The running transfer, if any.
+    pub fn transfer_progress(&self) -> Option<(Direction, std::path::PathBuf, Arc<Progress>)> {
+        self.transfer.lock().clone()
+    }
+
+    /// Report a transfer that has finished. Returns whether one is still running.
+    pub fn poll_transfer(&self) -> bool {
+        let mut transfer = self.transfer.lock();
+        let Some((direction, local, progress)) = transfer.as_ref() else { return false };
+        let Some(outcome) = progress.outcome() else { return true };
+        let verb = if *direction == Direction::Upload { "Upload" } else { "Download" };
+        let file = local.file_name().unwrap_or_default().to_string_lossy();
+        match outcome {
+            Ok(protocol) => self.shared.notify(NoticeLevel::Info, format!("{verb} of {file} finished ({protocol})")),
+            Err(reason) if reason == "Canceled" => {
+                self.shared.notify(NoticeLevel::Info, format!("{verb} of {file} canceled"));
+            }
+            Err(reason) => self.shared.notify(NoticeLevel::Warning, format!("{verb} of {file} failed: {reason}")),
+        }
+        *transfer = None;
+        false
     }
 
     /// Hang up. Safe to call more than once.
@@ -630,7 +694,7 @@ impl Session {
 
     pub fn description(&self) -> String {
         match self.profile.kind() {
-            Kind::Ssh => ssh::description(&self.profile),
+            Kind::Ssh | Kind::Sftp => ssh::description(&self.profile),
             Kind::Telnet | Kind::Raw => tcp::description(&self.profile),
             Kind::Serial => serial::description(&self.profile),
         }

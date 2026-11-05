@@ -16,7 +16,7 @@ use russh::{ChannelMsg, Disconnect, MethodKind, Preferred, cipher, kex, mac};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot;
 
-use super::{CONNECT_TIMEOUT, Command, Link, Sink, TERM, connect_tcp, keepalive_interval};
+use super::{CONNECT_TIMEOUT, Command, Link, Sink, TERM, connect_tcp, keepalive_interval, transfer};
 use crate::profiles::{Auth, Profile};
 
 /// Default key files tried in "SSH agent / default keys" mode, like
@@ -43,7 +43,18 @@ pub struct Credentials {
     pub known_hosts: PathBuf,
 }
 
+static KNOWN_HOSTS_FOR_TESTS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Keeps app-level tests away from the user's real known_hosts file.
+#[doc(hidden)]
+pub fn use_known_hosts_for_tests(path: PathBuf) {
+    let _ = KNOWN_HOSTS_FOR_TESTS.set(path);
+}
+
 pub fn known_hosts_path() -> PathBuf {
+    if let Some(path) = KNOWN_HOSTS_FOR_TESTS.get() {
+        return path.clone();
+    }
     dirs::home_dir().unwrap_or_default().join(".ssh").join("known_hosts")
 }
 
@@ -127,7 +138,7 @@ fn client_config(profile: &Profile) -> client::Config {
 }
 
 #[derive(Debug)]
-enum Error {
+pub(super) enum Error {
     Ssh(russh::Error),
     HostKeyChanged { line: usize },
     HostKeyRevoked { line: usize },
@@ -191,7 +202,7 @@ fn check_revoked_host_key(host: &str, port: u16, key: &PublicKey, path: &Path) -
     Ok(())
 }
 
-struct Client {
+pub(super) struct Client {
     host: String,
     port: u16,
     known_hosts: PathBuf,
@@ -309,7 +320,43 @@ pub fn expand_home(path: &str) -> PathBuf {
     }
 }
 
-type Session = Handle<Client>;
+pub(super) type Session = Handle<Client>;
+
+/// A logged-in connection that a shell and a file explorer can share. Whoever
+/// lets go of it last hangs up.
+#[derive(Clone)]
+pub struct Connection {
+    handle: Arc<Session>,
+    users: Arc<()>,
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Connection")
+    }
+}
+
+impl Connection {
+    fn new(handle: Session) -> Connection {
+        Connection { handle: Arc::new(handle), users: Arc::new(()) }
+    }
+
+    pub(super) fn handle(&self) -> &Session {
+        &self.handle
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.handle.is_closed()
+    }
+
+    /// Stop using the connection, hanging up if nobody else is.
+    pub async fn release(self) {
+        // into_inner picks exactly one winner when two holders release together.
+        if Arc::into_inner(self.users).is_some() {
+            let _ = self.handle.disconnect(Disconnect::ByApplication, "", "en").await;
+        }
+    }
+}
 
 async fn try_password(handle: &mut Session, user: &str, password: &str) -> Result<bool, String> {
     let result =
@@ -480,6 +527,29 @@ async fn establish(
     Ok(handle)
 }
 
+/// Log in without opening a shell, for a file explorer of its own.
+pub fn connect(
+    runtime: &tokio::runtime::Handle,
+    profile: Profile,
+    credentials: Credentials,
+    ask: HostKeyAsker,
+    sink: Arc<dyn Sink>,
+    access: crate::network::NetworkAccess,
+) -> oneshot::Receiver<Result<Connection, String>> {
+    let (mut reply, connection) = oneshot::channel();
+    runtime.spawn(async move {
+        let lost = Arc::new(Mutex::new(None));
+        tokio::select! {
+            result = establish(&profile, &credentials, ask, sink, lost, &access) => {
+                let _ = reply.send(result.map(Connection::new));
+            }
+            // Closing the tab cancels a slow connect.
+            () = reply.closed() => {}
+        }
+    });
+    connection
+}
+
 /// Start connecting in the background. Everything after this is reported
 /// through the sink.
 pub fn start(
@@ -541,6 +611,10 @@ async fn run(
     };
     // Don't keep the password in memory for the life of the session.
     drop(credentials);
+    let connection = Connection::new(handle);
+    let handle = connection.handle.clone();
+    // Transfers stop when this goes away, however the session ends.
+    let alive = Arc::new(());
 
     let mut channel = match handle.channel_open_session().await {
         Ok(channel) => channel,
@@ -574,9 +648,16 @@ async fn run(
                     let _ = channel.window_change(columns.into(), lines.into(), 0, 0).await;
                 }
                 Some(Command::Break) => sink.notice("SSH sessions do not support break".into()),
+                Some(Command::Transfer(mut request)) => {
+                    request.connection = Arc::downgrade(&alive);
+                    tokio::spawn(transfer::run(handle.clone(), request));
+                }
+                Some(Command::ShareConnection(reply)) => {
+                    let _ = reply.send(connection.clone());
+                }
                 Some(Command::Close) | None => {
                     let _ = channel.close().await;
-                    let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+                    connection.release().await;
                     return None;
                 }
             },

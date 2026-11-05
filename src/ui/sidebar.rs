@@ -6,7 +6,7 @@
 use egui::{ComboBox, DragValue, RichText, TextEdit, Ui};
 
 use super::style;
-use crate::profiles::{Auth, Kind, LocalEcho, Profile, ProfileStore};
+use crate::profiles::{self, Auth, Kind, LocalEcho, Profile, ProfileStore};
 use crate::settings::AppSettings;
 use crate::terminal::highlight::{syntax_label, syntax_options};
 use crate::terminal::keys::Backspace;
@@ -36,6 +36,25 @@ pub enum Action {
     /// Ask, then delete the saved session with this name.
     Delete(String),
     ToggleFavorite(String),
+    /// Ask for a name, make the folder, and put this saved session in it.
+    NewFolder {
+        parent: String,
+        session: Option<String>,
+    },
+    RenameFolder(String),
+    /// Ask, then delete the folder and keep what's in it.
+    DeleteFolder(String),
+    MoveFolder {
+        path: String,
+        into: String,
+    },
+    MoveSession {
+        name: String,
+        folder: String,
+    },
+    ToggleFolder(String),
+    /// Start a blank form that will save into this folder.
+    NewSessionIn(String),
     ProfileColor(String),
     ImportProfiles,
     ExportProfiles,
@@ -164,6 +183,14 @@ impl Sidebar {
         self.name_destination = Some(destination(&self.draft));
     }
 
+    pub fn set_folder(&mut self, folder: String) {
+        self.draft.folder = folder;
+    }
+
+    pub fn draft_name(&self) -> &str {
+        &self.draft.name
+    }
+
     pub fn set_name(&mut self, name: String) {
         self.draft.name = name;
         self.name_destination = Some(destination(&self.draft));
@@ -224,6 +251,9 @@ impl Sidebar {
             let host = profile.host.trim();
             profile.name = match kind {
                 Kind::Serial => profile.device.trim().to_string(),
+                // A shell on the same host would otherwise take the same name.
+                Kind::Sftp if !host.is_empty() && profile.port == 22 => format!("{host} SFTP"),
+                Kind::Sftp if !host.is_empty() => format!("{host}:{} SFTP", profile.port),
                 // A console server is one host with a port per line, so
                 // the port is what tells its sessions apart.
                 _ if host.is_empty() || kind.default_port() == Some(profile.port) => host.to_string(),
@@ -379,7 +409,7 @@ impl Sidebar {
                 ui.add(DragValue::new(&mut self.draft.port).range(1..=65535).speed(0.2)).labelled_by(label.id);
             });
         });
-        if self.draft.kind() == Kind::Ssh {
+        if self.draft.kind().is_ssh() {
             self.ssh_login(ui, actions);
         }
     }
@@ -560,6 +590,10 @@ impl Sidebar {
         if self.draft.kind().is_network() {
             self.keepalive_ui(ui);
         }
+        // Everything below is about a terminal, which SFTP doesn't have.
+        if self.draft.kind() == Kind::Sftp {
+            return;
+        }
         row(ui, "Scrollback lines", |ui| {
             ui.add(DragValue::new(&mut self.draft.scrollback).range(0..=200_000).speed(100.0))
         });
@@ -639,6 +673,217 @@ impl Sidebar {
         });
     }
 
+    /// The folders inside `parent`, then its sessions.
+    fn folder_contents_ui(&mut self, ui: &mut Ui, tree: &SavedTree, parent: &str, actions: &mut Vec<Action>) {
+        for path in tree.folders.iter().filter(|path| profiles::folder_parent(path) == parent) {
+            let matching = tree.visible.iter().filter(|p| profiles::in_folder(&p.folder, path)).count();
+            // While filtering, only folders with a result show, and they show open.
+            if tree.filtering && matching == 0 {
+                continue;
+            }
+            let open = tree.filtering || !tree.store.is_collapsed(path);
+            ui.push_id(("saved_folder", path), |ui| self.folder_row(ui, tree, path, matching, open, actions));
+            if open {
+                self.folder_contents_ui(ui, tree, path, actions);
+            }
+        }
+        for profile in tree.visible.iter().filter(|p| p.folder == parent) {
+            ui.push_id(("saved_profile", &profile.name), |ui| self.saved_row(ui, tree, profile, actions));
+        }
+    }
+
+    fn folder_row(
+        &mut self,
+        ui: &mut Ui,
+        tree: &SavedTree,
+        path: &str,
+        count: usize,
+        open: bool,
+        actions: &mut Vec<Action>,
+    ) {
+        let name = profiles::folder_leaf(path);
+        let label = format!("{} {name}  ({count})", if open { "⏷" } else { "⏵" });
+        let response = ui
+            .horizontal(|ui| {
+                ui.add_space(indent(path));
+                ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                    ui.add(egui::Button::selectable(false, label).min_size(egui::vec2(0.0, 22.0)))
+                })
+                .inner
+            })
+            .inner;
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Folder {name}")));
+        if response.clicked() {
+            actions.push(Action::ToggleFolder(path.to_string()));
+        }
+        if let Some(dragged) = response.dnd_release_payload::<DraggedSession>() {
+            actions.push(Action::MoveSession { name: dragged.0.clone(), folder: path.to_string() });
+        }
+        if response.dnd_hover_payload::<DraggedSession>().is_some() {
+            ui.painter().rect_stroke(
+                response.rect,
+                3.0,
+                egui::Stroke::new(1.5, ui.visuals().hyperlink_color),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let menu_was_open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+        let menu = response.context_menu(|ui| {
+            if ui.button("New session here").clicked() {
+                actions.push(Action::NewSessionIn(path.to_string()));
+                ui.close();
+            }
+            let room = profiles::folder_depth(path) < profiles::MAX_FOLDER_DEPTH;
+            if ui.add_enabled(room, egui::Button::new("New subfolder…")).clicked() {
+                actions.push(Action::NewFolder { parent: path.to_string(), session: None });
+                ui.close();
+            }
+            if ui.button("Rename…").clicked() {
+                actions.push(Action::RenameFolder(path.to_string()));
+                ui.close();
+            }
+            ui.menu_button("Move to", |ui| {
+                if ui.add_enabled(!profiles::folder_parent(path).is_empty(), egui::Button::new("No folder")).clicked() {
+                    actions.push(Action::MoveFolder { path: path.to_string(), into: String::new() });
+                    ui.close();
+                }
+                for into in tree.folders {
+                    if !profiles::in_folder(into, path)
+                        && profiles::folder_parent(path) != into
+                        && ui.button(into).clicked()
+                    {
+                        actions.push(Action::MoveFolder { path: path.to_string(), into: into.clone() });
+                        ui.close();
+                    }
+                }
+            });
+            ui.separator();
+            if ui.button("Delete folder…").clicked() {
+                actions.push(Action::DeleteFolder(path.to_string()));
+                ui.close();
+            }
+        });
+        self.blocks_terminal_input |= menu_was_open || menu.is_some() || response.has_focus() || response.lost_focus();
+    }
+
+    fn saved_row(&mut self, ui: &mut Ui, tree: &SavedTree, profile: &Profile, actions: &mut Vec<Action>) {
+        let selected = self.selected_saved.as_deref() == Some(profile.name.as_str());
+        let response = ui
+            .horizontal(|ui| {
+                ui.add_space(indent(&profile.folder));
+                let label = format!("{} {}", if profile.favorite { "Unfavorite" } else { "Favorite" }, profile.name);
+                let star = ui
+                    .add_sized([24.0, 34.0], egui::Button::new(if profile.favorite { "★" } else { "☆" }).frame(false));
+                star.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &label));
+                self.blocks_terminal_input |= star.has_focus() || star.lost_focus();
+                if star.on_hover_text(label).clicked() {
+                    actions.push(Action::ToggleFavorite(profile.name.clone()));
+                }
+                ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                    let endpoint = if profile.kind() == Kind::Serial {
+                        format!("{} · {} baud", profile.device, profile.baud)
+                    } else {
+                        format!("{}:{}", profile.host, profile.port)
+                    };
+                    let response = ui.add(
+                        egui::Button::selectable(selected, "")
+                            .min_size(egui::vec2(0.0, 34.0))
+                            .sense(egui::Sense::click_and_drag()),
+                    );
+                    // Elide each line independently so a long alias never hides its destination.
+                    let details = format!("{} · {endpoint}", profile.kind().label());
+                    for (text, font, color, y) in [
+                        (profile.name.as_str(), egui::TextStyle::Body, style::primary(ui), 3.0),
+                        (details.as_str(), egui::TextStyle::Small, style::secondary(ui), 18.0),
+                    ] {
+                        let mut job = egui::text::LayoutJob::simple(
+                            text.into(),
+                            font.resolve(ui.style()),
+                            color,
+                            (response.rect.width() - 16.0).max(1.0),
+                        );
+                        job.wrap.max_rows = 1;
+                        let galley = ui.fonts_mut(|f| f.layout_job(job));
+                        ui.painter().with_clip_rect(response.rect.intersect(ui.clip_rect())).galley(
+                            response.rect.min + egui::vec2(8.0, y),
+                            galley,
+                            color,
+                        );
+                    }
+                    response.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::SelectableLabel,
+                            ui.is_enabled(),
+                            selected,
+                            &profile.name,
+                        )
+                    });
+                    if selected {
+                        ui.painter().hline(
+                            response.rect.x_range(),
+                            response.rect.bottom(),
+                            egui::Stroke::new(1.0, ui.visuals().hyperlink_color),
+                        );
+                    }
+                    response
+                })
+                .inner
+            })
+            .inner;
+        // The same strip open tabs show for the profile's default color.
+        if let Some(color) = crate::settings::parse_hex(&profile.tab_color) {
+            let rect = response.rect;
+            let strip =
+                egui::Rect::from_x_y_ranges(rect.left()..=rect.left() + 3.0, rect.top() + 2.0..=rect.bottom() - 2.0);
+            ui.painter().rect_filled(strip, 1.0, color);
+        }
+        let response = response.on_hover_text(format!(
+            "{} — {}\n{}\nDouble-click to connect",
+            profile.name,
+            profile.kind().label(),
+            if profile.kind() == Kind::Serial {
+                profile.device.clone()
+            } else {
+                format!("{}:{}", profile.host, profile.port)
+            },
+        ));
+        let menu_was_open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+        let menu = response.context_menu(|ui| {
+            if ui.button("Default tab color…").clicked() {
+                actions.push(Action::ProfileColor(profile.name.clone()));
+                ui.close();
+            }
+            ui.menu_button("Move to folder", |ui| {
+                if ui.add_enabled(!profile.folder.is_empty(), egui::Button::new("No folder")).clicked() {
+                    actions.push(Action::MoveSession { name: profile.name.clone(), folder: String::new() });
+                    ui.close();
+                }
+                for folder in tree.folders {
+                    if ui.add_enabled(*folder != profile.folder, egui::Button::new(folder)).clicked() {
+                        actions.push(Action::MoveSession { name: profile.name.clone(), folder: folder.clone() });
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("New folder…").clicked() {
+                    actions.push(Action::NewFolder { parent: String::new(), session: Some(profile.name.clone()) });
+                    ui.close();
+                }
+            });
+        });
+        self.blocks_terminal_input |= menu_was_open || menu.is_some() || response.has_focus() || response.lost_focus();
+        if response.clicked() {
+            self.selected_saved = Some(profile.name.clone());
+        }
+        if response.double_clicked() {
+            self.selected_saved = Some(profile.name.clone());
+            actions.push(Action::Connect((*profile).clone()));
+        }
+        if response.drag_started() {
+            egui::DragAndDrop::set_payload(ui.ctx(), DraggedSession(profile.name.clone()));
+        }
+    }
+
     fn saved_ui(&mut self, ui: &mut Ui, store: &ProfileStore, actions: &mut Vec<Action>) {
         // Favorites sits in the heading row to leave the list as much room as
         // possible in the default window.
@@ -710,111 +955,20 @@ impl Sidebar {
                         } else if visible.is_empty() {
                             ui.label(RichText::new("No matching sessions").color(style::secondary(ui)));
                         }
-                        for profile in visible {
-                            ui.push_id(("saved_profile", &profile.name), |ui| {
-                                let selected = self.selected_saved.as_deref() == Some(profile.name.as_str());
-                                let response = ui
-                                    .horizontal(|ui| {
-                                        let label = format!(
-                                            "{} {}",
-                                            if profile.favorite { "Unfavorite" } else { "Favorite" },
-                                            profile.name
-                                        );
-                                        let star = ui.add_sized(
-                                            [24.0, 34.0],
-                                            egui::Button::new(if profile.favorite { "★" } else { "☆" }).frame(false),
-                                        );
-                                        star.widget_info(|| {
-                                            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &label)
-                                        });
-                                        self.blocks_terminal_input |= star.has_focus() || star.lost_focus();
-                                        if star.on_hover_text(label).clicked() {
-                                            actions.push(Action::ToggleFavorite(profile.name.clone()));
-                                        }
-                                        ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                                            let endpoint = if profile.kind() == Kind::Serial {
-                                                format!("{} · {} baud", profile.device, profile.baud)
-                                            } else {
-                                                format!("{}:{}", profile.host, profile.port)
-                                            };
-                                            let response = ui.add(
-                                                egui::Button::selectable(selected, "").min_size(egui::vec2(0.0, 34.0)),
-                                            );
-                                            // Elide each line independently so a long alias never hides its destination.
-                                            let details = format!("{} · {endpoint}", profile.kind().label());
-                                            for (text, font, color, y) in [
-                                                (profile.name.as_str(), egui::TextStyle::Body, style::primary(ui), 3.0),
-                                                (details.as_str(), egui::TextStyle::Small, style::secondary(ui), 18.0),
-                                            ] {
-                                                let mut job = egui::text::LayoutJob::simple(
-                                                    text.into(),
-                                                    font.resolve(ui.style()),
-                                                    color,
-                                                    (response.rect.width() - 16.0).max(1.0),
-                                                );
-                                                job.wrap.max_rows = 1;
-                                                let galley = ui.fonts_mut(|f| f.layout_job(job));
-                                                ui.painter()
-                                                    .with_clip_rect(response.rect.intersect(ui.clip_rect()))
-                                                    .galley(response.rect.min + egui::vec2(8.0, y), galley, color);
-                                            }
-                                            response.widget_info(|| {
-                                                egui::WidgetInfo::selected(
-                                                    egui::WidgetType::SelectableLabel,
-                                                    ui.is_enabled(),
-                                                    selected,
-                                                    &profile.name,
-                                                )
-                                            });
-                                            if selected {
-                                                ui.painter().hline(
-                                                    response.rect.x_range(),
-                                                    response.rect.bottom(),
-                                                    egui::Stroke::new(1.0, ui.visuals().hyperlink_color),
-                                                );
-                                            }
-                                            response
-                                        })
-                                        .inner
-                                    })
-                                    .inner;
-                                // The same strip open tabs show for the profile's default color.
-                                if let Some(color) = crate::settings::parse_hex(&profile.tab_color) {
-                                    let rect = response.rect;
-                                    let strip = egui::Rect::from_x_y_ranges(
-                                        rect.left()..=rect.left() + 3.0,
-                                        rect.top() + 2.0..=rect.bottom() - 2.0,
-                                    );
-                                    ui.painter().rect_filled(strip, 1.0, color);
-                                }
-                                let response = response.on_hover_text(format!(
-                                    "{} — {}\n{}\nDouble-click to connect",
-                                    profile.name,
-                                    profile.kind().label(),
-                                    if profile.kind() == Kind::Serial {
-                                        profile.device.clone()
-                                    } else {
-                                        format!("{}:{}", profile.host, profile.port)
-                                    },
-                                ));
-                                let menu_was_open =
-                                    egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
-                                let menu = response.context_menu(|ui| {
-                                    if ui.button("Default tab color…").clicked() {
-                                        actions.push(Action::ProfileColor(profile.name.clone()));
-                                        ui.close();
-                                    }
-                                });
-                                self.blocks_terminal_input |=
-                                    menu_was_open || menu.is_some() || response.has_focus() || response.lost_focus();
-                                if response.clicked() {
-                                    self.selected_saved = Some(profile.name.clone());
-                                }
-                                if response.double_clicked() {
-                                    self.selected_saved = Some(profile.name.clone());
-                                    actions.push(Action::Connect((*profile).clone()));
-                                }
+                        let folders = store.folders();
+                        let filtering = !query.is_empty() || self.favorites_only;
+                        let tree = SavedTree { store, folders: &folders, visible: &visible, filtering };
+                        self.folder_contents_ui(ui, &tree, "", actions);
+                        // The top of the list has no row of its own to drop on.
+                        if egui::DragAndDrop::has_payload_of_type::<DraggedSession>(ui.ctx()) {
+                            let response =
+                                ui.add(egui::Button::selectable(false, RichText::new("No folder").italics()));
+                            response.widget_info(|| {
+                                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Move to no folder")
                             });
+                            if let Some(dragged) = response.dnd_release_payload::<DraggedSession>() {
+                                actions.push(Action::MoveSession { name: dragged.0.clone(), folder: String::new() });
+                            }
                         }
                     });
             });
@@ -877,6 +1031,10 @@ impl Sidebar {
             // Import/export are also under Settings; here they share a menu so
             // the list keeps its height.
             let (more, _) = egui::containers::menu::MenuButton::new(MORE).ui(ui, |ui| {
+                if ui.button("New folder…").clicked() {
+                    actions.push(Action::NewFolder { parent: String::new(), session: None });
+                }
+                ui.separator();
                 if ui.button("Import profiles…").clicked() {
                     actions.push(Action::ImportProfiles);
                 }
@@ -887,15 +1045,31 @@ impl Sidebar {
             more.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "More profile actions"));
             let menu_open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&more));
             self.blocks_terminal_input |= menu_open || more.has_focus() || more.lost_focus();
-            more.on_hover_text("Import or export profiles");
+            more.on_hover_text("New folder, import or export");
         });
     }
+}
+
+/// What the saved-session list is drawing from, for one frame.
+struct SavedTree<'a> {
+    store: &'a ProfileStore,
+    folders: &'a [String],
+    visible: &'a [&'a Profile],
+    filtering: bool,
+}
+
+/// A saved session being dragged onto a folder.
+struct DraggedSession(String);
+
+/// How far a row in this folder sits from the left.
+fn indent(folder: &str) -> f32 {
+    profiles::folder_depth(folder) as f32 * 10.0
 }
 
 fn matches_saved_filter(profile: &Profile, query: &str, favorites_only: bool) -> bool {
     (!favorites_only || profile.favorite)
         && (query.is_empty()
-            || [&profile.name, &profile.host, &profile.device, &profile.kind]
+            || [&profile.name, &profile.host, &profile.device, &profile.kind, &profile.folder]
                 .into_iter()
                 .any(|value| value.to_lowercase().contains(query))
             || profile.kind().label().to_lowercase().contains(query))
@@ -1009,6 +1183,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ProfileStore {
             path: dir.path().join("sessions.json"),
+            folders: Vec::new(),
+            collapsed: Vec::new(),
             profiles: vec![
                 Profile { name: "Alpha".into(), host: "192.0.2.10".into(), ..Default::default() },
                 Profile {

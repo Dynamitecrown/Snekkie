@@ -38,16 +38,18 @@ enum Page {
     Terminal,
     Input,
     Network,
+    Files,
     Highlighting,
     Animations,
 }
 
 impl Page {
-    const ALL: [(Self, &'static str); 6] = [
+    const ALL: [(Self, &'static str); 7] = [
         (Self::Appearance, "Appearance"),
         (Self::Terminal, "Terminal"),
         (Self::Input, "Input & paste"),
         (Self::Network, "Network"),
+        (Self::Files, "Files"),
         (Self::Highlighting, "Highlighting"),
         (Self::Animations, "Animations"),
     ];
@@ -58,7 +60,7 @@ impl Page {
 pub enum Outcome {
     Open,
     Cancel,
-    Save(AppSettings),
+    Save(Box<AppSettings>),
     /// Ask for a name to save the current colors under.
     AskThemeName {
         suggested: String,
@@ -161,6 +163,7 @@ impl Preferences {
                 Page::Terminal => self.terminal_page(ui, fonts),
                 Page::Input => self.input_page(ui),
                 Page::Network => self.network_page(ui),
+                Page::Files => self.files_page(ui),
                 Page::Highlighting => self.highlighting_page(ui),
                 Page::Animations => self.animations_page(ui),
             });
@@ -169,7 +172,7 @@ impl Preferences {
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(style::primary_button(ui, "Save changes")).clicked() {
-                    outcome = Outcome::Save(self.working());
+                    outcome = Outcome::Save(Box::new(self.working()));
                 }
                 if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, 30.0))).clicked() {
                     outcome = Outcome::Cancel;
@@ -337,6 +340,32 @@ impl Preferences {
         );
     }
 
+    fn files_page(&mut self, ui: &mut Ui) {
+        scope_note(ui, "Used the next time you choose Edit in a file explorer, after you save.");
+        style::section_heading(ui, "Editing server files");
+        let label = ui.label("Open with");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.settings.explorer_editor)
+                .hint_text("The default app for each file type")
+                .desired_width(ui.available_width().min(480.0)),
+        )
+        .labelled_by(label.id);
+        ui.horizontal(|ui| {
+            if ui.button("Choose…").clicked() {
+                let picker = rfd::FileDialog::new().set_title("Choose the program to edit files with");
+                #[cfg(windows)]
+                let picker = picker.add_filter("Programs", &["exe", "cmd", "bat"]).add_filter("All files", &["*"]);
+                if let Some(path) = picker.pick_file() {
+                    self.settings.explorer_editor = path.display().to_string();
+                }
+            }
+            let chosen = !self.settings.explorer_editor.is_empty();
+            if ui.add_enabled(chosen, egui::Button::new("Use default app")).clicked() {
+                self.settings.explorer_editor.clear();
+            }
+        });
+    }
+
     fn network_page(&mut self, ui: &mut Ui) {
         scope_note(ui, "Network policy and update settings apply to the whole app after you save.");
         style::section_heading(ui, "Network privacy");
@@ -384,6 +413,14 @@ impl Preferences {
         ui.add_space(12.0);
         style::section_heading(ui, "AI agent access");
         ui.checkbox(&mut self.settings.agent_access, "Let AI agents on this computer use open sessions (MCP)");
+        ui.add_enabled(
+            self.settings.agent_access,
+            egui::Checkbox::new(&mut self.settings.agent_file_access, "Let agents transfer and change files"),
+        )
+        .on_hover_text(
+            "Agents can read, write and delete files on servers through SSH and file explorer tabs, and copy files to \
+             and from this computer. Off by default.",
+        );
         agent_animations_checkbox(ui, &mut self.settings.agent_animations);
         ui.add(
             egui::Label::new(

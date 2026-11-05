@@ -17,6 +17,7 @@ use std::net::{Ipv4Addr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -26,6 +27,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use crate::session::{Remote, Session, State};
 use crate::terminal::emulator::Emulator;
 
+mod files;
+
+pub use files::ExplorerEntry;
+
 pub const FILE_NAME: &str = "mcp.json";
 
 /// Newest first; a client asking for another gets the newest.
@@ -33,6 +38,7 @@ const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", 
 const MAX_REQUEST: u64 = 1024 * 1024;
 const REQUEST_WAIT: Duration = Duration::from_secs(10);
 const MAX_COMMAND_SECONDS: u64 = 120;
+const MAX_TRANSFER_SECONDS: u64 = 6 * 60 * 60;
 /// Output kept for one command; a flood beyond this is counted, not stored.
 const MAX_CAPTURE: usize = 4 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(50);
@@ -53,7 +59,8 @@ const NOT_RUNNING: &str = "Snekkie is not running, or AI agent access is off. As
 const INSTRUCTIONS: &str = "Snekkie is the user's terminal for network devices and servers. Its sessions are live \
      SSH, Telnet, raw TCP and serial connections the user opened. Anything you send runs on real equipment exactly \
      as if the user typed it, and is recorded in the session log when logging is on. Call list_sessions first, then \
-     send_command one line at a time and read what comes back.";
+     send_command one line at a time and read what comes back. If the user allows file access, the file tools work \
+     on SSH sessions and file explorer tabs over SFTP.";
 
 /// What agents are doing, for the app to show.
 #[derive(Clone, Debug, Default)]
@@ -96,6 +103,7 @@ impl Use {
 struct Listing {
     selected: Option<u64>,
     sessions: Vec<Remote>,
+    explorers: Vec<ExplorerEntry>,
     activity: HashMap<u64, Use>,
     agents: Vec<(u64, String)>,
     next_agent: u64,
@@ -103,6 +111,7 @@ struct Listing {
 
 struct Inner {
     listing: Mutex<Listing>,
+    files_allowed: AtomicBool,
     repaint: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -186,7 +195,11 @@ impl Server {
             let _entered = runtime.enter();
             tokio::net::TcpListener::from_std(listener)?
         };
-        let inner = Arc::new(Inner { listing: Mutex::default(), repaint: Box::new(repaint) });
+        let inner = Arc::new(Inner {
+            listing: Mutex::default(),
+            files_allowed: AtomicBool::new(false),
+            repaint: Box::new(repaint),
+        });
         let task = runtime.spawn(serve(listener, token.clone(), inner.clone()));
         Ok(Server { inner, task, file, token })
     }
@@ -200,9 +213,17 @@ impl Server {
             && listing.sessions.iter().zip(sessions).all(|(remote, session)| remote.id == session.id);
         if !same {
             listing.sessions = sessions.iter().map(|session| session.remote()).collect();
-            let open = &listing.sessions;
-            listing.activity.retain(|id, _| open.iter().any(|session| session.id == *id));
+            let (open, explorers) = (&listing.sessions, &listing.explorers);
+            listing.activity.retain(|id, _| {
+                open.iter().any(|session| session.id == *id) || explorers.iter().any(|tab| tab.id == *id)
+            });
         }
+    }
+
+    /// Whether agents may use the file tools, and the file explorers they can name.
+    pub fn sync_files(&self, allowed: bool, explorers: impl Iterator<Item = ExplorerEntry>) {
+        self.inner.files_allowed.store(allowed, Ordering::Relaxed);
+        self.inner.listing.lock().explorers = explorers.collect();
     }
 
     pub fn activity(&self) -> Activity {
@@ -288,6 +309,7 @@ async fn call(inner: &Inner, agent: &str, tool: &str, arguments: &Value) -> Resu
             Ok(all[all.len().saturating_sub(lines)..].join("\n"))
         }
         "send_command" => send_command(inner, agent, &find(listing, arguments)?, arguments).await,
+        tool if files::handles(tool) => files::call(inner, agent, tool, arguments).await,
         "send_keys" => {
             let session = find(listing, arguments)?;
             let text = arguments["text"].as_str().filter(|text| !text.is_empty()).ok_or("text is required.")?;
@@ -302,10 +324,10 @@ async fn call(inner: &Inner, agent: &str, tool: &str, arguments: &Value) -> Resu
 }
 
 fn list(listing: &Listing) -> String {
-    if listing.sessions.is_empty() {
+    if listing.sessions.is_empty() && listing.explorers.is_empty() {
         return "No sessions are open in Snekkie. Ask the user to open one.".into();
     }
-    let sessions: Vec<Value> = listing
+    let mut sessions: Vec<Value> = listing
         .sessions
         .iter()
         .map(|session| {
@@ -319,6 +341,16 @@ fn list(listing: &Listing) -> String {
             })
         })
         .collect();
+    sessions.extend(listing.explorers.iter().map(|tab| {
+        json!({
+            "session_id": tab.id,
+            "name": tab.name,
+            "type": "File explorer",
+            "destination": tab.description,
+            "state": if tab.link.is_some() { "connected" } else { "disconnected" },
+            "selected": false,
+        })
+    }));
     serde_json::to_string_pretty(&sessions).unwrap_or_default()
 }
 
@@ -331,12 +363,15 @@ fn state_text(state: &State) -> String {
     }
 }
 
-fn find(listing: &Mutex<Listing>, arguments: &Value) -> Result<Remote, String> {
+fn session_id(arguments: &Value) -> Result<u64, String> {
     let id = &arguments["session_id"];
-    let id = id
-        .as_u64()
+    id.as_u64()
         .or_else(|| id.as_str()?.trim().parse().ok())
-        .ok_or("session_id is required; call list_sessions to find one.")?;
+        .ok_or_else(|| "session_id is required; call list_sessions to find one.".to_string())
+}
+
+fn find(listing: &Mutex<Listing>, arguments: &Value) -> Result<Remote, String> {
+    let id = session_id(arguments)?;
     let found = listing.lock().sessions.iter().find(|session| session.id == id).cloned();
     found.ok_or_else(|| format!("No open session has session_id {id}; call list_sessions."))
 }
@@ -659,11 +694,16 @@ fn stay_connected(file: &Path, agent: &str) {
 }
 
 /// Run one tool call in the running app.
-fn forward(file: &Path, agent: &str, tool: &str, arguments: &Value) -> Result<(String, bool), String> {
+#[doc(hidden)]
+pub fn forward(file: &Path, agent: &str, tool: &str, arguments: &Value) -> Result<(String, bool), String> {
+    let request = json!({ "agent": agent, "tool": tool, "arguments": arguments }).to_string();
+    if request.len() as u64 >= MAX_REQUEST {
+        return Ok(("That call is over the 1 MB limit. Use upload_file for big files.".into(), true));
+    }
     let mut stream = open(file)?;
-    stream.set_read_timeout(Some(Duration::from_secs(MAX_COMMAND_SECONDS + 30))).map_err(|e| e.to_string())?;
-    writeln!(stream, "{}", json!({ "agent": agent, "tool": tool, "arguments": arguments }))
-        .map_err(|e| e.to_string())?;
+    let wait = if files::long_running(tool) { MAX_TRANSFER_SECONDS } else { MAX_COMMAND_SECONDS + 30 };
+    stream.set_read_timeout(Some(Duration::from_secs(wait))).map_err(|e| e.to_string())?;
+    writeln!(stream, "{request}").map_err(|e| e.to_string())?;
     let mut reply = String::new();
     io::BufReader::new(stream).read_line(&mut reply).map_err(|e| format!("Snekkie did not answer: {e}"))?;
     // A stale file can point at another program's port, which won't answer.
@@ -672,6 +712,14 @@ fn forward(file: &Path, agent: &str, tool: &str, arguments: &Value) -> Result<(S
 }
 
 fn tools() -> Value {
+    let mut all = terminal_tools();
+    if let Some(list) = all.as_array_mut() {
+        list.extend(files::tools());
+    }
+    all
+}
+
+fn terminal_tools() -> Value {
     let session_id = json!({ "type": "integer", "description": "A session_id from list_sessions." });
     json!([
         {
@@ -794,7 +842,8 @@ mod tests {
 
         let tools = respond(&json!({ "id": 4, "method": "tools/list" }), no_call).unwrap();
         let names: Vec<_> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].clone()).collect();
-        assert_eq!(names, ["list_sessions", "read_output", "send_command", "send_keys"]);
+        assert_eq!(names[..4], ["list_sessions", "read_output", "send_command", "send_keys"]);
+        assert!(names.contains(&json!("write_file")));
 
         let call = json!({ "id": "x", "method": "tools/call",
             "params": { "name": "read_output", "arguments": { "session_id": 4 } } });

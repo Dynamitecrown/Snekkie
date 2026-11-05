@@ -133,7 +133,7 @@ fn inactive_connection_tab_keeps_its_text_above_the_hover_fill() {
 fn empty_workspace_action_opens_the_connection_form_with_the_sidebar_hidden() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = harness_sized(&dir, [520.0, 320.0]);
-    for label in ["Workspace", "SSH, serial, Telnet or TCP.", "New connection"] {
+    for label in ["Workspace", "SSH, SFTP, serial, Telnet or TCP.", "New connection"] {
         assert!(app.ctx.content_rect().contains_rect(app.get_by_label(label).rect()), "{label}");
     }
     app.get_by_label("Hide sessions").click();
@@ -141,7 +141,7 @@ fn empty_workspace_action_opens_the_connection_form_with_the_sidebar_hidden() {
     app.get_by_label("Snekkie");
     let action = app.get_by_label("New connection");
     assert!(app.ctx.content_rect().contains_rect(action.rect()));
-    assert!(app.ctx.content_rect().contains_rect(app.get_by_label("SSH, serial, Telnet or TCP.").rect()));
+    assert!(app.ctx.content_rect().contains_rect(app.get_by_label("SSH, SFTP, serial, Telnet or TCP.").rect()));
     action.click();
     app.run_ok();
     app.get_by_label("Hide sessions");
@@ -3059,4 +3059,396 @@ fn agents_reach_open_tabs_through_the_bridge_only_while_access_is_on() {
 
     drop(to_bridge);
     assert!(bridge.wait().unwrap().success());
+}
+
+fn seed_saved(dir: &tempfile::TempDir, sessions: &[(&str, &str)]) {
+    let mut store = snekkie::profiles::ProfileStore::open(dir.path().join("sessions.json"));
+    for (name, folder) in sessions {
+        store
+            .put(snekkie::profiles::Profile {
+                name: (*name).into(),
+                host: "192.0.2.1".into(),
+                folder: (*folder).into(),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+}
+
+fn saved(dir: &tempfile::TempDir) -> snekkie::profiles::ProfileStore {
+    snekkie::profiles::ProfileStore::open(dir.path().join("sessions.json"))
+}
+
+/// The input dialog opens with its field focused and its text selected.
+fn answer_dialog(app: &mut Harness<'static, SnekkieApp>, text: &str) {
+    app.run_ok();
+    app.input_mut().events.push(egui::Event::Key {
+        key: egui::Key::A,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: app_modifiers(false),
+    });
+    app.input_mut().events.push(egui::Event::Text(text.into()));
+    app.run_ok();
+    app.get_by_label("OK").click();
+    app.run_ok();
+}
+
+#[test]
+fn folders_are_created_filled_collapsed_and_remembered() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_saved(&dir, &[("router", ""), ("switch", "")]);
+    let mut app = harness(&dir);
+
+    app.get_by_label("More profile actions").click();
+    app.run_ok();
+    app.get_by_label("New folder…").click();
+    app.run_ok();
+    answer_dialog(&mut app, "Lab");
+    assert!(app.query_by_label("Folder Lab").is_some());
+    assert_eq!(saved(&dir).folders(), ["Lab"]);
+
+    // Move one in from its right-click menu.
+    app.get_by_label("router").click_secondary();
+    app.run_ok();
+    app.get_by_label_contains("Move to folder").hover();
+    app.run_ok();
+    app.get_by_label("Lab").click();
+    app.run_ok();
+    assert_eq!(saved(&dir).get("router").unwrap().folder, "Lab");
+
+    // Collapsing hides it, and stays that way after a restart.
+    app.get_by_label("Folder Lab").click();
+    app.run_ok();
+    assert!(app.query_by_label("router").is_none());
+    assert!(app.query_by_label("switch").is_some(), "other sessions stay");
+    drop(app);
+    let mut app = harness(&dir);
+    assert!(app.query_by_label("Folder Lab").is_some());
+    assert!(app.query_by_label("router").is_none());
+
+    // A filter looks inside collapsed folders.
+    app.get_by_label("Filter saved sessions").click();
+    app.run_ok();
+    app.input_mut().events.push(egui::Event::Text("rout".into()));
+    app.run_ok();
+    assert!(app.query_by_label("router").is_some());
+    assert!(app.query_by_label("switch").is_none());
+}
+
+#[test]
+fn a_session_can_be_dragged_into_a_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_saved(&dir, &[("inside", "Lab"), ("router", "")]);
+    let mut app = harness(&dir);
+    let from = app.get_by_label("router").rect().center();
+    let to = app.get_by_label("Folder Lab").rect().center();
+    app.hover_at(from);
+    app.drag_at(from);
+    app.run_ok();
+    app.hover_at(from + (to - from) / 2.0);
+    app.run_ok();
+    app.hover_at(to);
+    app.run_ok();
+    app.drop_at(to);
+    app.run_ok();
+    assert_eq!(saved(&dir).get("router").unwrap().folder, "Lab");
+}
+
+#[test]
+fn deleting_a_folder_asks_and_keeps_its_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_saved(&dir, &[("router", "Site/Lab"), ("other", "Site")]);
+    let mut app = harness(&dir);
+    app.get_by_label("Folder Lab").click_secondary();
+    app.run_ok();
+    app.get_by_label("Delete folder…").click();
+    app.run_ok();
+    assert!(app.state().dialog_texts().iter().any(|t| t.contains("1 saved session") && t.contains("Site")));
+    assert_eq!(saved(&dir).get("router").unwrap().folder, "Site/Lab", "nothing until confirmed");
+    app.get_by_label("Yes").click();
+    app.run_ok();
+    let store = saved(&dir);
+    assert_eq!(store.get("router").unwrap().folder, "Site");
+    assert_eq!(store.folders(), ["Site"]);
+}
+
+#[test]
+fn renaming_a_folder_refuses_bad_names_and_keeps_its_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_saved(&dir, &[("router", "Lab"), ("other", "Prod")]);
+    let mut app = harness(&dir);
+    app.get_by_label("Folder Lab").click_secondary();
+    app.run_ok();
+    app.get_by_label("Rename…").click();
+    app.run_ok();
+    answer_dialog(&mut app, "Prod");
+    assert!(app.state().dialog_texts().iter().any(|t| t.contains("already a folder")));
+    app.get_by_label("OK").click();
+    app.run_ok();
+    assert_eq!(saved(&dir).get("router").unwrap().folder, "Lab");
+
+    app.get_by_label("Folder Lab").click_secondary();
+    app.run_ok();
+    app.get_by_label("Rename…").click();
+    app.run_ok();
+    answer_dialog(&mut app, "Test");
+    assert_eq!(saved(&dir).get("router").unwrap().folder, "Test");
+}
+
+#[test]
+fn new_session_here_saves_into_the_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_saved(&dir, &[("router", "Lab")]);
+    let mut app = harness(&dir);
+    app.get_by_label("Folder Lab").click_secondary();
+    app.run_ok();
+    app.get_by_label("New session here").click();
+    app.run_ok();
+    app.state_mut().sidebar_draft().host = "192.0.2.9".into();
+    app.run_ok();
+    app.get_by_label("Save…").click();
+    app.run_ok();
+    assert!(app.state().dialog_texts().iter().any(|t| t.contains("in Lab")));
+    app.get_by_label("OK").click();
+    app.run_ok();
+    let store = saved(&dir);
+    assert_eq!(store.profiles.iter().find(|p| p.host == "192.0.2.9").unwrap().folder, "Lab");
+}
+
+/// Drag a tab by its label to this spot, frame by frame, as a mouse would.
+fn drag_tab(app: &mut Harness<'static, SnekkieApp>, name: &str, to: egui::Pos2) {
+    let from = app.get_by_label(name).rect().center();
+    app.hover_at(from);
+    app.drag_at(from);
+    app.run_ok();
+    app.hover_at(from + egui::vec2(0.0, 30.0));
+    app.run_ok();
+    app.hover_at(to);
+    app.run_ok();
+    app.drop_at(to);
+    app.run_ok();
+}
+
+/// Points in the left and right of the area a terminal draws in.
+fn workspace_sides(app: &Harness<'static, SnekkieApp>) -> (egui::Pos2, egui::Pos2) {
+    let area = app.get_by_label("Terminal output").rect();
+    (area.center() - egui::vec2(area.width() / 4.0, 0.0), area.center() + egui::vec2(area.width() / 4.0, 0.0))
+}
+
+fn pair(left: &str, right: &str) -> Option<Vec<Vec<String>>> {
+    grid(&[&[left], &[right]])
+}
+
+fn grid(columns: &[&[&str]]) -> Option<Vec<Vec<String>>> {
+    Some(columns.iter().map(|column| column.iter().map(|tab| tab.to_string()).collect()).collect())
+}
+
+#[test]
+fn dragging_a_tab_onto_a_side_of_the_workspace_puts_it_beside_the_tab_on_show() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    let _first = open_raw_tab(&mut app, "first");
+    let _second = open_raw_tab(&mut app, "second");
+    assert_eq!(app.state().active_title().as_deref(), Some("second"));
+    let (_, right) = workspace_sides(&app);
+
+    drag_tab(&mut app, "first", right);
+    assert_eq!(app.state().split_titles(), pair("second", "first"));
+    assert_eq!(app.state().active_title().as_deref(), Some("first"), "the dragged tab has the keyboard");
+    assert_eq!(app.get_all_by_label("Terminal output").count(), 2);
+    assert_eq!(app.state().tab_titles(), ["first", "second"], "the strip keeps its order");
+}
+
+#[test]
+fn dragging_the_tab_on_show_puts_it_beside_the_one_shown_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    let _first = open_raw_tab(&mut app, "first");
+    let _second = open_raw_tab(&mut app, "second");
+    let (left, _) = workspace_sides(&app);
+    drag_tab(&mut app, "second", left);
+    assert_eq!(app.state().split_titles(), pair("second", "first"));
+}
+
+#[test]
+fn dropping_on_a_pane_of_a_pair_replaces_or_swaps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness_sized(&dir, [1400.0, 700.0]);
+    let _first = open_raw_tab(&mut app, "first");
+    let _second = open_raw_tab(&mut app, "second");
+    let _third = open_raw_tab(&mut app, "third");
+    app.get_by_label("second").click();
+    app.run_ok();
+    let (left, right) = workspace_sides(&app);
+    drag_tab(&mut app, "first", right);
+    assert_eq!(app.state().split_titles(), pair("second", "first"));
+
+    // A third tab takes the pane it lands on.
+    drag_tab(&mut app, "third", left);
+    assert_eq!(app.state().split_titles(), pair("third", "first"));
+
+    // A tab of the pair dropped on the other pane swaps them.
+    drag_tab(&mut app, "first", left);
+    assert_eq!(app.state().split_titles(), pair("first", "third"));
+
+    // Dropped on its own pane, nothing changes.
+    drag_tab(&mut app, "first", left);
+    assert_eq!(app.state().split_titles(), pair("first", "third"));
+}
+
+#[test]
+fn dragging_along_the_strip_only_reorders_and_a_miss_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    let _first = open_raw_tab(&mut app, "first");
+    let _second = open_raw_tab(&mut app, "second");
+    let to = app.get_by_label("second").rect().center();
+    drag_tab(&mut app, "first", to);
+    assert_eq!(app.state().tab_titles(), ["second", "first"]);
+    assert_eq!(app.state().split_titles(), None);
+    assert_eq!(app.state().active_title().as_deref(), Some("first"));
+
+    // Let go over the sidebar: no pair, and the dragged tab stays selected.
+    let sidebar = app.get_by_label("Filter saved sessions").rect().center();
+    drag_tab(&mut app, "second", sidebar);
+    assert_eq!(app.state().split_titles(), None);
+    assert_eq!(app.state().active_title().as_deref(), Some("second"));
+}
+
+#[test]
+fn a_window_too_narrow_for_two_panes_offers_no_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness_sized(&dir, [600.0, 640.0]);
+    let _first = open_raw_tab(&mut app, "first");
+    let _second = open_raw_tab(&mut app, "second");
+    let (_, right) = workspace_sides(&app);
+    drag_tab(&mut app, "first", right);
+    assert_eq!(app.state().split_titles(), None);
+    assert_eq!(app.state().active_title().as_deref(), Some("first"));
+}
+
+#[test]
+fn the_game_tab_never_joins_a_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    let _first = open_raw_tab(&mut app, "first");
+    let (_, right) = workspace_sides(&app);
+    app.get_by_label("Help").click();
+    app.run_ok();
+    app.get_by_label("About Snekkie").click();
+    app.run_ok();
+    app.get_by_role_and_label(Role::Button, "Invade").click();
+    app.run_ok();
+    let from = app.get_by_label("Invade").rect().center();
+    app.hover_at(from);
+    app.drag_at(from);
+    app.run_ok();
+    app.hover_at(right);
+    app.run_ok();
+    app.drop_at(right);
+    app.run_ok();
+    assert_eq!(app.state().split_titles(), None);
+}
+
+/// Near one edge of the pane showing this terminal's output.
+fn edge_of(app: &Harness<'static, SnekkieApp>, index: usize, x: f32, y: f32) -> egui::Pos2 {
+    let panes: Vec<_> = app.get_all_by_label("Terminal output").map(|node| node.rect()).collect();
+    let pane = panes[index];
+    pane.min + egui::vec2(pane.width() * x, pane.height() * y)
+}
+
+#[test]
+fn tabs_arrange_up_to_four_across_and_two_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness_sized(&dir, [1900.0, 1000.0]);
+    let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
+    let _links: Vec<_> = names.iter().map(|name| open_raw_tab(&mut app, name)).collect();
+    app.get_by_label("a").click();
+    app.run_ok();
+
+    // Across: each drop lands on the right edge of the last pane.
+    let to = edge_of(&app, 0, 0.9, 0.5);
+    drag_tab(&mut app, "b", to);
+    let to = edge_of(&app, 1, 0.9, 0.5);
+    drag_tab(&mut app, "c", to);
+    let to = edge_of(&app, 2, 0.9, 0.5);
+    drag_tab(&mut app, "d", to);
+    assert_eq!(app.state().split_titles(), grid(&[&["a"], &["b"], &["c"], &["d"]]));
+    assert_eq!(app.get_all_by_label("Terminal output").count(), 4);
+
+    // Down: the bottom edge of each pane, in the order the panes are drawn.
+    let to = edge_of(&app, 0, 0.5, 0.9);
+    drag_tab(&mut app, "e", to);
+    let to = edge_of(&app, 2, 0.5, 0.9);
+    drag_tab(&mut app, "f", to);
+    let to = edge_of(&app, 4, 0.5, 0.9);
+    drag_tab(&mut app, "g", to);
+    let to = edge_of(&app, 6, 0.5, 0.9);
+    drag_tab(&mut app, "h", to);
+    assert_eq!(app.state().split_titles(), grid(&[&["a", "e"], &["b", "f"], &["c", "g"], &["d", "h"]]));
+    let panes: Vec<_> = app.get_all_by_label("Terminal output").map(|node| node.rect()).collect();
+    assert_eq!(panes.len(), 8);
+    for (index, pane) in panes.iter().enumerate() {
+        for other in &panes[index + 1..] {
+            assert!(!pane.intersects(*other), "{pane:?} overlaps {other:?}");
+        }
+    }
+
+    // Full: a ninth tab can't make a fifth column, so it takes the pane.
+    let to = edge_of(&app, 6, 0.95, 0.25);
+    drag_tab(&mut app, "i", to);
+    assert_eq!(app.state().split_titles(), grid(&[&["a", "e"], &["b", "f"], &["c", "g"], &["i", "h"]]));
+    assert_eq!(app.state().active_title().as_deref(), Some("i"));
+
+    // Only the active pane types: click one and it has the keyboard.
+    let target = app.get_all_by_label("Terminal output").nth(1).unwrap().rect().center();
+    app.hover_at(target);
+    app.run_ok();
+    app.drag_at(target);
+    app.drop_at(target);
+    app.run_ok();
+    assert_eq!(app.state().active_title().as_deref(), Some("e"));
+
+    // Its menu takes one tab out and the column closes up.
+    app.get_by_label("e").click_secondary();
+    app.run_ok();
+    app.get_by_label("Take out of side by side").click();
+    app.run_ok();
+    assert_eq!(app.state().split_titles(), grid(&[&["a"], &["b", "f"], &["c", "g"], &["i", "h"]]));
+}
+
+#[test]
+fn the_edit_program_saves_with_preferences_and_cancel_discards_it() {
+    use snekkie::settings::SettingsStore;
+    let dir = tempfile::tempdir().unwrap();
+    let saved = || SettingsStore::new(dir.path().join("settings.json")).load().explorer_editor;
+    let mut app = harness_sized(&dir, [1000.0, 640.0]);
+
+    let type_program = |app: &mut Harness<'static, SnekkieApp>| {
+        open_preferences(app);
+        show_page(app, "Files");
+        let field = app.get_by_role_and_label(Role::TextInput, "Open with");
+        field.focus();
+        field.type_text("my-editor");
+        app.run_ok();
+    };
+    type_program(&mut app);
+    app.get_by_label("Cancel").click();
+    app.run_ok();
+    assert_eq!(saved(), "");
+
+    type_program(&mut app);
+    app.get_by_label("Save changes").click();
+    app.run_ok();
+    assert_eq!(saved(), "my-editor");
+
+    open_preferences(&mut app);
+    show_page(&mut app, "Files");
+    app.get_by_label("Use default app").click();
+    app.run_ok();
+    app.get_by_label("Save changes").click();
+    app.run_ok();
+    assert_eq!(saved(), "");
 }

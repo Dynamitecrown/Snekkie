@@ -29,17 +29,20 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Ssh,
+    /// Files only: a file explorer tab, with no shell.
+    Sftp,
     Telnet,
     Raw,
     Serial,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Ssh, Kind::Telnet, Kind::Raw, Kind::Serial];
+    pub const ALL: [Kind; 5] = [Kind::Ssh, Kind::Sftp, Kind::Telnet, Kind::Raw, Kind::Serial];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Ssh => "ssh",
+            Kind::Sftp => "sftp",
             Kind::Telnet => "telnet",
             Kind::Raw => "raw",
             Kind::Serial => "serial",
@@ -48,6 +51,7 @@ impl Kind {
 
     pub fn parse(s: &str) -> Kind {
         match s {
+            "sftp" => Kind::Sftp,
             "telnet" => Kind::Telnet,
             "raw" => Kind::Raw,
             "serial" => Kind::Serial,
@@ -58,6 +62,7 @@ impl Kind {
     pub fn label(self) -> &'static str {
         match self {
             Kind::Ssh => "SSH",
+            Kind::Sftp => "SFTP",
             Kind::Telnet => "Telnet",
             Kind::Raw => "Raw TCP",
             Kind::Serial => "Serial",
@@ -68,7 +73,7 @@ impl Kind {
     /// console server maps to the line you want.
     pub fn default_port(self) -> Option<u16> {
         match self {
-            Kind::Ssh => Some(22),
+            Kind::Ssh | Kind::Sftp => Some(22),
             Kind::Telnet => Some(23),
             Kind::Raw | Kind::Serial => None,
         }
@@ -77,6 +82,11 @@ impl Kind {
     /// Connects over the network, so has a host and port.
     pub fn is_network(self) -> bool {
         self != Kind::Serial
+    }
+
+    /// Logs in over SSH.
+    pub fn is_ssh(self) -> bool {
+        matches!(self, Kind::Ssh | Kind::Sftp)
     }
 }
 
@@ -177,6 +187,14 @@ pub struct Profile {
     /// Empty = the normal tab appearance; otherwise a saved #rrggbb color.
     #[serde(deserialize_with = "lenient")]
     pub tab_color: String,
+    /// The saved-session folder this belongs to, as "Site/Core". Empty = none.
+    #[serde(deserialize_with = "lenient")]
+    pub folder: String,
+    /// The folders a file explorer last showed. Not part of an export.
+    #[serde(deserialize_with = "lenient")]
+    pub explorer_local: String,
+    #[serde(deserialize_with = "lenient")]
+    pub explorer_remote: String,
 
     // SSH, telnet and raw TCP
     #[serde(deserialize_with = "lenient")]
@@ -252,6 +270,9 @@ impl Default for Profile {
             kind: "ssh".into(),
             favorite: false,
             tab_color: String::new(),
+            folder: String::new(),
+            explorer_local: String::new(),
+            explorer_remote: String::new(),
             host: String::new(),
             port: 22,
             keepalive: 60,
@@ -317,6 +338,7 @@ impl Profile {
     /// Replace values a hand-edited file could have made unusable.
     fn sanitize(mut self) -> Self {
         let defaults = Profile::default();
+        self.folder = normalize_folder(&self.folder);
         if self.port == 0 {
             self.port = defaults.port;
         }
@@ -370,6 +392,7 @@ struct ExportProfile<'a> {
     kind: &'a str,
     favorite: bool,
     tab_color: String,
+    folder: &'a str,
     host: &'a str,
     port: u16,
     keepalive: u32,
@@ -403,6 +426,7 @@ impl<'a> From<&'a Profile> for ExportProfile<'a> {
             kind: &profile.kind,
             favorite: profile.favorite,
             tab_color: settings::parse_hex(&profile.tab_color).map(settings::to_hex).unwrap_or_default(),
+            folder: &profile.folder,
             host: &profile.host,
             port: profile.port,
             keepalive: profile.keepalive,
@@ -490,6 +514,7 @@ fn imported_profile(value: &serde_json::Value) -> Result<(Profile, Vec<String>),
         "name",
         "kind",
         "tab_color",
+        "folder",
         "host",
         "username",
         "auth",
@@ -621,15 +646,88 @@ struct SessionsFile {
     sessions: Vec<serde_json::Value>,
 }
 
+/// How deep folders can nest, and how long one name can be.
+pub const MAX_FOLDER_DEPTH: usize = 6;
+const MAX_FOLDER_NAME: usize = 64;
+
+/// A folder path from a file or an import, in the one form the app uses.
+pub fn normalize_folder(path: &str) -> String {
+    path.replace('\\', "/")
+        .split('/')
+        .map(|name| name.chars().filter(|c| !c.is_control()).take(MAX_FOLDER_NAME).collect::<String>())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .take(MAX_FOLDER_DEPTH)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Why this can't be one folder's name, if it can't.
+pub fn folder_name_error(name: &str) -> Option<&'static str> {
+    if name.trim().is_empty() {
+        Some("Enter a name for the folder.")
+    } else if name.contains(['/', '\\']) {
+        Some("A folder name can't contain / or \\.")
+    } else if name.chars().any(char::is_control) {
+        Some("A folder name can't contain control characters.")
+    } else if name.chars().count() > MAX_FOLDER_NAME {
+        Some("That folder name is too long.")
+    } else {
+        None
+    }
+}
+
+pub fn folder_parent(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+pub fn folder_leaf(path: &str) -> &str {
+    path.rsplit_once('/').map_or(path, |(_, leaf)| leaf)
+}
+
+pub fn join_folder(parent: &str, name: &str) -> String {
+    if parent.is_empty() { name.to_string() } else { format!("{parent}/{name}") }
+}
+
+pub fn folder_depth(path: &str) -> usize {
+    if path.is_empty() { 0 } else { path.split('/').count() }
+}
+
+/// This folder or something inside it. The separator keeps "Lab" from
+/// matching "Lab 2".
+pub fn in_folder(path: &str, folder: &str) -> bool {
+    path == folder || path.strip_prefix(folder).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// `path` with the leading `from` replaced by `to`.
+fn moved_path(path: &str, from: &str, to: &str) -> String {
+    if in_folder(path, from) { format!("{to}{}", &path[from.len()..]) } else { path.to_string() }
+}
+
+/// `path` with `folder` itself taken out, so what was inside moves up a level.
+fn without_folder(path: &str, folder: &str) -> String {
+    if !in_folder(path, folder) {
+        return path.to_string();
+    }
+    let parent = folder_parent(folder);
+    match path[folder.len()..].trim_start_matches('/') {
+        "" => parent.to_string(),
+        rest => join_folder(parent, rest),
+    }
+}
+
 /// Ordered collection of profiles, persisted to sessions.json.
 pub struct ProfileStore {
     pub path: PathBuf,
     pub profiles: Vec<Profile>,
+    /// Folders with no session in them yet. See [`ProfileStore::folders`].
+    pub(crate) folders: Vec<String>,
+    pub(crate) collapsed: Vec<String>,
 }
 
 impl ProfileStore {
     pub fn open(path: PathBuf) -> Self {
-        let mut store = ProfileStore { path, profiles: Vec::new() };
+        let mut store = ProfileStore { path, profiles: Vec::new(), folders: Vec::new(), collapsed: Vec::new() };
         store.load();
         store
     }
@@ -640,12 +738,29 @@ impl ProfileStore {
 
     pub fn load(&mut self) {
         self.profiles = read_profiles(&self.path);
+        // Read apart from the sessions, so a bad list can't cost anyone those.
+        let file =
+            fs::read_to_string(&self.path).ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        let list = |key: &str| -> Vec<String> {
+            let values = file.as_ref().and_then(|file| file.get(key)).and_then(serde_json::Value::as_array);
+            values
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(normalize_folder)
+                .filter(|path| !path.is_empty())
+                .collect()
+        };
+        self.folders = list("folders");
+        self.collapsed = list("collapsed_folders");
     }
 
     pub fn save(&self) -> std::io::Result<()> {
         let payload = serde_json::json!({
             "version": 1,
             "sessions": self.profiles,
+            "folders": self.folders(),
+            "collapsed_folders": self.collapsed,
         });
         let text = serde_json::to_string_pretty(&payload).map_err(std::io::Error::other)?;
         config::write_atomic(&self.path, &text)
@@ -667,9 +782,127 @@ impl ProfileStore {
     }
 
     pub fn remove(&mut self, name: &str) -> std::io::Result<()> {
+        // A folder outlives its last session.
+        self.folders = self.folders();
         let before = self.profiles.len();
         self.profiles.retain(|p| p.name != name);
         if self.profiles.len() != before { self.save() } else { Ok(()) }
+    }
+
+    /// Every folder, parents right before their children, ignoring case.
+    pub fn folders(&self) -> Vec<String> {
+        let mut all: Vec<String> = Vec::new();
+        for path in self.folders.iter().chain(self.profiles.iter().map(|p| &p.folder)) {
+            let mut current = path.as_str();
+            while !current.is_empty() {
+                if !all.iter().any(|known| known == current) {
+                    all.push(current.to_string());
+                }
+                current = folder_parent(current);
+            }
+        }
+        all.sort_by_key(|path| path.split('/').map(str::to_lowercase).collect::<Vec<_>>());
+        all
+    }
+
+    pub fn is_collapsed(&self, path: &str) -> bool {
+        self.collapsed.iter().any(|folder| folder == path)
+    }
+
+    /// Saved sessions in this folder and the folders inside it.
+    pub fn sessions_in(&self, path: &str) -> usize {
+        self.profiles.iter().filter(|p| in_folder(&p.folder, path)).count()
+    }
+
+    fn folder_taken(&self, path: &str) -> bool {
+        self.folders().iter().any(|folder| folder.to_lowercase() == path.to_lowercase())
+    }
+
+    /// Why a folder can't be created at this path, if it can't.
+    pub fn folder_create_error(&self, path: &str) -> Option<String> {
+        if folder_depth(path) > MAX_FOLDER_DEPTH {
+            Some(format!("Folders can only nest {MAX_FOLDER_DEPTH} levels deep."))
+        } else if self.folder_taken(path) {
+            Some(format!("There's already a folder called “{}” there.", folder_leaf(path)))
+        } else {
+            None
+        }
+    }
+
+    /// Why a folder can't be renamed or moved to this path, if it can't.
+    pub fn folder_move_error(&self, from: &str, to: &str) -> Option<String> {
+        if in_folder(to, from) {
+            return Some("A folder can't move inside itself.".into());
+        }
+        let deepest = self.folders().iter().filter(|f| in_folder(f, from)).map(|f| folder_depth(f)).max().unwrap_or(0);
+        if folder_depth(to) + deepest - folder_depth(from) > MAX_FOLDER_DEPTH {
+            return Some(format!("Folders can only nest {MAX_FOLDER_DEPTH} levels deep."));
+        }
+        // Renaming only the capitals of a name is not a clash with itself.
+        if from.to_lowercase() != to.to_lowercase() && self.folder_taken(to) {
+            return Some(format!("There's already a folder called “{}” there.", folder_leaf(to)));
+        }
+        None
+    }
+
+    /// Apply a change and persist it, or put everything back if that fails.
+    fn change(&mut self, apply: impl FnOnce(&mut Self)) -> std::io::Result<()> {
+        let before = (self.profiles.clone(), self.folders.clone(), self.collapsed.clone());
+        self.folders = self.folders();
+        apply(self);
+        let saved = self.save();
+        if saved.is_err() {
+            (self.profiles, self.folders, self.collapsed) = before;
+        }
+        saved
+    }
+
+    /// Change every folder path the store holds.
+    fn map_folders(&mut self, map: impl Fn(&str) -> String) {
+        for profile in &mut self.profiles {
+            profile.folder = map(&profile.folder);
+        }
+        for path in self.folders.iter_mut().chain(self.collapsed.iter_mut()) {
+            *path = map(path);
+        }
+        self.folders.retain(|path| !path.is_empty());
+        self.collapsed.retain(|path| !path.is_empty());
+        self.folders.dedup();
+    }
+
+    pub fn create_folder(&mut self, path: &str) -> std::io::Result<()> {
+        self.change(|store| store.folders.push(path.to_string()))
+    }
+
+    pub fn rename_folder(&mut self, from: &str, to: &str) -> std::io::Result<()> {
+        self.change(|store| store.map_folders(|path| moved_path(path, from, to)))
+    }
+
+    /// Remove a folder and keep what's in it, one level up. Never deletes a session.
+    pub fn delete_folder(&mut self, path: &str) -> std::io::Result<()> {
+        self.change(|store| {
+            store.collapsed.retain(|folder| folder != path);
+            store.folders.retain(|folder| folder != path);
+            store.map_folders(|current| without_folder(current, path));
+        })
+    }
+
+    pub fn move_session(&mut self, name: &str, folder: &str) -> std::io::Result<()> {
+        self.change(|store| {
+            if let Some(profile) = store.profiles.iter_mut().find(|p| p.name == name) {
+                profile.folder = folder.to_string();
+            }
+        })
+    }
+
+    pub fn toggle_collapsed(&mut self, path: &str) -> std::io::Result<()> {
+        self.change(|store| {
+            if store.is_collapsed(path) {
+                store.collapsed.retain(|folder| folder != path);
+            } else {
+                store.collapsed.push(path.to_string());
+            }
+        })
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -874,7 +1107,7 @@ mod tests {
         let text = export_profiles(&profiles).unwrap();
         let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(payload["version"], 1);
-        assert_eq!(payload["sessions"].as_array().unwrap().len(), 4);
+        assert_eq!(payload["sessions"].as_array().unwrap().len(), Kind::ALL.len());
         let imported = parse_import(text.as_bytes()).unwrap();
         assert_eq!(imported.warnings.len(), profiles.len());
         let expected = profiles.map(|mut profile| {
@@ -913,6 +1146,8 @@ mod tests {
         let store = ProfileStore {
             path: dir.path().join("sessions.json"),
             profiles: merge_import(std::slice::from_ref(&existing), imported.profiles),
+            folders: Vec::new(),
+            collapsed: Vec::new(),
         };
         store.save().unwrap();
         let loaded = ProfileStore::open(store.path);
@@ -932,7 +1167,12 @@ mod tests {
             assert!(!text.contains(secret));
         }
         let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore { path: dir.path().join("sessions.json"), profiles: imported.profiles };
+        let store = ProfileStore {
+            path: dir.path().join("sessions.json"),
+            profiles: imported.profiles,
+            folders: Vec::new(),
+            collapsed: Vec::new(),
+        };
         store.save().unwrap();
         let saved = fs::read_to_string(&store.path).unwrap();
         assert!(!saved.contains("secret-"));

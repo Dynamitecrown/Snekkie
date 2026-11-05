@@ -71,6 +71,29 @@ The agent can be started before Snekkie. Until Snekkie is running with access on
 | `send_command` | Types one command line, presses Enter and returns the output once it settles at a prompt |
 | `send_keys` | Sends exact keystrokes without Enter: a space at `--More--`, `y` at a confirmation, Ctrl+C |
 
+### File tools
+
+Tick **Let agents transfer and change files** under **Preferences → Network** to add these. They are **off by default**, even with agent access on, because they reach this computer's files as well as the server's. They work on connected SSH sessions and file explorer tabs, using the login already open: over SFTP where the device offers it, otherwise SCP.
+
+| Tool | What it does |
+| --- | --- |
+| `list_files` | Lists a folder on the server |
+| `read_file` | Reads a text file, up to 512 KB |
+| `write_file` | Creates or replaces a text file, up to 512 KB. This is how an agent edits a file |
+| `upload_file` | Copies one file from this computer to the server |
+| `download_file` | Copies one file from the server to this computer |
+| `make_folder` | Creates a folder |
+| `rename_path` | Renames or moves a file or folder, and won't replace what's there |
+| `delete_path` | Deletes a file, link or empty folder |
+| `set_permissions` | Sets permissions, such as `644` |
+
+Writes and copies won't replace an existing file unless the agent passes `overwrite`. A replaced server file keeps its permissions, and a failed transfer leaves the original alone. Paths on this computer must be full paths. Folders are copied one file at a time, and `write_file` and `read_file` are for text, so big or binary files go through the upload and download tools.
+
+Devices that offer only SCP, such as many switches and routers, support `read_file`, `write_file`, `upload_file` and `download_file`. Paths look like `flash:/config.txt`, and the device must allow SCP, such as `ip scp server enable` on Cisco IOS. The other tools return an error, and the agent can use `send_command` instead, such as `dir flash:`. SCP is less careful than SFTP:
+
+- It can't check whether a file exists, so sending always needs `overwrite`, and replaces any file there.
+- A transfer that fails partway can leave a damaged file on the device.
+
 Agents cannot open, close or reconnect sessions, and never receive the passwords you connect with: you connect, and the agent works in what is open. They can read whatever a tab shows, including configuration output. Once you turn access off or quit Snekkie, no further calls reach your sessions.
 
 `send_command` returns when the output has been quiet briefly at something that looks like a prompt, after 3 seconds of quiet anywhere, or after its timeout (15 seconds by default, at most 120). Long-running output may continue after it returns; the agent can read the rest with `read_output`. If paging is on at the device, the agent sees `--More--` and can answer it, or you can turn on **Automatically page through show commands**.
@@ -81,12 +104,16 @@ Agents cannot open, close or reconnect sessions, and never receive the passwords
 - **Reading:** the session's tab and the terminal glow cyan, and a soft band of light sweeps down the output. The status bar says, for example, **Claude Code is reading edge-rtr**.
 - **Typing:** the tab and the terminal glow amber and pulse once for each command, and three dots move under the tab's name. The status bar says, for example, **Claude Code is typing in edge-rtr**. After `send_command` types, the cue turns cyan while the agent reads the result.
 
+File tools use the same cues. Reading a file counts as reading and changing one as typing. In a file explorer tab the folder lists refresh after a change, and uploads and downloads appear in the queue.
+
 The tab glows even when you are looking at another tab, so you can see which session an agent is in. The terminal glow shows for the tab you have selected. Cues fade a second or two after the agent stops.
 
 **Animate agent activity** is on by default and separate from the Animations switch. It appears under **Preferences → Network** and again under **Preferences → Animations → AI agent activity**; both are the same setting. Turn it off for steady colored outlines with no sweep or pulse; the status bar messages stay the same.
 
 ## Safety
 
+- With file tools on, an agent can read any file your account can on this computer and send it to a server, or save files here. It can also delete files on the server with no undo, and Snekkie doesn't ask first. Only turn them on for agents you trust, and use your agent's own approval settings.
+- A file on a server may contain text written to mislead an agent. Treat what an agent does after reading one with the same care.
 - Commands run on real equipment, exactly as if you typed them. Review what the agent proposes, especially in configuration mode, and use your agent's own approval settings for tool calls.
 - Everything an agent sends goes through the same path as typing: it appears in the tab, and session logging records it as input, with the usual password redaction and Private input.
 - Snekkie listens only on the loopback interface (127.0.0.1), on a random port, and requires a token created fresh each time access is turned on. The port and token are kept in `mcp.json` in Snekkie's settings folder, which other accounts cannot read (administrators aside). Other computers, other users and web pages cannot connect.

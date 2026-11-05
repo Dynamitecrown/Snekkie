@@ -1,12 +1,12 @@
 # Snekkie
 
-Snekkie 2.8.0 is a tabbed SSH, Telnet, raw TCP and serial terminal for network engineers, built in Rust for Windows, Linux and macOS.
+Snekkie 2.9.0 is a tabbed SSH, Telnet, raw TCP and serial terminal for network engineers, built in Rust for Windows, Linux and macOS.
 
 **[Download the Windows master installer](https://github.com/Dynamitecrown/Snekkie/releases/download/installer-v1.0.0/Snekkie-Setup.exe)**
 
 Download this master installer once. It fetches and verifies the latest stable app from GitHub; future updates install through Snekkie's **Update** button.
 
-[Offline Windows installers, portable Windows, Linux and macOS downloads](https://github.com/Dynamitecrown/Snekkie/releases/latest) · [2.8.0 release notes](docs/releases/2.8.0.md) · [All guides](docs/README.md)
+[Offline Windows installers, portable Windows, Linux and macOS downloads](https://github.com/Dynamitecrown/Snekkie/releases/latest) · [2.9.0 release notes](docs/releases/2.9.0.md) · [All guides](docs/README.md)
 
 ![Snekkie with a saved switch session open](docs/screenshots/workspace-dark.png)
 
@@ -26,9 +26,17 @@ Download this master installer once. It fetches and verifies the latest stable a
 - **SSH, Telnet, raw TCP and serial** in one window, each in its own tab. SSH supports passwords, private key files and your SSH agent or default keys, with host-key verification against your `known_hosts` file.
 - **Serial consoles** list available ports with their USB details. Baud rate, data bits, parity, stop bits and flow control are saved per profile. **Ctrl+Shift+B** sends a break on serial and Telnet sessions.
 - **Keepalives, local echo and Backspace behavior** are configurable per profile under **Advanced**.
+- **Side by side:** drag tabs into the workspace to show up to eight at once, four across and two down, with dividers you can resize. Right-click an SSH tab and choose **Open file explorer beside** to work in a terminal and its files on one login.
 - **Tab status** uses distinct dots, rings and crosses for connected, connecting and disconnected, with the destination in the tooltip. **Reconnect** and **Duplicate** reopen a tab without retyping anything.
 
+### File transfers
+
+- **File explorer:** a two-pane view of your computer and the server, with a transfer queue. Open it as an SFTP session from the sidebar, or from a connected SSH tab's right-click menu without logging in again. Drag and drop, transfer whole folders, rename, delete, change permissions, and edit server files in your own app with automatic upload on save.
+- **Quick transfers:** right-click an SSH tab to upload or download one file. These use SFTP, or SCP on devices that don't offer SFTP. See [File transfers](docs/file-transfers.md).
+
 ### Saved sessions
+
+- **Folders** keep saved sessions organized, up to six levels deep. Drag a session onto a folder, or use its right-click menu. Deleting a folder keeps the sessions in it.
 
 - **Save, filter and favorite.** Filter by name, host, serial device or protocol, and star favorites to show them alone. **Connect selected** or a double-click connects; **Edit connection** loads a profile without connecting.
 - **Import from PuTTY** straight from the Windows registry or from an exported `.reg` file, on any platform. You review the sessions first; nothing connects and existing profiles are never replaced.
@@ -81,6 +89,7 @@ Optionally let an AI agent on your computer work in the sessions you have open, 
 
 - **Off by default.** Turn it on under **Preferences → Network**, which also shows the exact command to add to your agent.
 - **You stay in control.** Agents can't open, close or reconnect sessions and never see your passwords. Snekkie listens only on 127.0.0.1 with a fresh token, so other computers and other users can't connect.
+- **File access is a separate choice.** Also off by default. With it on, agents can list, read, write, upload, download, rename and delete files over SFTP on SSH and file explorer tabs, and read, write and copy them over SCP on devices without SFTP.
 - **You can see what they do.** The tab and terminal glow cyan while an agent reads and amber while it types, and the status bar names the agent. Everything it types appears in the tab and in the session log, as if you had typed it.
 - **Notification-area icon (Windows).** Show or quit Snekkie, start or stop the agent server, or close the agent's bridge, even after Snekkie itself is closed.
 
@@ -155,6 +164,7 @@ On Windows, `build-windows.bat` also builds the full installer when [NSIS 3](htt
 | [Preferences](docs/preferences.md) | Every settings section, previews, themes and save/cancel behavior |
 | [Session sidebar](docs/session-sidebar.md) | Saved sessions, connection options and tab status |
 | [Syntax highlighting](docs/syntax-highlighting.md) | Platforms and intensity levels |
+| [File transfers](docs/file-transfers.md) | Quick transfers, the file explorer, the queue and editing server files |
 | [Command snippets](docs/command-snippets.md) | Templates, variables, review and sharing |
 | [Paste behavior](docs/paste-behavior.md) | Multiline review, pacing and right-click options |
 | [Session logging](docs/session-logging.md) | Formats, timestamps, password controls and rotation |

@@ -235,7 +235,7 @@ fn run(mut port: Box<dyn SerialPort>, mut commands: UnboundedReceiver<Command>, 
                         Err(e) => sink.notice(format!("Break failed: {e}")),
                     }
                 }
-                Ok(Command::Resize { .. }) => {}
+                Ok(Command::Resize { .. } | Command::Transfer(_) | Command::ShareConnection(_)) => {}
                 Ok(Command::Close) | Err(TryRecvError::Disconnected) => return None,
                 Err(TryRecvError::Empty) => break,
             }

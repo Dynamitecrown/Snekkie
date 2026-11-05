@@ -247,9 +247,18 @@ pub struct AppSettings {
     /// Let AI agents on this computer use open sessions over MCP.
     #[serde(deserialize_with = "lenient")]
     pub agent_access: bool,
+    /// Agents may also transfer and change files, on servers and this computer.
+    #[serde(deserialize_with = "lenient")]
+    pub agent_file_access: bool,
     /// Glow, sweep and pulse while an agent reads or types; off holds the cues steady.
     #[serde(deserialize_with = "lenient_right_click_paste")]
     pub agent_animations: bool,
+    /// File explorers list names starting with a dot.
+    #[serde(deserialize_with = "lenient_right_click_paste")]
+    pub explorer_show_hidden: bool,
+    /// The program Edit opens server files in. Empty means the system's default app.
+    #[serde(deserialize_with = "lenient")]
+    pub explorer_editor: String,
     /// Automatically press Space at paging prompts during show commands.
     #[serde(deserialize_with = "lenient")]
     pub auto_paging: bool,
@@ -285,7 +294,10 @@ impl Default for AppSettings {
             check_for_updates: true,
             offline_mode: false,
             agent_access: false,
+            agent_file_access: false,
             agent_animations: true,
+            explorer_show_hidden: true,
+            explorer_editor: String::new(),
             auto_paging: false,
             right_click_paste: true,
             preview_multiline_paste: true,

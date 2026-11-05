@@ -22,6 +22,22 @@ Filtering or **Favorites only** can hide the selected profile. When that happens
 
 Click the arrow beside **New session** to collapse the connection form independently of the saved-session list. This is useful in short windows. **Edit connection** and **Session → New session** reopen the form; the latter resets it for a new connection.
 
+## Folders
+
+Choose **…** > **New folder…** to add a folder. Folders can hold other folders, up to six levels deep, and a session can be in one folder.
+
+| To do this | Do this |
+| --- | --- |
+| Put a session in a folder | Drag it onto the folder, or right-click it and choose **Move to folder** |
+| Take a session out | Right-click it and choose **Move to folder** > **No folder** |
+| Open or close a folder | Click it. Snekkie remembers which are closed |
+| Save a new session into a folder | Right-click the folder and choose **New session here** |
+| Add, rename, move or delete a folder | Right-click it |
+
+Deleting a folder never deletes a session. What was inside moves up one level, and Snekkie tells you how many sessions that affects first.
+
+While you filter or show favorites only, closed folders with a match open, and folders without one hide. The filter also matches folder names. Exports include each session's folder, and imports recreate it.
+
 Saved-session action buttons stack when the sidebar or theme font is too narrow to fit their labels side by side. Short windows use tighter sidebar controls and spacing. The sidebar remains scrollable when its content exceeds the window height.
 
 ![Saved-session actions in a 520 by 320 window with the form collapsed](screenshots/session-sidebar-compact.png)

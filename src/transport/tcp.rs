@@ -154,6 +154,7 @@ async fn run(
                     sink.notice("Raw TCP sessions do not support break".into());
                     Vec::new()
                 }
+                Some(Command::Transfer(_) | Command::ShareConnection(_)) => Vec::new(),
                 Some(Command::Close) | None => {
                     let _ = writer.shutdown().await;
                     return None;
