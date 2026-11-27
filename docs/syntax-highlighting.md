@@ -14,6 +14,10 @@ Use **Settings → Preferences → Highlighting → Intensity** to control the a
 
 Each level includes the lower levels. Important fields keep their color as detail increases. Addresses are validated to avoid coloring impossible IPs or partial matches inside version strings. Prompts can be recognized before echoed commands, including Cisco configuration prompts, Junos `user@host` prompts and FortiOS contexts. Colors adapt to light terminal backgrounds.
 
+## Highlight rules
+
+Add your own rules under **Settings → Preferences → Highlighting → Highlight rules**. Each rule has the text to match, **Regular expression** and **Match case** checkboxes, a text color and **Bold**. Rules apply in every session, on top of device highlighting, and also when a session's highlighting is **Off**. Where rules overlap, the first one in the list wins. A rule with an invalid regular expression shows the error under it and is skipped. Up to 50 rules are kept, in `settings.json`. Like device highlighting, rules change only the display.
+
 Monochrome themes take precedence over syntax colors. To see syntax colors with a monochrome preset, clear **Monochrome output** under **Appearance → Theme colors** and save the customized theme. CRT glow and the retro interface can remain enabled independently.
 
 Highlighting is a text display overlay, not a complete configuration parser or security audit. It colors recognizable terms in commands, configuration and output; arbitrary names and vendor/version-specific syntax may remain uncolored. It never changes the actual output, transmitted commands, clipboard text, logs or exports.

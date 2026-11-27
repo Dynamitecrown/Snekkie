@@ -31,6 +31,7 @@ impl ThemePreview {
             theme,
             syntax: "cisco_ios",
             highlighting_intensity: crate::terminal::highlight::DEFAULT_INTENSITY,
+            user_rules: &crate::terminal::highlight::NO_USER_RULES,
             regular,
             bold,
             keyboard: false,

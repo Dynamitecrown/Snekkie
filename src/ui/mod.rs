@@ -16,6 +16,7 @@ pub mod render;
 pub mod search;
 pub mod sidebar;
 mod snippets;
+mod space;
 pub mod style;
 mod syntax_preview;
 pub mod terminal_view;

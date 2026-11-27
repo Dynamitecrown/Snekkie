@@ -22,12 +22,14 @@ use super::animation::{
     self, Animator, CellLook, CursorLook, LineMark, ParticleColor, ParticleLook, ParticleShape, Snapshot,
 };
 use super::search::{self, BarAction, SearchBar};
+use super::space;
 use crate::session::Session;
-use crate::settings::{Animations, NewLines, Theme};
+use crate::settings::{Animations, AppAppearance, NewLines, Theme};
 use crate::terminal::colors;
 use crate::terminal::emulator::Emulator;
 use crate::terminal::highlight::{self, Span};
 use crate::terminal::keys;
+use crate::terminal::links::{self, Link};
 
 pub const SCROLLBAR_WIDTH: f32 = 12.0;
 const PADDING: f32 = 4.0;
@@ -63,6 +65,8 @@ pub struct ViewOptions<'a> {
     pub theme: Theme,
     pub syntax: &'a str,
     pub highlighting_intensity: u8,
+    /// The user's own rules, drawn over the device's.
+    pub user_rules: &'a highlight::UserRules,
     pub regular: FontId,
     pub bold: FontId,
     /// False while a dialog is up: its Enter or Escape must not also reach
@@ -102,11 +106,47 @@ pub struct ViewOutput {
     pub paste_text: Option<String>,
     /// A snapshot of output to save or append with the app's file dialog.
     pub text_export: Option<TextExport>,
+    /// Text landed this frame, with animations on: where, and how many cells.
+    pub fresh_text: Option<(Pos2, usize)>,
+    /// A link Ctrl+clicked (Cmd+clicked on macOS).
+    pub open_link: Option<Link>,
 }
 
 pub enum TextExport {
     Save(String),
     Append(String),
+}
+
+/// While Ctrl (Cmd on macOS) is held, the link under the pointer gets a
+/// pointing hand and an underline; only the logical line there is searched.
+fn link_under_pointer(
+    ui: &Ui,
+    response: &egui::Response,
+    session: &Session,
+    m: &Metrics,
+    color: Color32,
+) -> Option<Link> {
+    if !response.hovered() || !ui.input(|i| i.modifiers.command) {
+        return None;
+    }
+    let (row, column, _) = m.cell_at(ui.input(|i| i.pointer.latest_pos())?);
+    let emu = session.shared.emulator.lock();
+    let point = emu.viewport_to_point(row, column);
+    let (text, cells) = emu.logical_line(point);
+    let offset = emu.display_offset() as i32;
+    drop(emu);
+    let at = cells.iter().position(|&cell| cell == point)?;
+    let (range, link) = links::find(&text, at)?;
+    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    for cell in &cells[range] {
+        let row = cell.line.0 + offset;
+        if (0..m.lines as i32).contains(&row) {
+            let x = m.origin.x + cell.column.0 as f32 * m.cell.x;
+            let y = m.origin.y + (row + 1) as f32 * m.cell.y - 1.0;
+            ui.painter().hline(x..=x + m.cell.x, y, Stroke::new(1.0, color));
+        }
+    }
+    Some(link)
 }
 
 fn ctrl_secondary_click(ui: &Ui) -> bool {
@@ -160,6 +200,8 @@ pub struct TerminalView {
     blink_epoch: f64,
     highlight_cache: HashMap<String, Vec<Span>>,
     highlight_settings: Option<(String, u8)>,
+    user_cache: HashMap<String, Vec<highlight::UserSpan>>,
+    user_rules_id: u64,
     scrollbar_grab: Option<f32>,
     request_focus: bool,
     animator: Animator,
@@ -269,6 +311,7 @@ impl TerminalView {
 
     pub fn clear_highlight_cache(&mut self) {
         self.highlight_cache.clear();
+        self.user_cache.clear();
     }
 
     /// Take the screen as it is from here: nothing on it animates. For a
@@ -315,7 +358,9 @@ impl TerminalView {
             self.blink_epoch = now;
         }
 
-        if options.mouse_input {
+        // That gesture moves a planet; it mustn't also select text.
+        let moving_planet = space::is_active(&options.theme, &options.animations) && ui.input(space::grabbing);
+        if options.mouse_input && !moving_planet {
             self.handle_mouse(ui, &response, session, &metrics, now, &mut out);
             if response.secondary_clicked() {
                 out.paste_requested = options.right_click_paste && !ctrl_secondary_click(ui);
@@ -361,6 +406,17 @@ impl TerminalView {
 
         let area = Rect::from_min_max(full.min, pos2(term_rect.max.x, full.max.y));
         self.paint(ui, area, &session.shared.emulator, options, &metrics, blinking, cursor_on, now);
+        if options.mouse_input
+            && let Some(link) = link_under_pointer(ui, &response, session, &metrics, options.theme.fg)
+            && response.clicked()
+        {
+            out.open_link = Some(link);
+        }
+        if options.animations.enabled {
+            out.fresh_text = self.animator.fresh_text().map(|(row, column, cells)| {
+                (metrics.origin + vec2(column * metrics.cell.x, row * metrics.cell.y), cells)
+            });
+        }
         self.scrollbar(ui, id, bar_rect, session, metrics.lines);
 
         // Over the text, and registered after the terminal so its clicks
@@ -489,6 +545,10 @@ impl TerminalView {
         let (metrics, _) = self.fit(ui, term_rect, emulator, options);
         let now = ui.input(|i| i.time);
         let cursor_on = blink_on(now, self.blink_epoch);
+        if options.theme.effects.appearance() == AppAppearance::Space {
+            // Previews have no app sky behind them, so they show a still one.
+            space::paint_still(&ui.painter().with_clip_rect(area), area, &options.theme);
+        }
         self.paint(ui, area, emulator, options, &metrics, true, cursor_on, now);
         self.schedule_repaint(ui.ctx(), &options.animations, true, now);
     }
@@ -528,6 +588,10 @@ impl TerminalView {
             != Some((options.syntax, intensity));
         if resized || highlighting_changed {
             self.highlight_cache.clear();
+        }
+        if resized || self.user_rules_id != options.user_rules.id {
+            self.user_cache.clear();
+            self.user_rules_id = options.user_rules.id;
         }
         if highlighting_changed {
             self.highlight_settings = Some((options.syntax.to_string(), intensity));
@@ -761,19 +825,7 @@ impl TerminalView {
     ) {
         let painter = ui.painter().with_clip_rect(area);
         let theme = options.theme;
-        painter.rect_filled(area, 0.0, theme.bg);
-        if theme.effects.appearance() == crate::settings::AppAppearance::Blueprint {
-            let grid_color = theme.fg.gamma_multiply(0.07);
-            let step = (m.cell.y * 2.0).max(24.0);
-            for column in 0..=(area.width() / step) as usize {
-                let x = area.left() + column as f32 * step;
-                painter.line_segment([pos2(x, area.top()), pos2(x, area.bottom())], Stroke::new(0.5, grid_color));
-            }
-            for row in 0..=(area.height() / step) as usize {
-                let y = area.top() + row as f32 * step;
-                painter.line_segment([pos2(area.left(), y), pos2(area.right(), y)], Stroke::new(0.5, grid_color));
-            }
-        }
+        paint_backdrop(&painter, area, &theme, m.cell.y);
 
         let emu = emulator.lock();
         // The animator compares the live screen with last frame's under the
@@ -793,7 +845,7 @@ impl TerminalView {
         let offset = grid.display_offset();
         let overrides = term.colors();
         let selection = term.selection.as_ref().and_then(|s| s.to_range(term));
-        let highlighting = options.syntax != "none" && !theme.effects.monochrome;
+        let highlighting = (options.syntax != "none" || !options.user_rules.is_empty()) && !theme.effects.monochrome;
         let columns = m.columns.min(grid.columns());
         let lines = m.lines.min(grid.screen_lines());
         // With this many glyphs zooming at once they fade in at their own size.
@@ -825,15 +877,19 @@ impl TerminalView {
             let live = anim.zip(usize::try_from(line.0).ok());
             let rect = |column: usize, width: usize| d.rect_at(row as f32, column as f32, width as f32);
 
-            let spans = if highlighting {
+            let (spans, user_spans) = if highlighting {
                 let text: String = (0..columns).map(|c| cells[Column(c)].c).collect();
-                highlight_cached(&mut self.highlight_cache, &text, options.syntax, options.highlighting_intensity)
+                (
+                    highlight_cached(&mut self.highlight_cache, &text, options.syntax, options.highlighting_intensity),
+                    user_cached(&mut self.user_cache, &text, options.user_rules),
+                )
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
             let syntax_color = |column: usize| {
                 spans.iter().find(|s| s.start <= column && column < s.end).map(|s| s.category.color_on(theme.bg))
             };
+            let user_style = |column: usize| user_spans.iter().find(|s| s.start <= column && column < s.end);
 
             let mut runs: Vec<Run> = Vec::new();
             let mut bg_run: Option<(usize, usize, Color32)> = None;
@@ -856,6 +912,7 @@ impl TerminalView {
                 let (mut fg, mut bg) = colors::cell_colors(cell, &theme, overrides);
                 let selected = selection.is_some_and(|s| s.contains(Point::new(line, Column(column))));
                 let found = marks.and_then(|m| m.at(line, column));
+                let user = user_style(column);
                 if selected {
                     bg = theme.selection;
                 } else if found == Some(true) {
@@ -866,6 +923,9 @@ impl TerminalView {
                     }
                     if let Some(color) = syntax_color(column) {
                         fg = color;
+                    }
+                    if let Some(user) = user {
+                        fg = user.color;
                     }
                 }
                 let look = live.and_then(|(a, live)| a.cell(now, live, column));
@@ -894,7 +954,7 @@ impl TerminalView {
                     ch = look.glyph.unwrap_or(ch);
                     (offset_y, scale) = (look.offset_y, if keep_size { 1.0 } else { look.scale });
                 }
-                let bold = cell.flags.contains(Flags::BOLD);
+                let bold = cell.flags.contains(Flags::BOLD) || user.is_some_and(|u| u.bold);
                 let italic = cell.flags.contains(Flags::ITALIC);
                 let underline = cell.flags.intersects(Flags::ALL_UNDERLINES);
                 let strike = cell.flags.contains(Flags::STRIKEOUT);
@@ -1213,6 +1273,25 @@ fn highlight_cached(cache: &mut HashMap<String, Vec<Span>>, text: &str, syntax: 
     spans
 }
 
+fn user_cached(
+    cache: &mut HashMap<String, Vec<highlight::UserSpan>>,
+    text: &str,
+    rules: &highlight::UserRules,
+) -> Vec<highlight::UserSpan> {
+    if rules.is_empty() {
+        return Vec::new();
+    }
+    if let Some(spans) = cache.get(text) {
+        return spans.clone();
+    }
+    if cache.len() >= HIGHLIGHT_CACHE_MAX {
+        cache.clear();
+    }
+    let spans = rules.spans(text);
+    cache.insert(text.to_string(), spans.clone());
+    spans
+}
+
 // -- animations -------------------------------------------------------------
 
 /// The cursor's cell on the live screen; on the second half of a wide
@@ -1327,6 +1406,54 @@ fn convex_hull(mut points: Vec<Pos2>) -> Vec<Pos2> {
     hull
 }
 
+/// What sits behind the text. Faint and still, so it never competes with it.
+fn paint_backdrop(painter: &Painter, area: Rect, theme: &Theme, row_height: f32) {
+    let appearance = theme.effects.appearance();
+    let fill = if appearance == AppAppearance::Space {
+        theme.bg.gamma_multiply(super::style::SPACE_TERMINAL)
+    } else {
+        theme.bg
+    };
+    painter.rect_filled(area, 0.0, fill);
+    let line = Stroke::new(0.5, theme.fg.gamma_multiply(0.07));
+    match appearance {
+        AppAppearance::Blueprint => {
+            let step = (row_height * 2.0).max(24.0);
+            for column in 0..=(area.width() / step) as usize {
+                let x = area.left() + column as f32 * step;
+                painter.line_segment([pos2(x, area.top()), pos2(x, area.bottom())], line);
+            }
+            for row in 0..=(area.height() / step) as usize {
+                let y = area.top() + row as f32 * step;
+                painter.line_segment([pos2(area.left(), y), pos2(area.right(), y)], line);
+            }
+        }
+        AppAppearance::Neon => {
+            // A floor running back to a horizon across the lower half.
+            let line = Stroke::new(0.8, theme.cursor.gamma_multiply(0.09));
+            let vanish = area.center();
+            for i in -12..=12 {
+                let x = vanish.x + i as f32 * area.width() / 8.0;
+                painter.line_segment([vanish, pos2(x, area.bottom())], line);
+            }
+            let mut y = 6.0;
+            while vanish.y + y < area.bottom() {
+                painter.hline(area.x_range(), vanish.y + y, line);
+                y *= 1.5;
+            }
+        }
+        AppAppearance::Sonar => {
+            let centre = pos2(area.center().x, area.bottom());
+            let step = (area.height() / 3.0).max(48.0);
+            for ring in 1..=6 {
+                painter.circle_stroke(centre, ring as f32 * step, line);
+            }
+            painter.vline(centre.x, area.y_range(), line);
+        }
+        _ => {}
+    }
+}
+
 /// The mark on a row of fresh output; [`LineMark`] says how each style is
 /// drawn.
 fn paint_line_mark(painter: &Painter, d: &Metrics, row: f32, mark: &LineMark, theme: &Theme, columns: usize) {
@@ -1390,6 +1517,13 @@ fn paint_line_mark(painter: &Painter, d: &Metrics, row: f32, mark: &LineMark, th
                     painter.line_segment([pos2(x, y), pos2(x + sign * arm, y)], stroke);
                 }
             }
+        }
+        NewLines::Wipe => {
+            painter.rect_filled(span(start, start + mark.reach), 0.0, theme.cursor.gamma_multiply(mark.alpha));
+        }
+        NewLines::Beacon => {
+            let centre = pos2(d.origin.x - 2.0, span(0.0, 1.0).center().y);
+            painter.circle_filled(centre, 2.5, theme.cursor.gamma_multiply(mark.alpha));
         }
         NewLines::Outline => {
             painter.rect_stroke(
@@ -1929,6 +2063,7 @@ mod tests {
             theme: Theme::default(),
             syntax: "none",
             highlighting_intensity: highlight::DEFAULT_INTENSITY,
+            user_rules: &highlight::NO_USER_RULES,
             regular: FontId::monospace(14.0),
             bold: FontId::monospace(14.0),
             keyboard: false,

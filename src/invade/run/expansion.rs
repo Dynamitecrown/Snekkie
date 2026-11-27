@@ -1,4 +1,5 @@
-//! Elite cargo, reflected packets and Probe's optional homing Pivot.
+//! Elite cargo, reflected packets, optional specials (Missile, Cloak,
+//! Stinger and its poison, Rate Limit), blasts and Train's tail.
 use super::*;
 
 impl InvadeRun {
@@ -28,8 +29,160 @@ impl InvadeRun {
     }
 
     /// Selected at the loadout screen; preserved through waves in this run.
+    /// A special this rig cannot use, or has not unlocked, falls back to its own.
     pub fn set_pivot_kind(&mut self, kind: PivotKind) {
-        self.pivot_kind = kind;
+        self.pivot_kind = if kind.allowed(self.rig, |u| self.unlocked.contains(&u)) { kind } else { PivotKind::Chain };
+    }
+
+    /// What X does in this run, for the HUD and control hints.
+    pub fn special_name(&self) -> &'static str {
+        match self.pivot_kind {
+            PivotKind::Chain => self.rig.special_name(),
+            PivotKind::Missile => "Missile",
+            kind => kind.name(),
+        }
+    }
+
+    /// Train's cars follow the one ahead like a snake, one spacing apart.
+    pub(super) fn update_tail(&mut self) {
+        let p = &mut self.player;
+        let mut leader = (p.x, p.y + 0.5);
+        while p.tail.len() < usize::from(self.stats.tail) {
+            p.tail.push(p.tail.last().copied().unwrap_or(leader));
+        }
+        for car in &mut p.tail {
+            let gap = visual_distance(*car, leader);
+            if gap > TAIL_SPACING {
+                let pull = (gap - TAIL_SPACING) / gap;
+                car.0 += (leader.0 - car.0) * pull;
+                car.1 += (leader.1 - car.1) * pull;
+            }
+            leader = *car;
+        }
+    }
+
+    pub(super) fn launch_stinger(&mut self) {
+        let mirrored = self.items.contains(&ItemKind::PortMirroring);
+        for side in 0..if mirrored { 2 } else { 1 } {
+            if self.shots.len() >= MAX_SHOTS {
+                break;
+            }
+            if mirrored && self.mirror_rng.chance(0.25) {
+                continue;
+            }
+            let aim = self.player.aim;
+            let dir = if side == 0 { aim } else { (-aim.0, -aim.1) };
+            let (vx, vy) = velocity(dir, STINGER_SPEED * self.projectile_speed());
+            self.shots.push(Shot {
+                radius: STINGER_SHOT_RADIUS * self.projectile_size(),
+                target: None,
+                kind: ShotKind::Stinger,
+                x: self.player.x,
+                y: self.player.y + 0.5,
+                vx,
+                vy,
+                damage: 0.0,
+                pierce: 0,
+                hit: Vec::new(),
+                travelled: 0.0,
+                range: STINGER_RANGE,
+                guided: false,
+            });
+        }
+    }
+
+    /// Add a poison stack to every enemy in the cloud; stacks refresh the timer.
+    pub(super) fn poison_cloud(&mut self, at: (f32, f32)) {
+        self.effect(EffectKind::Poison, at, at, 0.6);
+        if let Some(effect) = self.effects.last_mut() {
+            effect.radius = STINGER_RADIUS;
+        }
+        // Linked boss parts share one HP pool: poison only one of them.
+        let mut pools = BTreeSet::new();
+        for e in &mut self.enemies {
+            let near = visual_distance(at, (at.0.clamp(e.x, e.x + e.w), at.1.clamp(e.y, e.y + e.h))) <= STINGER_RADIUS;
+            if e.alive && near && e.pool.is_none_or(|p| pools.insert(p)) {
+                e.poison = (e.poison + 1).min(POISON_MAX_STACKS);
+                e.poison_time = POISON_DURATION;
+            }
+        }
+    }
+
+    /// Seconds of Rate Limit left; hostile packets and ordinary ships crawl.
+    pub fn rate_limited(&self) -> f32 {
+        self.throttle
+    }
+
+    /// Seconds one Rate Limit lasts with the current build.
+    pub fn rate_limit_time(&self) -> f32 {
+        rate_limit_time(&self.stats)
+    }
+
+    /// Seconds of Relay's Overclock left; weapons cool down twice as fast.
+    pub fn overclocked(&self) -> f32 {
+        self.overclock
+    }
+
+    /// Kernel's Purge: erase nearby hostile packets and blast the devices around the rig.
+    pub(super) fn purge(&mut self) {
+        let at = (self.player.x, self.player.y + 0.5);
+        let radius = self.stats.purge_radius;
+        self.hostiles.retain(|h| visual_distance(at, (h.x, h.y)) > radius);
+        self.explode(at, self.stats.pivot_direct, radius);
+    }
+
+    pub(super) fn slow(&self) -> f32 {
+        if self.throttle > 0.0 { RATE_LIMIT_SLOW } else { 1.0 }
+    }
+
+    pub(super) fn rate_limit(&mut self) {
+        self.throttle = rate_limit_time(&self.stats);
+        let at = (self.player.x, self.player.y + 0.5);
+        self.effect(EffectKind::Pulse, at, at, 0.6);
+        if let Some(effect) = self.effects.last_mut() {
+            effect.radius = 30.0;
+        }
+    }
+
+    /// The blast radius of a shot that explodes, in visual units.
+    pub(super) fn blast(&self, kind: ShotKind) -> Option<f32> {
+        match kind {
+            ShotKind::Missile => Some(8.0 + f32::from(self.stats.pivot_jumps.saturating_sub(3))),
+            ShotKind::Mine => {
+                let bomb = self.weapons.iter().find(|w| w.kind == WeaponKind::Mine);
+                Some(bomb.map_or(6.0, |w| w.spec(self.rig, &self.stats).radius))
+            }
+            _ => None,
+        }
+    }
+
+    /// Damage per poison stack per second.
+    pub fn poison_per_stack(&self) -> f32 {
+        poison_per_stack(&self.stats)
+    }
+
+    pub(super) fn update_poison(&mut self) {
+        let per_stack = self.poison_per_stack();
+        for i in 0..self.enemies.len() {
+            let e = &mut self.enemies[i];
+            if !e.alive || e.poison == 0 {
+                continue;
+            }
+            e.poison_time -= STEP;
+            e.poison_tick += STEP;
+            let amount = if e.poison_tick >= POISON_TICK {
+                e.poison_tick -= POISON_TICK;
+                f32::from(e.poison) * per_stack * POISON_TICK
+            } else {
+                0.0
+            };
+            if e.poison_time <= 0.0 {
+                (e.poison, e.poison_tick) = (0, 0.0);
+            }
+            if amount > 0.0 {
+                self.damage(i, amount);
+            }
+        }
     }
 
     pub(super) fn projectile_size(&self) -> f32 {
@@ -40,11 +193,15 @@ impl InvadeRun {
         if self.items.contains(&ItemKind::JumboFrame) { 0.5 } else { 1.0 }
     }
 
-    /// A random item the player has neither equipped nor left lying around.
+    /// A random unlocked item the player has neither equipped nor left lying around.
     pub(super) fn drop_elite_item(&mut self, at: (f32, f32)) {
         let open: Vec<_> = ItemKind::ALL
             .into_iter()
-            .filter(|k| !self.items.contains(k) && !self.item_drops.iter().any(|d| d.kind == *k))
+            .filter(|k| {
+                !self.items.contains(k)
+                    && !self.item_drops.iter().any(|d| d.kind == *k)
+                    && k.unlock().is_none_or(|u| self.unlocked.contains(&u))
+            })
             .collect();
         if !open.is_empty() {
             let kind = open[self.loot_rng.below(open.len() as u32) as usize];
@@ -104,10 +261,12 @@ impl InvadeRun {
         }
     }
 
-    pub(super) fn missile_target(&self, at: (f32, f32), hemisphere: Option<(f32, f32)>) -> Option<u32> {
+    /// The nearest visible enemy with at least 6 HP, else the nearest one,
+    /// leaving out any in `skip` (what a Worm has already been through).
+    pub(super) fn missile_target(&self, at: (f32, f32), hemisphere: Option<(f32, f32)>, skip: &[u32]) -> Option<u32> {
         self.enemies
             .iter()
-            .filter(|e| e.alive && e.visible_in(self.camera()))
+            .filter(|e| e.alive && e.visible_in(self.camera()) && !skip.contains(&e.id))
             .filter(|e| {
                 hemisphere.is_none_or(|dir| {
                     let c = e.center();
@@ -136,7 +295,7 @@ impl InvadeRun {
             let aim = self.player.aim;
             let dir = if side == 0 { aim } else { (-aim.0, -aim.1) };
             let at = (self.player.x, self.player.y + 0.5);
-            let target = self.missile_target(at, if side == 1 { Some(dir) } else { None });
+            let target = self.missile_target(at, if side == 1 { Some(dir) } else { None }, &[]);
             let heading = target
                 .and_then(|id| self.alive_index(id))
                 .and_then(|i| direction(at, self.enemies[i].center()))
@@ -163,18 +322,19 @@ impl InvadeRun {
     pub(super) fn steer_missile(&self, shot: &mut Shot) {
         let at = (shot.x, shot.y);
         if shot.target.and_then(|id| self.alive_index(id)).is_none() {
-            shot.target = self.missile_target(at, None);
+            shot.target = self.missile_target(at, None, &shot.hit);
         }
         let Some(index) = shot.target.and_then(|id| self.alive_index(id)) else { return };
         let Some(dir) = direction(at, self.enemies[index].center()) else { return };
         let current = unit((shot.vx, shot.vy * ASPECT)).unwrap_or(dir);
         let angle = (current.0 * dir.1 - current.1 * dir.0).atan2(current.0 * dir.0 + current.1 * dir.1);
-        let heading = rotated(current, angle.clamp(-5.0 * STEP, 5.0 * STEP));
+        // A Worm turns tightly, or it would orbit a device beside it forever.
+        let turn = if shot.kind == ShotKind::Worm { 14.0 } else { 5.0 } * STEP;
+        let heading = rotated(current, angle.clamp(-turn, turn));
         (shot.vx, shot.vy) = velocity(heading, shot.vx.hypot(shot.vy * ASPECT));
     }
 
-    pub(super) fn explode(&mut self, at: (f32, f32), damage: f32) {
-        let radius = 8.0 + f32::from(self.stats.pivot_jumps.saturating_sub(3));
+    pub(super) fn explode(&mut self, at: (f32, f32), damage: f32, radius: f32) {
         self.effect(EffectKind::Pulse, at, at, 0.45);
         if let Some(effect) = self.effects.last_mut() {
             effect.radius = radius;

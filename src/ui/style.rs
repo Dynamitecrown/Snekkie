@@ -9,6 +9,12 @@ use egui::{Color32, CornerRadius, Stroke, Visuals};
 pub const BANNER_BG: Color32 = Color32::from_rgb(0x55, 0x22, 0x22);
 pub const BANNER_INFO_BG: Color32 = Color32::from_rgb(0x2a, 0x3a, 0x4a);
 
+/// How much of the theme background covers the Space sky: sidebar and bars,
+/// the workspace, and behind terminal text. Tests hold text readable at these.
+pub const SPACE_PANEL: f32 = 0.84;
+pub const SPACE_CENTRAL: f32 = 0.15;
+pub const SPACE_TERMINAL: f32 = 0.68;
+
 pub fn lighter(c: Color32, factor: f32) -> Color32 {
     let f = |v: u8| ((v as f32 * factor).round().min(255.0)) as u8;
     Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
@@ -29,7 +35,7 @@ fn luminance(c: Color32) -> f32 {
     0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
 }
 
-fn contrast(a: Color32, b: Color32) -> f32 {
+pub(super) fn contrast(a: Color32, b: Color32) -> f32 {
     let (a, b) = (luminance(a), luminance(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
@@ -127,6 +133,17 @@ pub fn apply_theme(ctx: &egui::Context, theme: Theme) {
             AppAppearance::Amber => {
                 (Color32::from_rgb(39, 28, 17), Color32::from_rgb(20, 14, 8), Color32::from_rgb(34, 24, 13))
             }
+            // Space leaves the panels see-through so its sky shows behind them.
+            AppAppearance::Space => {
+                visuals.panel_fill = theme.bg.gamma_multiply(SPACE_PANEL);
+                (theme.bg.lerp_to_gamma(theme.fg, 0.08), theme.bg, theme.bg.gamma_multiply(SPACE_CENTRAL))
+            }
+            AppAppearance::Neon => {
+                (Color32::from_rgb(28, 18, 58), Color32::from_rgb(14, 9, 32), Color32::from_rgb(23, 15, 48))
+            }
+            AppAppearance::Sonar => {
+                (Color32::from_rgb(8, 42, 44), Color32::from_rgb(3, 22, 24), Color32::from_rgb(6, 33, 36))
+            }
             _ => (Color32::from_rgb(10, 24, 15), Color32::from_rgb(5, 15, 8), Color32::from_rgb(9, 21, 13)),
         };
         visuals.window_fill = panel;
@@ -195,6 +212,24 @@ pub fn monitor<R>(ui: &mut egui::Ui, theme: Theme, draw: impl FnOnce(&mut egui::
             Color32::from_rgb(12, 8, 3),
             "S N E K K I E  /  A M B E R",
         ),
+        AppAppearance::Space => (
+            theme.bg.gamma_multiply(0.2),
+            theme.cursor.gamma_multiply(0.45),
+            theme.cursor.gamma_multiply(0.3),
+            "S N E K K I E  /  S P A C E",
+        ),
+        AppAppearance::Neon => (
+            Color32::from_rgb(25, 15, 52),
+            theme.cursor.gamma_multiply(0.75),
+            Color32::from_rgb(57, 200, 240),
+            "S N E K K I E  /  N E O N",
+        ),
+        AppAppearance::Sonar => (
+            Color32::from_rgb(9, 40, 42),
+            Color32::from_rgb(40, 110, 104),
+            Color32::from_rgb(2, 12, 13),
+            "S N E K K I E  /  S O N A R",
+        ),
         _ => (
             Color32::from_rgb(35, 45, 38),
             Color32::from_rgb(74, 88, 77),
@@ -216,7 +251,8 @@ pub fn monitor<R>(ui: &mut egui::Ui, theme: Theme, draw: impl FnOnce(&mut egui::
         .inner_margin(egui::Margin { left: 16, right: 16, top: 16, bottom: 34 })
         .show(ui, |ui| {
             egui::Frame::new()
-                .fill(theme.bg)
+                // The terminal lays its own see-through cover over the sky.
+                .fill(if appearance == AppAppearance::Space { Color32::TRANSPARENT } else { theme.bg })
                 .stroke(Stroke::new(if is_paper { 1.0 } else { 3.0 }, inset))
                 .corner_radius(if appearance == AppAppearance::Blueprint { 0.0 } else { 8.0 })
                 .inner_margin(4.0)
@@ -235,6 +271,9 @@ pub fn monitor<R>(ui: &mut egui::Ui, theme: Theme, draw: impl FnOnce(&mut egui::
             AppAppearance::EInk => "E-INK",
             AppAppearance::Blueprint => "BLUEPRINT",
             AppAppearance::Amber => "AMBER",
+            AppAppearance::Space => "SPACE",
+            AppAppearance::Neon => "NEON",
+            AppAppearance::Sonar => "SONAR",
             _ => "CRT",
         }
     };
@@ -399,7 +438,9 @@ mod tests {
 
     #[test]
     fn narrow_monitor_labels_fit_between_the_bezel_controls() {
-        for name in ["CRT Super", "E-Ink Super", "Blueprint Super", "Amber Super"] {
+        for name in
+            ["CRT Super", "E-Ink Super", "Blueprint Super", "Amber Super", "Space Super", "Neon Super", "Sonar Super"]
+        {
             let ctx = egui::Context::default();
             let theme = crate::settings::AppSettings { theme: name.into(), ..Default::default() }.colors();
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {

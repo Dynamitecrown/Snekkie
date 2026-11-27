@@ -29,4 +29,8 @@ With a positive delay, the status bar shows the target and lines submitted, plus
 
 Typing and mouse input on the destination are blocked during its queued paste so commands cannot interleave. Other tabs remain usable. Queues pause while a dialog is open. Disconnect, reconnect, closing the tab or quitting discards unsent lines; nothing is replayed into a replacement connection. One queue runs at a time.
 
-**0 ms** sends the entire text immediately, without a stoppable queue. Turning off multiline preview restores immediate clipboard paste and bypasses pacing. [Command snippets](command-snippets.md) use the same controller and saved delay after their own review, while still adding a final CR to submit the last command. Bracketed-paste support for terminal applications remains separate work.
+**0 ms** sends the entire text immediately, without a stoppable queue. Turning off multiline preview restores immediate clipboard paste and bypasses pacing. [Command snippets](command-snippets.md) use the same controller and saved delay after their own review, while still adding a final CR to submit the last command.
+
+## Bracketed paste
+
+Shells such as bash and zsh, and editors such as vim, can turn on bracketed paste mode. While it is on, a clipboard paste is sent as one block between the `ESC [200~` and `ESC [201~` markers, so the program knows it was pasted and doesn't run each line as you'd typed it. Review still opens for multiline text as usual, but the line delay is not used: the whole reviewed text goes at once. Any paste markers inside the text are removed first, so pasted text can't end the block early. Devices that don't ask for it, such as most network CLIs, get the usual paced paste. Command snippets are never bracketed, because they are meant to run.

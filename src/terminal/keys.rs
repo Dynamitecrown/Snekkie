@@ -44,6 +44,58 @@ impl Backspace {
     }
 }
 
+/// What Enter sends on a serial line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EnterSends {
+    #[default]
+    Cr,
+    Lf,
+    CrLf,
+}
+
+impl EnterSends {
+    pub const ALL: [EnterSends; 3] = [EnterSends::Cr, EnterSends::Lf, EnterSends::CrLf];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EnterSends::Cr => "cr",
+            EnterSends::Lf => "lf",
+            EnterSends::CrLf => "crlf",
+        }
+    }
+
+    pub fn parse(s: &str) -> EnterSends {
+        match s {
+            "lf" => EnterSends::Lf,
+            "crlf" => EnterSends::CrLf,
+            _ => EnterSends::Cr,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EnterSends::Cr => "CR",
+            EnterSends::Lf => "LF",
+            EnterSends::CrLf => "CR+LF",
+        }
+    }
+
+    /// Input leaves the terminal with CR line ends (Enter and pastes alike);
+    /// replace each CR with this ending just before it goes out.
+    pub fn translate(self, bytes: Vec<u8>) -> Vec<u8> {
+        let ending: &[u8] = match self {
+            EnterSends::Cr => return bytes,
+            EnterSends::Lf => b"\n",
+            EnterSends::CrLf => b"\r\n",
+        };
+        let mut out = Vec::with_capacity(bytes.len() + 8);
+        for b in bytes {
+            if b == b'\r' { out.extend_from_slice(ending) } else { out.push(b) }
+        }
+        out
+    }
+}
+
 /// xterm modifier parameter: 1 + shift(1) + alt(2) + ctrl(4).
 fn modifier_code(mods: Modifiers) -> u8 {
     1 + u8::from(mods.shift) + 2 * u8::from(mods.alt) + 4 * u8::from(mods.ctrl)
@@ -204,6 +256,21 @@ pub fn encode_paste(text: &str) -> Vec<u8> {
     text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
 }
 
+/// Paste for a far end in bracketed paste mode: one block between the start
+/// and end markers. Markers inside the text are removed (repeatedly, so
+/// removing one can't join the pieces of another), so a pasted end marker
+/// can't break out and run the rest as typed commands.
+pub fn encode_bracketed_paste(text: &str) -> Vec<u8> {
+    let mut text = text.to_string();
+    while text.contains("\x1b[200~") || text.contains("\x1b[201~") {
+        text = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
+    }
+    let mut out = b"\x1b[200~".to_vec();
+    out.extend(encode_paste(&text));
+    out.extend(b"\x1b[201~");
+    out
+}
+
 /// What to draw for bytes the user sent, when the far end won't echo them.
 ///
 /// Text goes on screen as typed, Enter starts a new line and Backspace rubs
@@ -333,8 +400,28 @@ mod tests {
     }
 
     #[test]
+    fn enter_sends_translates_only_carriage_returns() {
+        assert_eq!(EnterSends::Cr.translate(b"a\rb\n".to_vec()), b"a\rb\n");
+        assert_eq!(EnterSends::Lf.translate(b"a\rb\r".to_vec()), b"a\nb\n");
+        assert_eq!(EnterSends::CrLf.translate(encode_paste("a\nb\r\n")), b"a\r\nb\r\n");
+        for e in EnterSends::ALL {
+            assert_eq!(EnterSends::parse(e.as_str()), e);
+        }
+        assert_eq!(EnterSends::parse("bogus"), EnterSends::Cr);
+    }
+
+    #[test]
     fn paste_normalises_line_endings() {
         assert_eq!(encode_paste("a\r\nb\nc"), b"a\rb\rc");
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_and_strips_markers() {
+        assert_eq!(encode_bracketed_paste("a\nb"), b"\x1b[200~a\rb\x1b[201~");
+        assert_eq!(encode_bracketed_paste("x\x1b[201~rm -rf /\n"), b"\x1b[200~xrm -rf /\r\x1b[201~");
+        // Removing the inner marker must not leave a new one behind.
+        assert_eq!(encode_bracketed_paste("\x1b[20\x1b[201~1~ok"), b"\x1b[200~ok\x1b[201~");
+        assert_eq!(encode_bracketed_paste("\x1b[200~"), b"\x1b[200~\x1b[201~");
     }
 
     #[test]

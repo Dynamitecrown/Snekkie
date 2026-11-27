@@ -1,7 +1,7 @@
 //! Read-only PuTTY session import. Registry exports are parsed as data, never
 //! executed or installed. Only supported connection/terminal fields are used.
 
-use crate::profiles::Profile;
+use crate::profiles::{Profile, Tunnel, TunnelKind, parse_destination, parse_listen};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -31,6 +31,7 @@ const NUMBERS: &[&str] = &[
     "FontHeight",
     "LocalEcho",
     "BackspaceIsDelete",
+    "LFImpliesCR",
     "ProxyMethod",
     "SSH2DES",
     "SshNoAuth",
@@ -120,6 +121,7 @@ fn convert(sessions: BTreeMap<String, Values>, defaults: &crate::settings::AppSe
             profile.stopbits = stop as f32 / 2.0;
             profile.xonxoff = flow == 1;
             profile.rtscts = flow == 2;
+            profile.lf_to_crlf = number("LFImpliesCR", 0) != 0;
         }
         if protocol == "ssh" {
             let key = get("PublicKeyFile");
@@ -135,13 +137,54 @@ fn convert(sessions: BTreeMap<String, Values>, defaults: &crate::settings::AppSe
                 }
             }
         }
-        if number("ProxyMethod", 0) != 0 || !get("PortForwardings").is_empty() || !get("RemoteCommand").is_empty() {
-            batch.warnings.push(format!("{}: proxy, forwarding or remote-command settings are not imported. Check that the destination is directly reachable.", profile.name));
+        let mut unsupported_forwards = Vec::new();
+        for entry in get("PortForwardings").split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            match port_forward(entry).filter(|_| protocol == "ssh") {
+                Some((tunnel, wanted_others)) => {
+                    if wanted_others {
+                        batch.warnings.push(format!("{}: tunnel {} listens on 127.0.0.1 only after import; tick Allow other computers to change that.", profile.name, tunnel.label()));
+                    }
+                    profile.tunnels.push(tunnel);
+                }
+                None => unsupported_forwards.push(entry),
+            }
+        }
+        if !unsupported_forwards.is_empty() {
+            batch.warnings.push(format!(
+                "{}: port forwardings {} are not imported.",
+                profile.name,
+                unsupported_forwards.join(", ")
+            ));
+        }
+        if number("ProxyMethod", 0) != 0 || !get("RemoteCommand").is_empty() {
+            batch.warnings.push(format!("{}: proxy or remote-command settings are not imported. Check that the destination is directly reachable.", profile.name));
         }
         batch.profiles.push(profile);
     }
     batch.profiles.sort_by_key(|p| p.name.to_lowercase());
     batch
+}
+
+/// One PuTTY PortForwardings entry, such as "L8080=10.0.0.1:80" or "D1080",
+/// and whether it listened beyond loopback. IPv4/IPv6-only entries aren't simple.
+fn port_forward(entry: &str) -> Option<(Tunnel, bool)> {
+    let kind = match entry.get(..1)? {
+        "L" => TunnelKind::Local,
+        "R" => TunnelKind::Remote,
+        "D" => TunnelKind::Dynamic,
+        _ => return None,
+    };
+    let (listen, destination) = entry[1..].split_once('=').unwrap_or((&entry[1..], ""));
+    let (listen_port, others) = parse_listen(listen)?;
+    let mut tunnel = Tunnel { kind, listen_port, ..Tunnel::default() };
+    if kind == TunnelKind::Dynamic {
+        if !destination.is_empty() {
+            return None;
+        }
+    } else {
+        (tunnel.host, tunnel.port) = parse_destination(destination)?;
+    }
+    Some((tunnel, others))
 }
 
 fn quoted(text: &str) -> Option<(String, &str)> {
@@ -373,6 +416,7 @@ mod tests {
 "LocalEcho"=dword:00000000
 "BackspaceIsDelete"=dword:00000000
 "ProxyMethod"=dword:00000002
+"PortForwardings"="L8080=10.0.0.1:80,R2222=localhost:22,D1080,L0.0.0.0:8443=[fd00::1]:443,4L9000=h:1,Lbad"
 
 [HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\Sessions\Console]
 "Protocol"="serial"
@@ -381,6 +425,7 @@ mod tests {
 "SerialParity"=dword:00000002
 "SerialStopHalfbits"=dword:00000004
 "SerialFlowControl"=dword:00000002
+"LFImpliesCR"=dword:00000001
 
 [HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\Sessions\Default%20Settings]
 "HostName"="ignore-me"
@@ -414,7 +459,18 @@ mod tests {
             assert_eq!(serial.stopbits, 2.0);
             assert!(serial.rtscts);
             assert!(!serial.xonxoff);
-            assert_eq!(batch.warnings.len(), 2);
+            assert!(serial.lf_to_crlf);
+            assert!(!ssh.lf_to_crlf);
+            let labels: Vec<String> = ssh.tunnels.iter().map(Tunnel::label).collect();
+            assert_eq!(
+                labels,
+                ["L 8080 → 10.0.0.1:80", "R 2222 → localhost:22", "D 1080 (SOCKS)", "L 8443 → [fd00::1]:443"]
+            );
+            assert!(ssh.tunnels.iter().all(|t| t.enabled && !t.allow_others));
+            let notes = batch.warnings.join("\n");
+            assert!(notes.contains("port forwardings 4L9000=h:1, Lbad are not imported"), "{notes}");
+            assert!(notes.contains("tunnel L 8443 → [fd00::1]:443 listens on 127.0.0.1 only"), "{notes}");
+            assert_eq!(batch.warnings.len(), 4);
         }
         assert!(parse_export(b"not a registry export", &settings).is_err());
         assert!(parse_export(&[0xff, 0xfe, 0], &settings).is_err());

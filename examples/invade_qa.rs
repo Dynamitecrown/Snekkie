@@ -124,6 +124,11 @@ fn main() {
         return;
     }
 
+    if std::env::args().any(|a| a == "--enhance") {
+        enhance_scenes();
+        return;
+    }
+
     // Every screen, in the default theme and window.
     let mut qa = Qa::setup("Snekkie Dark", [1000.0, 640.0], 1.0, None);
     qa.capture("loadout");
@@ -251,8 +256,8 @@ fn main() {
         (10, "gateway", 9.0),
         (20, "load-balancer", 3.2),
         (20, "load-balancer-curtain", 0.0),
-        (30, "sentinel-ids", 3.1),
-        (40, "root-controller", 4.0),
+        (40, "sentinel-ids", 3.1),
+        (50, "root-controller", 4.0),
     ] {
         let mut qa = Qa::new("Snekkie Dark", [1000.0, 640.0], 1.0, Some(UNLOCKED));
         let run = qa.run();
@@ -261,7 +266,7 @@ fn main() {
             run.grant(id);
         }
         run.skip_to_wave(wave);
-        if wave == 40 {
+        if wave == 50 {
             // Its first reinforcements arrive at three quarters health.
             for _ in 0..3 {
                 run.grant(UpgradeId::Payload);
@@ -450,7 +455,7 @@ fn expansion_scenes() {
             run.spawn_item_drop(kind, at);
         }
         run.step(Input::default());
-        assert_eq!(run.items().count(), 2);
+        assert_eq!(run.items().count(), ItemKind::ALL.len());
         for _ in 0..15 {
             run.step(Input { fire: true, ..Default::default() });
         }
@@ -462,4 +467,102 @@ fn expansion_scenes() {
         inventory.app.step();
         inventory.capture("expansion-items-build");
     }
+}
+
+/// Rate Limit, Worm, Logic Bomb, the larger cargo list, Bot Herder and
+/// Null Route.
+fn enhance_scenes() {
+    use snekkie::invade::content::encounter_for;
+    use snekkie::invade::{EncounterKind, InvadeRun, ItemKind, MinibossKind, PivotKind, Rig, WeaponKind};
+    let size = [1000.0, 640.0];
+    let fire = Input { fire: true, ..Default::default() };
+
+    let rate_limit = r#"{"version":1,"unlocked":["rate_limit"]}"#;
+    let mut qa = Qa::setup("Snekkie Dark", size, 1.0, Some(rate_limit));
+    qa.app.get_by_label("Rate Limit").scroll_to_me();
+    qa.app.run_ok();
+    qa.app.get_by_label("Rate Limit").click();
+    qa.app.step();
+    qa.capture("enhance-loadout");
+    qa.start();
+    assert_eq!(qa.run().pivot_kind(), PivotKind::RateLimit);
+    let run = qa.run();
+    run.set_immortal();
+    run.skip_to_wave(9);
+    assert!(run.grant_weapon(WeaponKind::Worm));
+    assert!(run.grant_weapon(WeaponKind::Mine));
+    qa.play(12.0, 3);
+    // The automatic pilot spends X at once; wait for the next charge.
+    let run = qa.run();
+    for _ in 0..3000 {
+        if run.rate_limited() > 0.0 {
+            break;
+        }
+        if run.phase() == Phase::Upgrade {
+            run.choose(0);
+        }
+        run.step(Input { special: true, ..fire });
+    }
+    assert!(run.rate_limited() > 0.0);
+    for _ in 0..40 {
+        run.step(fire);
+    }
+    qa.app.step();
+    qa.app.step();
+    qa.capture("enhance-swarm-rate-limit");
+    let run = qa.run();
+    let at = (run.player().x, run.player().y + 0.5);
+    for kind in ItemKind::ALL {
+        run.spawn_item_drop(kind, at);
+    }
+    run.step(Input::default());
+    qa.app.key_press(egui::Key::B);
+    qa.app.step();
+    qa.app.step();
+    qa.capture("enhance-build");
+
+    let herder = EncounterKind::Miniboss(MinibossKind::BotHerder);
+    let seed = (0..5000).find(|&s| encounter_for(s, 5) == herder).unwrap();
+    let mut qa = Qa::new("Snekkie Dark", size, 1.0, None);
+    *qa.run() = InvadeRun::new(seed, Rig::Probe, [], 0);
+    qa.run().set_immortal();
+    qa.run().skip_to_wave(5);
+    qa.play(9.0, seed);
+    qa.capture("enhance-bot-herder");
+
+    let mut qa = Qa::new("Snekkie Dark", size, 1.0, None);
+    qa.run().set_immortal();
+    qa.run().skip_to_wave(30);
+    qa.play(2.9, 1);
+    qa.capture("enhance-null-route-ring");
+    qa.play(1.5, 1);
+    qa.capture("enhance-null-route-pull");
+
+    // Relay and Kernel with evolved weapons; the HUD shows `*` and the streak.
+    for (rig, name) in [(Rig::Relay, "enhance-relay-evolved"), (Rig::Kernel, "enhance-kernel-evolved")] {
+        let mut qa = Qa::new("Snekkie Dark", size, 1.0, None);
+        *qa.run() = InvadeRun::new(3, rig, [], 0);
+        let run = qa.run();
+        run.set_immortal();
+        run.skip_to_wave(12);
+        for kind in [WeaponKind::Packet, WeaponKind::Arc] {
+            for _ in 0..5 {
+                run.grant_weapon(kind);
+            }
+        }
+        qa.play(8.0, 3);
+        qa.capture(name);
+    }
+
+    let mut qa = Qa::new("Snekkie Dark", size, 1.0, None);
+    qa.run().skip_to_wave(12);
+    qa.app.key_press(egui::Key::P);
+    qa.app.step();
+    qa.app.get_by_label("Codex").scroll_to_me();
+    qa.app.run_ok();
+    qa.app.get_by_label("Codex").click();
+    qa.app.run_ok();
+    qa.app.get_by_label("Codex").scroll_to_me();
+    qa.app.run_ok();
+    qa.capture("enhance-pause-codex");
 }

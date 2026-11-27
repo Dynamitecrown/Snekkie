@@ -12,7 +12,16 @@ pub(super) fn rig(rig: Rig) -> Vec<String> {
         Rig::Probe => &["  /==\\  ", "<==^^==>"],
         Rig::Ghost => &[r" /\/\ ", "<~==~>"],
         Rig::Bastion => &[" /======\\ ", "[|==^^==|]"],
+        Rig::Tonk => &["/[######]\\", "[#==^^==#]"],
+        Rig::Train => &[" _||_ ", "[=^^=]"],
+        Rig::Relay => &[r" _/\_ ", "(=++=>"],
+        Rig::Kernel => &[r"  /\  ", r"</##\>"],
     })
+}
+
+/// One of Train's tail cars: two columns by one row around its center.
+pub(super) fn tail_car() -> Vec<String> {
+    redouble(&["(==)", "[##]"])
 }
 
 /// Rotate the rig in visual space, fitting the result inside the model's
@@ -117,6 +126,10 @@ pub(super) fn device(kind: DeviceKind, damaged: bool) -> Vec<String> {
         DeviceKind::Firewall => &["[####]", "|=##=|"],
         DeviceKind::Switch => &["[====]", "|::::|"],
         DeviceKind::IdsProbe => &[" /!!\\ ", "<!==!>"],
+        DeviceKind::Bot => &["  \\/  ", " <()> "],
+        DeviceKind::Hypervisor if damaged => &["{[.] /", "{/ [.]"],
+        DeviceKind::Hypervisor => &["{[.][.", "{[.][."],
+        DeviceKind::Repeater => &[" (++) ", "<-++->"],
     })
 }
 

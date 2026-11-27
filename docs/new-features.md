@@ -8,7 +8,7 @@ For the reorganized Preferences, session sidebar, themes and Linux/macOS package
 
 ## Full app themes
 
-Choose a preset in **Settings → Preferences → Appearance**. The current build has 21 presets, including four complete app appearances. See the [Preferences guide](preferences.md) for the newer Frost Light, Copper Night and Forest Night palettes, contrast improvements and animation options.
+Choose a preset in **Settings → Preferences → Appearance**. The current build has 30 presets, including seven complete app appearances. See the [Preferences guide](preferences.md) for the newer Frost Light, Copper Night and Forest Night palettes, contrast improvements and animation options.
 
 | Theme | Appearance |
 | --- | --- |
@@ -16,6 +16,9 @@ Choose a preset in **Settings → Preferences → Appearance**. The current buil
 | E-Ink Super | A matte cream and charcoal interface, crisp monochrome output, rounded reader bezel and a printed status mark; no glow or scanlines |
 | Blueprint Super | Blue drafting controls, a fine grid behind the terminal, measurement ticks and a square instrument frame |
 | Amber Super | Amber menus, monochrome phosphor text, glow, scanlines and a brown workstation bezel |
+| Space Super | Stars and planets behind the whole app, seen through see-through panels and terminal; see below |
+| Neon Super | Violet controls, magenta and cyan bezel, and a faint floor grid running back to a horizon behind the terminal |
+| Sonar Super | Teal console, monochrome output and faint range rings behind the terminal |
 
 All presets remain editable. **Theme colors → App appearance** lets you combine the full app appearance with your own colors. Monochrome output and CRT effects are separate controls. **Save as…** saves colors, appearance and effects together. Changing to a standard theme restores the normal interface. These static effects work with animations off.
 
@@ -25,14 +28,33 @@ All presets remain editable. **Theme colors → App appearance** lets you combin
 
 ![Amber Super](screenshots/amber-super.png)
 
+![Neon Super](screenshots/neon-super.png)
+
+![Sonar Super](screenshots/sonar-super.png)
+
+New standard palettes: Aurora, Rose Dusk, Graphite, Ember, Sandstone Light and Harbor Light.
+
+### Space Super
+
+![Space Super](screenshots/space-super.png)
+
+With animations off, the sky holds completely still and asks for no extra frames. With the **Animations** master switch on:
+
+- **New terminal text** sends a ripple out from where it landed. Stars are pushed aside and brighten as it passes, and planets drift away, then return.
+- **The pointer** shifts the sky slightly for depth, and planets lean away when it comes close.
+- **Ctrl+Shift+drag** picks up the nearest planet and leaves it where you drop it. Plain drags still select text. Moved planets return to their usual places when Snekkie restarts.
+
+The Animations speed setting applies to all of this, and once everything settles it stops drawing until something happens. Text stays on a darkened cover over the sky, selection stays solid, and syntax colors are checked against the brightest planets. The sky only changes drawing: commands, copied text and logs are unaffected. **Space observatory** can also be chosen under **Theme colors → App appearance** with your own colors, and **Save as…** keeps it.
+
 ## More animation choices
 
 Open **Settings → Preferences → Animations** and enable the master switch. Animations remain off by default. New choices include:
 
-- **Keystroke burst:** Explosion (sparks and a shockwave), Lasers (outward bolts), Lightning (electric arcs) and Portal (a ring with orbiting sparks).
-- **Typed characters:** Stamp and Laser.
-- **New text:** Hologram and Binary decode.
-- **New lines:** Laser sweep and Radar pulse.
+- **Keystroke burst:** Explosion (sparks and a shockwave), Lasers (outward bolts), Lightning (electric arcs), Portal (a ring with orbiting sparks), Comet (a streak with a dust trail), Fireflies (slow glowing wanderers) and Orbit (small moons circling the cursor).
+- **Typed characters:** Stamp, Laser, Jelly (a soft wobble) and Neon (stutters on like a tube).
+- **Cursor blink:** Heartbeat (two quick pulses, then a rest).
+- **New text:** Hologram, Binary decode, Flicker (a fluorescent tube warming up) and Glitch (a few characters scramble, then snap back).
+- **New lines:** Laser sweep, Radar pulse, Wipe (a soft band opening across the line) and Beacon (a margin light that blinks twice).
 
 Each category can be changed or turned off separately, and the live preview demonstrates the chosen settings. The speed slider applies to the new effects. Particle counts remain capped, effects stay inside the terminal, and finished effects stop requesting frames. Effects only change drawing; transmitted commands, copied text, exports and logs retain the original content.
 
@@ -75,9 +97,15 @@ reg export "HKCU\Software\SimonTatham\PuTTY\Sessions" putty-sessions.reg
 
 Review the listed destinations and import notes, select the sessions you want, then click **Import selected**. **Cancel** saves nothing. Imports add profiles to the sidebar without opening connections. Name conflicts get a unique suffix such as `Switch (PuTTY 1)`; existing profiles are never replaced.
 
-Supported settings include SSH/Telnet/raw TCP destinations, ports, usernames, keepalives, supported serial line settings, font, scrollback, local echo and Backspace behavior. PuTTY's Default Settings entry and unsupported protocols or serial configurations are skipped with notes. Passwords and host-key trust are not imported. PuTTY colors, proxies, forwarding, remote commands and other unsupported options are not imported. The preview reports proxy/forwarding/command dependencies so you can review them before connecting.
+Supported settings include SSH/Telnet/raw TCP destinations, ports, usernames, keepalives, supported serial line settings, font, scrollback, local echo and Backspace behavior. PuTTY's Default Settings entry and unsupported protocols or serial configurations are skipped with notes. Passwords and host-key trust are not imported. Simple `PortForwardings` entries become [tunnels](tunnels.md). PuTTY colors, proxies, other forwarding forms, remote commands and other unsupported options are not imported. The preview reports proxy/forwarding/command dependencies so you can review them before connecting.
 
 Imported SSH sessions default to **Password**, regardless of PuTTY's agent setting. An explicit non-`.ppk` key path selects **Private key file** instead; only the path is imported, and no private-key contents are read during import. A `.ppk` path is not imported as an OpenSSH key: to use it, select **SSH agent / default keys** and load it into Pageant, or export it to OpenSSH format and select that file in Snekkie. Field mappings follow [PuTTY's settings implementation](https://raw.githubusercontent.com/github/putty/master/settings.c).
+
+## Import an OpenSSH config
+
+Open **Settings → Import → OpenSSH config (~/.ssh/config)…**. The file is read straight away; **Open other config file…** reads another one. Each plain `Host` alias becomes an SSH session with its `HostName`, `User`, `Port` and first `IdentityFile`. A key file selects **Private key file**, and only its path is imported; otherwise the session uses **Password**. Review and select hosts the same way as the PuTTY import. Name conflicts get a suffix such as `Switch (Imported 1)`.
+
+Wildcard hosts (`*`, `?`, `!`), `Match` blocks, settings before the first `Host` line and `Include` files are skipped with a note. A `ProxyJump` that names another `Host` in the file becomes that session's [jump host](jump-hosts.md); simple `LocalForward`, `RemoteForward` and `DynamicForward` lines become [tunnels](tunnels.md). Other `ProxyJump` and forwarding forms, `ProxyCommand` and remote or local commands are listed as unsupported. Nothing in the file is ever run.
 
 ## Find and favorite saved sessions
 
@@ -105,7 +133,7 @@ Right-click a saved session in the sidebar and choose **Default tab color…**. 
 
 Right-click an open session tab and choose **Tab color**. Pick Red, Orange, Yellow, Green, Blue, Purple, Pink or Gray, or use **Custom color…** to give that tab a temporary override. **Clear tab color** overrides the default with the standard appearance. **Use profile color** removes the override and restores the saved default. **Save tab color as profile default** saves the tab's current choice for its matching saved profile, including removing a default when the tab has no color.
 
-The tab gets a tinted background and a colored left edge; the active underline uses its color too. Connection status retains its separate indicator. Temporary overrides follow drag reordering and reconnecting and are discarded when the tab closes. A later tab opened from the saved profile uses its default again. Changing the profile default preserves temporary overrides on other tabs. Tab colors do not change the terminal palette.
+The tab gets a tinted background and a colored left edge; the active underline uses its color too. Connection status retains its separate indicator. Temporary overrides follow drag reordering and reconnecting and are discarded when the tab closes. A later tab opened from the saved profile uses its default again. Changing the profile default preserves temporary overrides on other tabs. A file explorer opened from a session's tab uses that tab's color and follows changes to it. Tab colors do not change the terminal palette.
 
 ## Logging status and log location
 

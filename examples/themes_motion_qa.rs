@@ -38,6 +38,7 @@ fn sample(name: &str, animations: Animations) -> Harness<'static, Sample> {
                     theme: sample.theme,
                     syntax: "cisco_ios",
                     highlighting_intensity: highlight::DEFAULT_INTENSITY,
+                    user_rules: &highlight::NO_USER_RULES,
                     regular: FontId::monospace(15.0),
                     bold: FontId::monospace(15.0),
                     keyboard: false,

@@ -70,6 +70,7 @@ The agent can be started before Snekkie. Until Snekkie is running with access on
 | `read_output` | Reads the latest lines of a tab's screen and scrollback |
 | `send_command` | Types one command line, presses Enter and returns the output once it settles at a prompt |
 | `send_keys` | Sends exact keystrokes without Enter: a space at `--More--`, `y` at a confirmation, Ctrl+C |
+| `reconnect_session` | Connects a dropped session again, such as after a host reboots |
 
 ### File tools
 
@@ -94,7 +95,9 @@ Devices that offer only SCP, such as many switches and routers, support `read_fi
 - It can't check whether a file exists, so sending always needs `overwrite`, and replaces any file there.
 - A transfer that fails partway can leave a damaged file on the device.
 
-Agents cannot open, close or reconnect sessions, and never receive the passwords you connect with: you connect, and the agent works in what is open. They can read whatever a tab shows, including configuration output. Once you turn access off or quit Snekkie, no further calls reach your sessions.
+`reconnect_session` works like the tab's **Reconnect** button: it clears the tab's screen and scrollback and runs nothing on the device. It only acts on a session that dropped, so one you disconnected yourself stays disconnected, and you stay on the tab you were using. You still answer every password, passphrase, host key and offline-mode question in Snekkie, so a session that logs in with a password waits for you. File explorer tabs are not included, so you reconnect those yourself.
+
+Agents cannot open or close sessions, and never receive the passwords you connect with: you connect, and the agent works in what is open. They can read whatever a tab shows, including configuration output. Once you turn access off or quit Snekkie, no further calls reach your sessions.
 
 `send_command` returns when the output has been quiet briefly at something that looks like a prompt, after 3 seconds of quiet anywhere, or after its timeout (15 seconds by default, at most 120). Long-running output may continue after it returns; the agent can read the rest with `read_output`. If paging is on at the device, the agent sees `--More--` and can answer it, or you can turn on **Automatically page through show commands**.
 

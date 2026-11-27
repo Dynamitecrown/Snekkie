@@ -15,6 +15,8 @@ Open it either way:
 
 To see the terminal and its files together, choose **Open file explorer beside** instead. See [Side by side](#side-by-side).
 
+An explorer opened from an SSH tab takes that tab's color, and follows it when you change it.
+
 Your computer is on the left, the server on the right and the transfer queue along the bottom. Each opens in its own tab. A saved session reopens at the folders you last used.
 
 | To do this | Do this |
@@ -60,6 +62,10 @@ Files dropped from your file manager go to the active explorer, or else the firs
 ## Devices without SFTP
 
 Many network devices offer only SCP. The explorer can't browse those, because SCP has no way to list folders. It says so and points you to the tab's right-click transfers.
+
+## Jump hosts
+
+Transfers and the explorer of a session that connects through a [jump host](jump-hosts.md) go through the same jump hosts. An explorer opened on its own logs in to each hop again, asking for each hop's password.
 
 ## Not included
 

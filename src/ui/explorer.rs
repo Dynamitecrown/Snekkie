@@ -297,6 +297,9 @@ type DeleteTask = Task<Result<DeletePlan, String>>;
 pub struct ExplorerTab {
     pub id: u64,
     pub profile: Profile,
+    /// The SSH tab it was opened from, whose color it takes while that's open.
+    pub session: Option<u64>,
+    pub color: Option<Color32>,
     /// Where it sits in the tab strip.
     pub slot: usize,
     link: Link,
@@ -366,6 +369,8 @@ impl ExplorerTab {
         };
         let mut tab = ExplorerTab {
             id,
+            session: None,
+            color: crate::settings::parse_hex(&profile.tab_color),
             slot: usize::MAX,
             link: Link::Waiting(connection),
             context,

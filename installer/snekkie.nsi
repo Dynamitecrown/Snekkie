@@ -8,11 +8,11 @@
 ; in %APPDATA%\snekkie\network.ini and can be changed in Preferences.
 ;
 ; Build (from the repository root):
-;   makensis -DVERSION=2.9.0 -DEXE=target\release\snekkie.exe installer\snekkie.nsi
+;   makensis -DVERSION=2.10.0 -DEXE=target\release\snekkie.exe installer\snekkie.nsi
 ;
 ; Unattended use:
-;   Snekkie-Setup-2.9.0.exe /S            install or upgrade silently
-;   Snekkie-Setup-2.9.0.exe /S /D=C:\Dir  ...into a specific folder (first install)
+;   Snekkie-Setup-2.10.0.exe /S            install or upgrade silently
+;   Snekkie-Setup-2.10.0.exe /S /D=C:\Dir  ...into a specific folder (first install)
 ;   "%LOCALAPPDATA%\Programs\Snekkie\uninstall.exe" /S
 ;
 ; Snekkie's own "Update now" runs the new installer with /UPDATE and then

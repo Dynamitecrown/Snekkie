@@ -375,6 +375,8 @@ impl Server {
             password: "secret".into(),
             key_passphrase: String::new(),
             known_hosts: self.local.path().join("known_hosts"),
+            ask_prompts: None,
+            jumps: Vec::new(),
         }
     }
 
@@ -1532,4 +1534,53 @@ fn file_tools_stay_off_until_allowed_and_say_when_a_server_has_no_sftp() {
     let arguments = serde_json::json!({ "session_id": tab_id(&call, "SSH") });
     let (text, failed) = call("list_files", arguments);
     assert!(failed && text.contains("SFTP"), "{text}");
+}
+
+fn pick_color(app: &mut Harness<'static, SnekkieApp>, tab: &str, color: &str) {
+    app.get_by_label(tab).click_secondary();
+    app.run_steps(3);
+    app.get_by_label_contains("Tab color").hover();
+    app.run_steps(3);
+    app.get_by_label(color).click();
+    app.run_steps(3);
+}
+
+#[test]
+fn an_explorer_follows_the_color_of_the_session_it_came_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = server(true);
+    s.put("/home/admin/beside.txt", file(b"x"));
+    let mut app = split_app(&s, &dir);
+    assert_eq!(app.state().explorer_colors(), [None]);
+
+    pick_color(&mut app, "shell", "Blue");
+    let blue = app.state().explorer_colors()[0];
+    assert!(blue.is_some(), "the explorer changes with its session");
+
+    pick_color(&mut app, "shell", "Red");
+    let red = app.state().explorer_colors()[0];
+    assert!(red.is_some() && red != blue, "and again");
+
+    // A second explorer starts out matching.
+    app.get_by_label("shell").click_secondary();
+    app.run_steps(3);
+    app.get_by_label("Open file explorer").click();
+    app.run_steps(4);
+    assert_eq!(app.state().explorer_colors(), [red, red]);
+
+    pick_color(&mut app, "shell", "Clear tab color");
+    assert_eq!(app.state().explorer_colors(), [None, None]);
+    pick_color(&mut app, "shell", "Green");
+    let green = app.state().explorer_colors()[0];
+
+    // With its session gone it keeps the color it had.
+    app.get_by_label("shell").click_secondary();
+    app.run_steps(3);
+    app.get_by_label("Close").click();
+    app.run_steps(4);
+    if app.query_by_label("Yes").is_some() {
+        app.get_by_label("Yes").click();
+    }
+    app_until(&mut app, "the tab to close", |h| !h.state().workspace_titles().contains(&"shell".to_string()));
+    assert_eq!(app.state().explorer_colors(), [green, green]);
 }

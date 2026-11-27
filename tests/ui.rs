@@ -416,7 +416,14 @@ fn super_themes_change_the_whole_app_and_standard_restores_it() {
     let _peer = open_raw_tab(&mut harness, "Monitor");
     let original = harness.get_by_label("Terminal output").rect();
     let mut current = "Snekkie Dark";
-    for (name, light) in [("E-Ink Super", true), ("Blueprint Super", false), ("Amber Super", false)] {
+    for (name, light) in [
+        ("E-Ink Super", true),
+        ("Blueprint Super", false),
+        ("Amber Super", false),
+        ("Space Super", false),
+        ("Neon Super", false),
+        ("Sonar Super", false),
+    ] {
         open_preferences(&mut harness);
         choose_theme(&mut harness, current, name);
         harness.get_by_label("Save changes").click();
@@ -432,6 +439,46 @@ fn super_themes_change_the_whole_app_and_standard_restores_it() {
     harness.run_ok();
     assert!(harness.ctx.global_style().visuals.override_text_color.is_none());
     assert_eq!(harness.get_by_label("Terminal output").rect(), original);
+    assert_eq!(harness.ctx.global_style().visuals.panel_fill.a(), 255, "the Space sky no longer shows through");
+}
+
+#[test]
+fn space_sky_reacts_to_output_only_with_animations_on_and_leaves_the_text_alone() {
+    use snekkie::settings::{Animations, AppSettings, SettingsStore};
+    use std::io::Write;
+    let output = b"Interface  IP-Address  Status\r\nGi1/0/1    192.0.2.1   up\r\nSwitch#";
+    let wave_after_output = |enabled: bool| {
+        let dir = tempfile::tempdir().unwrap();
+        SettingsStore::new(dir.path().join("settings.json"))
+            .save(&AppSettings {
+                theme: "Space Super".into(),
+                check_for_updates: false,
+                animations: Animations { enabled, ..Animations::reduced_motion() },
+                ..Default::default()
+            })
+            .unwrap();
+        let mut app = harness(&dir);
+        let mut device = open_raw_tab(&mut app, "Sky");
+        // The whole app sits on translucent panels, over the sky.
+        assert!(app.ctx.global_style().visuals.panel_fill.a() < 255);
+        device.write_all(output).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.state().active_screen_text().is_some_and(|text| text.contains("192.0.2.1")) {
+            assert!(std::time::Instant::now() < deadline, "output never arrived");
+            app.step();
+        }
+        // The screen holds the bytes as sent, whatever the sky is doing.
+        let text = app.state().active_screen_text().unwrap();
+        assert!(text.contains("Gi1/0/1    192.0.2.1   up"), "{text}");
+        for _ in 0..3 {
+            app.step();
+        }
+        // A wave's ring is the only 1.5-point stroked circle in the app.
+        let is_ring = |shape: &egui::Shape| matches!(shape, egui::Shape::Circle(c) if c.stroke.width == 1.5);
+        app.output().shapes.iter().any(|clipped| is_ring(&clipped.shape))
+    };
+    assert!(wave_after_output(true), "new text set no wave off");
+    assert!(!wave_after_output(false), "the sky moved with animations off");
 }
 
 fn wait_for_dialog(harness: &mut Harness<'static, SnekkieApp>, needle: &str) {
@@ -562,6 +609,29 @@ fn creative_animation_choices_are_selectable_and_saved() {
     assert!(saved.animations.enabled);
     assert_eq!(saved.animations.keystroke_burst, snekkie::settings::KeystrokeBurst::Portal);
     assert_eq!(saved.animations.typed_text, snekkie::settings::TypedText::Stamp);
+}
+
+#[test]
+fn newer_animation_choices_are_selectable_and_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(&dir);
+    open_preferences(&mut harness);
+    show_page(&mut harness, "Animations");
+    harness.get_by_role_and_label(Role::CheckBox, "Animations").click();
+    harness.run_ok();
+    for (old, new) in [("Sparks", "Comet"), ("Pop", "Jelly")] {
+        harness.get_by_value(old).click();
+        harness.run_ok();
+        harness.get_by_label(new).scroll_to_me();
+        harness.run_ok();
+        harness.get_by_label(new).click();
+        harness.run_ok();
+    }
+    harness.get_by_label("Save changes").click();
+    harness.run_ok();
+    let saved = snekkie::settings::SettingsStore::new(dir.path().join("settings.json")).load();
+    assert_eq!(saved.animations.keystroke_burst, snekkie::settings::KeystrokeBurst::Comet);
+    assert_eq!(saved.animations.typed_text, snekkie::settings::TypedText::Jelly);
 }
 
 #[test]
@@ -3061,6 +3131,153 @@ fn agents_reach_open_tabs_through_the_bridge_only_while_access_is_on() {
     assert!(bridge.wait().unwrap().success());
 }
 
+/// A running app with agent access on, and where its bridge looks for it.
+fn app_with_agent_access() -> (Harness<'static, SnekkieApp>, tempfile::TempDir, std::path::PathBuf) {
+    let config = tempfile::tempdir().unwrap();
+    let file = config.path().join("mcp.json");
+    let paths = Paths { sessions: config.path().join("sessions.json"), settings: config.path().join("settings.json") };
+    let mut app = Harness::builder()
+        .with_size([1000.0, 640.0])
+        .build_eframe(move |_cc| SnekkieApp::with_port_lister(paths, two_cables));
+    app.run_ok();
+    toggle_agent_access(&mut app);
+    (app, config, file)
+}
+
+/// The listed session with this name, once `state` says what's wanted.
+fn agent_sees(
+    app: &mut Harness<'static, SnekkieApp>,
+    file: &std::path::Path,
+    name: &str,
+    wanted: impl Fn(&str) -> bool,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        app.run_ok();
+        let (text, error) = snekkie::mcp::forward(file, "Test agent", "list_sessions", &serde_json::json!({})).unwrap();
+        assert!(!error, "{text}");
+        if let Ok(serde_json::Value::Array(list)) = serde_json::from_str(&text)
+            && let Some(found) = list.into_iter().find(|session| session["name"] == name)
+            && wanted(found["state"].as_str().unwrap())
+        {
+            return found["session_id"].clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "{name} is not as expected: {text}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Runs a reconnect on another thread, with frames going, until it answers.
+fn agent_reconnects(
+    app: &mut Harness<'static, SnekkieApp>,
+    file: &std::path::Path,
+    id: &serde_json::Value,
+    mut each_frame: impl FnMut(),
+) -> (String, bool) {
+    let (file, arguments) = (file.to_path_buf(), serde_json::json!({ "session_id": id, "timeout_seconds": 20 }));
+    let call = std::thread::spawn(move || snekkie::mcp::forward(&file, "Test agent", "reconnect_session", &arguments));
+    while !call.is_finished() {
+        app.run_ok();
+        each_frame();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.run_ok();
+    call.join().unwrap().unwrap()
+}
+
+#[test]
+fn agents_reconnect_a_dropped_session_without_taking_the_users_tab() {
+    use std::io::Write;
+
+    let (mut app, _config, file) = app_with_agent_access();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let device = open_raw_tab_on_listener(&mut app, "lab-router", &listener);
+    let _other = open_raw_tab(&mut app, "lab-switch");
+    assert_eq!(app.state().active_title().as_deref(), Some("lab-switch"));
+
+    drop(device);
+    let id = agent_sees(&mut app, &file, "lab-router", |state| state.starts_with("disconnected"));
+    let send = serde_json::json!({ "session_id": id, "command": "show clock" });
+    let (text, error) = snekkie::mcp::forward(&file, "Test agent", "send_command", &send).unwrap();
+    assert!(error && text.contains("reconnect_session"), "agents are told what to do: {text}");
+
+    listener.set_nonblocking(true).unwrap();
+    let mut device = None;
+    let (text, error) = agent_reconnects(&mut app, &file, &id, || {
+        if device.is_none()
+            && let Ok((accepted, _)) = listener.accept()
+        {
+            device = Some(accepted);
+        }
+    });
+    assert!(!error && text.contains("connected again"), "{text}");
+    assert_eq!(app.state().active_title().as_deref(), Some("lab-switch"), "the user stays on their own tab");
+
+    // It runs nothing on the device, and the agent can carry on.
+    let mut device = device.expect("the device saw a new connection");
+    device.set_nonblocking(false).unwrap();
+    assert_device_received_nothing(&mut device);
+    device.write_all(b"lab-router#").unwrap();
+    let read = serde_json::json!({ "session_id": id, "lines": 1 });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while snekkie::mcp::forward(&file, "Test agent", "read_output", &read).unwrap().0 != "lab-router#" {
+        assert!(std::time::Instant::now() < deadline, "the reconnected session never showed output");
+        app.run_ok();
+    }
+    let (text, error) = agent_reconnects(&mut app, &file, &id, || {});
+    assert!(!error && text.contains("already connected"), "{text}");
+    listener.set_nonblocking(true).unwrap();
+    assert!(listener.accept().is_err(), "a connected session is left alone");
+
+    // A failed attempt says so.
+    drop(device);
+    let id = agent_sees(&mut app, &file, "lab-router", |state| state.starts_with("disconnected"));
+    drop(listener);
+    let (text, error) = agent_reconnects(&mut app, &file, &id, || {});
+    assert!(error && text.contains("did not reconnect"), "{text}");
+}
+
+#[test]
+fn agents_leave_a_password_to_the_user_when_reconnecting() {
+    let (mut app, _config, file) = app_with_agent_access();
+    let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = unused.local_addr().unwrap().port();
+    drop(unused);
+    let ctx = app.ctx.clone();
+    app.state_mut().open_session(
+        &ctx,
+        snekkie::profiles::Profile {
+            name: "lab-ssh".into(),
+            kind: "ssh".into(),
+            host: "127.0.0.1".into(),
+            port,
+            auth: "password".into(),
+            ..Default::default()
+        },
+    );
+    app.run_ok();
+    app.get_by_label("OK").click();
+    app.run_ok();
+    let id = agent_sees(&mut app, &file, "lab-ssh", |state| state.starts_with("disconnected:"));
+    let prompts = |app: &Harness<'static, SnekkieApp>| {
+        app.state().dialog_texts().iter().filter(|text| text.contains("Password for")).count()
+    };
+    assert_eq!(prompts(&app), 0);
+
+    // The agent learns who has to answer, and asking again adds no second prompt.
+    for _ in 0..2 {
+        let (text, error) = agent_reconnects(&mut app, &file, &id, || {});
+        assert!(error && text.contains("Only the user can answer"), "{text}");
+        assert_eq!(prompts(&app), 1);
+    }
+
+    // Declining leaves the session down, and the agent can't get around it.
+    app.get_by_label("Cancel").click();
+    app.run_ok();
+    assert_eq!(prompts(&app), 0);
+    agent_sees(&mut app, &file, "lab-ssh", |state| state.starts_with("disconnected:"));
+}
+
 fn seed_saved(dir: &tempfile::TempDir, sessions: &[(&str, &str)]) {
     let mut store = snekkie::profiles::ProfileStore::open(dir.path().join("sessions.json"));
     for (name, folder) in sessions {
@@ -3451,4 +3668,35 @@ fn the_edit_program_saves_with_preferences_and_cancel_discards_it() {
     app.get_by_label("Save changes").click();
     app.run_ok();
     assert_eq!(saved(), "");
+}
+
+#[test]
+fn tab_menu_shows_the_tunnels_window_for_an_ssh_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = unused.local_addr().unwrap().port();
+    drop(unused);
+    let ctx = app.ctx.clone();
+    app.state_mut().open_session(
+        &ctx,
+        snekkie::profiles::Profile {
+            name: "lab-ssh".into(),
+            kind: "ssh".into(),
+            host: "127.0.0.1".into(),
+            port,
+            auth: "password".into(),
+            tunnels: vec![snekkie::profiles::Tunnel { listen_port: 8080, port: 80, ..Default::default() }],
+            ..Default::default()
+        },
+    );
+    app.run_ok();
+    app.get_by_label("OK").click();
+    app.run_ok();
+    app.get_by_label_contains("lab-ssh").click_secondary();
+    app.run_ok();
+    app.get_by_label("Tunnels…").click();
+    app.run_ok();
+    app.get_by_label("Tunnels — lab-ssh");
+    app.get_by_label("Tunnels start once the session is connected.");
 }

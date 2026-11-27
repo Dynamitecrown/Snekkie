@@ -25,6 +25,10 @@ pub enum Rig {
     Probe,
     Ghost,
     Bastion,
+    Tonk,
+    Train,
+    Relay,
+    Kernel,
 }
 
 /// A rig's starting statistics, before any upgrade.
@@ -40,6 +44,7 @@ pub struct RigBase {
     pub pierce: u8,
     /// Integrity lost per ordinary hit.
     pub hit_cost: u8,
+    pub max_integrity: u8,
 }
 
 /// How a ship flies: it turns at a limited rate and takes `spool` seconds
@@ -53,13 +58,17 @@ pub struct Flight {
 }
 
 impl Rig {
-    pub const ALL: [Rig; 3] = [Rig::Probe, Rig::Ghost, Rig::Bastion];
+    pub const ALL: [Rig; 7] = [Rig::Probe, Rig::Ghost, Rig::Bastion, Rig::Tonk, Rig::Train, Rig::Relay, Rig::Kernel];
 
     pub fn id(self) -> &'static str {
         match self {
             Rig::Probe => "probe",
             Rig::Ghost => "ghost",
             Rig::Bastion => "bastion",
+            Rig::Tonk => "tonk",
+            Rig::Train => "train",
+            Rig::Relay => "relay",
+            Rig::Kernel => "kernel",
         }
     }
 
@@ -72,22 +81,29 @@ impl Rig {
             Rig::Probe => "Probe",
             Rig::Ghost => "Ghost",
             Rig::Bastion => "Bastion",
+            Rig::Tonk => "Tonk",
+            Rig::Train => "Train",
+            Rig::Relay => "Relay",
+            Rig::Kernel => "Kernel",
         }
     }
 
     pub fn special_name(self) -> &'static str {
         match self {
-            Rig::Probe => "Pivot",
+            Rig::Probe | Rig::Train => "Pivot",
             Rig::Ghost => "Slip",
             Rig::Bastion => "Barrier",
+            Rig::Tonk => "Reflect",
+            Rig::Relay => "Overclock",
+            Rig::Kernel => "Purge",
         }
     }
 
     pub fn mobility_name(self) -> &'static str {
         match self {
-            Rig::Probe => "Dash",
+            Rig::Probe | Rig::Train | Rig::Relay => "Dash",
             Rig::Ghost => "Blink",
-            Rig::Bastion => "Boost",
+            Rig::Bastion | Rig::Tonk | Rig::Kernel => "Boost",
         }
     }
 
@@ -97,14 +113,19 @@ impl Rig {
             Rig::Probe => Flight { turn_rate: 5.0, spool: 0.28 },
             Rig::Ghost => Flight { turn_rate: 6.0, spool: 0.22 },
             Rig::Bastion => Flight { turn_rate: 4.2, spool: 0.32 },
+            Rig::Tonk => Flight { turn_rate: 3.6, spool: 0.42 },
+            Rig::Train => Flight { turn_rate: 4.6, spool: 0.30 },
+            Rig::Relay => Flight { turn_rate: 5.4, spool: 0.26 },
+            Rig::Kernel => Flight { turn_rate: 4.4, spool: 0.34 },
         }
     }
 
     pub fn mobility_recharge(self) -> f32 {
         match self {
-            Rig::Probe => 4.0,
+            Rig::Probe | Rig::Train | Rig::Relay => 4.0,
             Rig::Ghost => 5.0,
-            Rig::Bastion => 6.0,
+            Rig::Bastion | Rig::Kernel => 6.0,
+            Rig::Tonk => 7.0,
         }
     }
 
@@ -113,20 +134,85 @@ impl Rig {
             Rig::Probe => "Balanced. Pivot chains a heavy packet through nearby devices.",
             Rig::Ghost => "Fast and fragile: hits cost 2 integrity. Slip makes a short protected dash along the nose.",
             Rig::Bastion => "Slow and defensive. Heavy piercing packets; Barrier blocks hits for two seconds.",
+            Rig::Tonk => {
+                "Slowest and toughest: 8 integrity and heavy packets. Reflect blocks hits and bounces ordinary packets back."
+            }
+            Rig::Train => {
+                "Balanced with a snake-like tail. Level-ups can add Tail Cars for damage and fire rate; packets hitting a car still hurt."
+            }
+            Rig::Relay => "Fragile and quick-firing. Overclock doubles every weapon's fire rate for four seconds.",
+            Rig::Kernel => {
+                "Sturdy and slow. Purge erases nearby hostile packets and damages every device around the rig."
+            }
         }
     }
 
     pub fn base(self) -> RigBase {
         match self {
-            Rig::Probe => {
-                RigBase { damage: 1.0, fire_rate: 6.6, move_speed: 26.0, recharge: 12.0, pierce: 0, hit_cost: 1 }
-            }
-            Rig::Ghost => {
-                RigBase { damage: 1.0, fire_rate: 8.8, move_speed: 34.0, recharge: 8.0, pierce: 0, hit_cost: 2 }
-            }
-            Rig::Bastion => {
-                RigBase { damage: 3.0, fire_rate: 2.2, move_speed: 19.0, recharge: 14.0, pierce: 1, hit_cost: 1 }
-            }
+            Rig::Probe => RigBase {
+                damage: 1.0,
+                fire_rate: 6.6,
+                move_speed: 26.0,
+                recharge: 12.0,
+                pierce: 0,
+                hit_cost: 1,
+                max_integrity: 5,
+            },
+            Rig::Ghost => RigBase {
+                damage: 1.0,
+                fire_rate: 8.8,
+                move_speed: 34.0,
+                recharge: 8.0,
+                pierce: 0,
+                hit_cost: 2,
+                max_integrity: 5,
+            },
+            Rig::Bastion => RigBase {
+                damage: 3.0,
+                fire_rate: 2.2,
+                move_speed: 19.0,
+                recharge: 14.0,
+                pierce: 1,
+                hit_cost: 1,
+                max_integrity: 5,
+            },
+            Rig::Tonk => RigBase {
+                damage: 2.6,
+                fire_rate: 2.6,
+                move_speed: 15.0,
+                recharge: 13.0,
+                pierce: 1,
+                hit_cost: 1,
+                max_integrity: 8,
+            },
+            Rig::Train => RigBase {
+                damage: 1.1,
+                fire_rate: 6.0,
+                move_speed: 24.0,
+                recharge: 12.0,
+                pierce: 0,
+                hit_cost: 1,
+                max_integrity: 5,
+            },
+            Rig::Relay => RigBase {
+                damage: 0.9,
+                fire_rate: 7.4,
+                move_speed: 27.0,
+                recharge: 11.0,
+                pierce: 0,
+                hit_cost: 1,
+                max_integrity: 4,
+            },
+            Rig::Kernel => RigBase {
+                damage: 1.6,
+                fire_rate: 4.4,
+                move_speed: 22.0,
+                // Below POISON_DURATION, so a Stinger Kernel can still stack poison.
+                recharge: 14.0,
+                pierce: 1,
+                hit_cost: 1,
+                max_integrity: 6,
+            },
         }
     }
 
@@ -136,6 +222,10 @@ impl Rig {
             Rig::Probe => "[>_]",
             Rig::Ghost => "<~>",
             Rig::Bastion => "[|^|]",
+            Rig::Tonk => "[#^#]",
+            Rig::Train => "[=>",
+            Rig::Relay => "(+>",
+            Rig::Kernel => "/^\\",
         }
     }
 
@@ -146,9 +236,11 @@ impl Rig {
     /// The unlock that makes this rig available, if it starts locked.
     pub fn unlock(self) -> Option<Unlock> {
         match self {
-            Rig::Probe => None,
+            Rig::Probe | Rig::Tonk | Rig::Train => None,
             Rig::Ghost => Some(Unlock::Ghost),
             Rig::Bastion => Some(Unlock::Bastion),
+            Rig::Relay => Some(Unlock::Relay),
+            Rig::Kernel => Some(Unlock::Kernel),
         }
     }
 }
@@ -167,13 +259,21 @@ pub enum Unlock {
     ToolCharge,
     Feedback,
     RootAccess,
+    Cloak,
+    Stinger,
+    RateLimit,
+    Worm,
+    LogicBomb,
+    Failover,
+    Relay,
+    Kernel,
 }
 
 /// How many devices across all runs unlock Fragment.
 pub const FRAGMENT_DEVICES: u64 = 100;
 
 impl Unlock {
-    pub const ALL: [Unlock; 9] = [
+    pub const ALL: [Unlock; 17] = [
         Unlock::Ghost,
         Unlock::Bastion,
         Unlock::Fork,
@@ -183,6 +283,14 @@ impl Unlock {
         Unlock::ToolCharge,
         Unlock::Feedback,
         Unlock::RootAccess,
+        Unlock::Cloak,
+        Unlock::Stinger,
+        Unlock::RateLimit,
+        Unlock::Worm,
+        Unlock::LogicBomb,
+        Unlock::Failover,
+        Unlock::Relay,
+        Unlock::Kernel,
     ];
 
     pub fn id(self) -> &'static str {
@@ -196,6 +304,14 @@ impl Unlock {
             Unlock::ToolCharge => "tool_charge",
             Unlock::Feedback => "feedback",
             Unlock::RootAccess => "root_access",
+            Unlock::Cloak => "cloak",
+            Unlock::Stinger => "stinger",
+            Unlock::RateLimit => "rate_limit",
+            Unlock::Worm => "worm",
+            Unlock::LogicBomb => "logic_bomb",
+            Unlock::Failover => "failover",
+            Unlock::Relay => "relay",
+            Unlock::Kernel => "kernel",
         }
     }
 
@@ -214,6 +330,14 @@ impl Unlock {
             Unlock::ToolCharge => "Tool Charge module",
             Unlock::Feedback => "Feedback module",
             Unlock::RootAccess => "Root Access player tag",
+            Unlock::Cloak => "Ghost Cloak special",
+            Unlock::Stinger => "Stinger special",
+            Unlock::RateLimit => "Rate Limit special",
+            Unlock::Worm => "Worm weapon",
+            Unlock::LogicBomb => "Logic Bomb weapon",
+            Unlock::Failover => "Failover cargo",
+            Unlock::Relay => "Relay rig",
+            Unlock::Kernel => "Kernel rig",
         }
     }
 
@@ -227,6 +351,14 @@ impl Unlock {
             Unlock::ToolCharge => "Complete wave 15",
             Unlock::Feedback => "Complete wave 20",
             Unlock::RootAccess => "Complete wave 30",
+            Unlock::Cloak => "Complete wave 10",
+            Unlock::Stinger => "Complete wave 25",
+            Unlock::RateLimit => "Complete wave 5",
+            Unlock::Worm => "Complete wave 8",
+            Unlock::LogicBomb => "Defeat Bot Herder",
+            Unlock::Failover => "Defeat Load Balancer",
+            Unlock::Relay => "Complete wave 18",
+            Unlock::Kernel => "Defeat Null Route",
         }
     }
 
@@ -238,6 +370,11 @@ impl Unlock {
             Unlock::ToolCharge => Some(15),
             Unlock::Feedback => Some(20),
             Unlock::RootAccess => Some(30),
+            Unlock::Cloak => Some(10),
+            Unlock::Stinger => Some(25),
+            Unlock::RateLimit => Some(5),
+            Unlock::Worm => Some(8),
+            Unlock::Relay => Some(18),
             _ => None,
         }
     }
@@ -252,11 +389,25 @@ pub enum DeviceKind {
     Firewall,
     Switch,
     IdsProbe,
+    /// Fast and fragile; it never shoots, it rams.
+    Bot,
+    /// Slow host that releases two Endpoints when destroyed.
+    Hypervisor,
+    /// Support ship that never shoots; it patches damaged neighbors.
+    Repeater,
 }
 
 impl DeviceKind {
-    pub const ALL: [DeviceKind; 5] =
-        [DeviceKind::Endpoint, DeviceKind::Router, DeviceKind::Firewall, DeviceKind::Switch, DeviceKind::IdsProbe];
+    pub const ALL: [DeviceKind; 8] = [
+        DeviceKind::Endpoint,
+        DeviceKind::Router,
+        DeviceKind::Firewall,
+        DeviceKind::Switch,
+        DeviceKind::IdsProbe,
+        DeviceKind::Bot,
+        DeviceKind::Hypervisor,
+        DeviceKind::Repeater,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -265,6 +416,9 @@ impl DeviceKind {
             DeviceKind::Firewall => "Firewall",
             DeviceKind::Switch => "Switch",
             DeviceKind::IdsProbe => "IDS Probe",
+            DeviceKind::Bot => "Bot",
+            DeviceKind::Hypervisor => "Hypervisor",
+            DeviceKind::Repeater => "Repeater",
         }
     }
 
@@ -275,15 +429,20 @@ impl DeviceKind {
             DeviceKind::Firewall => "[#]",
             DeviceKind::Switch => "[=]",
             DeviceKind::IdsProbe => "<!>",
+            DeviceKind::Bot => "<v>",
+            DeviceKind::Hypervisor => "{:}",
+            DeviceKind::Repeater => "(+)",
         }
     }
 
     pub fn base_hp(self) -> u32 {
         match self {
             DeviceKind::Endpoint => 4,
-            DeviceKind::Router => 6,
+            DeviceKind::Router | DeviceKind::Repeater => 6,
             DeviceKind::Firewall => 12,
             DeviceKind::Switch | DeviceKind::IdsProbe => 8,
+            DeviceKind::Bot => 2,
+            DeviceKind::Hypervisor => 10,
         }
     }
 
@@ -291,8 +450,10 @@ impl DeviceKind {
         match self {
             DeviceKind::Endpoint => 100,
             DeviceKind::Router => 150,
-            DeviceKind::Firewall | DeviceKind::IdsProbe => 250,
+            DeviceKind::Firewall | DeviceKind::IdsProbe | DeviceKind::Repeater => 250,
             DeviceKind::Switch => 200,
+            DeviceKind::Bot => 60,
+            DeviceKind::Hypervisor => 300,
         }
     }
 
@@ -304,6 +465,22 @@ impl DeviceKind {
             DeviceKind::Firewall => 3,
             DeviceKind::Switch => 6,
             DeviceKind::IdsProbe => 8,
+            DeviceKind::Bot => 4,
+            DeviceKind::Hypervisor => 7,
+            DeviceKind::Repeater => 9,
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            DeviceKind::Endpoint => "Flies straight at you and fires single aimed shots at the spot it marked.",
+            DeviceKind::Router => "Agile; spirals in at an angle and fires a two-packet spread at its mark.",
+            DeviceKind::Firewall => "Slow and armored; shoots half as often and its armor cracks below half health.",
+            DeviceKind::Switch => "Circles at mid range and marks you for a three-shot burst; leave the mark.",
+            DeviceKind::IdsProbe => "Hangs back at long range and calls a column scan on you; sidestep it.",
+            DeviceKind::Bot => "Fast and fragile; never shoots, rams you and bursts on contact.",
+            DeviceKind::Hypervisor => "Slow host that shoots like a Firewall; releases two Endpoints when destroyed.",
+            DeviceKind::Repeater => "Never shoots; patches the most damaged device nearby. Kill it first.",
         }
     }
 }
@@ -321,16 +498,19 @@ pub enum MinibossKind {
     PortSentry,
     RelayPair,
     TraceHunter,
+    BotHerder,
 }
 
 impl MinibossKind {
-    pub const ALL: [MinibossKind; 3] = [MinibossKind::PortSentry, MinibossKind::RelayPair, MinibossKind::TraceHunter];
+    pub const ALL: [MinibossKind; 4] =
+        [MinibossKind::PortSentry, MinibossKind::RelayPair, MinibossKind::TraceHunter, MinibossKind::BotHerder];
 
     pub fn name(self) -> &'static str {
         match self {
             MinibossKind::PortSentry => "Port Sentry",
             MinibossKind::RelayPair => "Relay Pair",
             MinibossKind::TraceHunter => "Trace Hunter",
+            MinibossKind::BotHerder => "Bot Herder",
         }
     }
 
@@ -339,6 +519,20 @@ impl MinibossKind {
             MinibossKind::PortSentry => &[" .-=====-. ", "<[o--+--o]>", " '-.._..-' "],
             MinibossKind::RelayPair => &[" /=+=\\ ", "<|(o)|>", " \\=+=/ "],
             MinibossKind::TraceHunter => &[" _/~~~\\_ ", "{ <(@)> }", " `-._.-' "],
+            MinibossKind::BotHerder => &[" .-<v>-. ", "<[ (%) ]>", " '-<v>-' "],
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            MinibossKind::PortSentry => {
+                "Sweeps side to side, alternating marked pairs and column scans with aimed shots."
+            }
+            MinibossKind::RelayPair => "Two weaving halves trade five-packet fans; the last one standing speeds up.",
+            MinibossKind::TraceHunter => {
+                "Hops between three stations calling bursts and scans; hit it while it dwells."
+            }
+            MinibossKind::BotHerder => "Drifts, fires fans and calls Bot pairs; clear the Bots before they ram you.",
         }
     }
 }
@@ -349,11 +543,17 @@ pub enum BossKind {
     LoadBalancer,
     SentinelIds,
     RootController,
+    NullRoute,
 }
 
 impl BossKind {
-    pub const CYCLE: [BossKind; 4] =
-        [BossKind::Gateway, BossKind::LoadBalancer, BossKind::SentinelIds, BossKind::RootController];
+    pub const CYCLE: [BossKind; 5] = [
+        BossKind::Gateway,
+        BossKind::LoadBalancer,
+        BossKind::NullRoute,
+        BossKind::SentinelIds,
+        BossKind::RootController,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -361,6 +561,7 @@ impl BossKind {
             BossKind::LoadBalancer => "Load Balancer",
             BossKind::SentinelIds => "Sentinel IDS",
             BossKind::RootController => "Root Controller",
+            BossKind::NullRoute => "Null Route",
         }
     }
 
@@ -384,8 +585,63 @@ impl BossKind {
                 "  '-._  ##########  _.-' ",
                 "       '-.______.-'       ",
             ],
+            BossKind::NullRoute => {
+                &["    .-[ NULL ]-.    ", " .-'  \\  ||  /  '-. ", "<|==--  ( 0 )  --==|>", " '-._ /  ||  \\ _.-' "]
+            }
         }
     }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            BossKind::Gateway => {
+                "Drifting wall that alternates wide fans with twin column scans; weave through the fan."
+            }
+            BossKind::LoadBalancer => {
+                "Two cores share one health pool; slip through the curtain gaps and dodge their bursts."
+            }
+            BossKind::SentinelIds => "Records your position for three numbered column scans, then fans; keep moving.",
+            BossKind::RootController => "Sweeping streams, pairs and fans; calls four guards at 75, 50 and 25% health.",
+            BossKind::NullRoute => {
+                "Fires rings with one gap and pulls you in; thrust against the pull and exit the gap."
+            }
+        }
+    }
+}
+
+pub struct CodexEntry {
+    pub name: &'static str,
+    pub sprite: String,
+    pub detail: String,
+    pub revealed: bool,
+}
+
+/// Every device and encounter, hidden until `best_wave + 1` reaches its first wave.
+pub fn codex(best_wave: u32) -> Vec<(&'static str, Vec<CodexEntry>)> {
+    let entry = |name, sprite: &str, wave: u32, detail: String| {
+        let revealed = best_wave + 1 >= wave;
+        CodexEntry {
+            name: if revealed { name } else { "???" },
+            sprite: if revealed { sprite.trim().to_string() } else { "???".into() },
+            detail: if revealed { detail } else { format!("Reach wave {wave}") },
+            revealed,
+        }
+    };
+    let devices = DeviceKind::ALL.iter().map(|&kind| {
+        let wave = kind.introduced();
+        let detail =
+            format!("HP {} · {} pts · from wave {wave} · {}", kind.base_hp(), kind.score(), kind.description());
+        entry(kind.name(), kind.sprite(), wave, detail)
+    });
+    let minibosses = MinibossKind::ALL.iter().map(|&kind| {
+        let detail = format!("HP {}+ · once every ten waves · {}", miniboss_hp(0), kind.description());
+        entry(kind.name(), kind.sprite()[0], 4, detail)
+    });
+    let bosses = BossKind::CYCLE.iter().enumerate().map(|(i, &kind)| {
+        let wave = i as u32 * 10 + 10;
+        let detail = format!("HP {} · wave {wave} · {}", boss_hp(wave), kind.description());
+        entry(kind.name(), kind.sprite()[0], wave, detail)
+    });
+    vec![("Devices", devices.collect()), ("Minibosses", minibosses.collect()), ("Bosses", bosses.collect())]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -405,9 +661,9 @@ impl EncounterKind {
     }
 }
 
-/// Every tenth wave is a major boss, cycling through four encounters.
+/// Every tenth wave is a major boss, cycling through the encounters.
 pub fn boss_for_wave(wave: u32) -> Option<BossKind> {
-    (wave > 0 && wave.is_multiple_of(10)).then(|| BossKind::CYCLE[((wave / 10 - 1) % 4) as usize])
+    (wave > 0 && wave.is_multiple_of(10)).then(|| BossKind::CYCLE[(wave as usize / 10 - 1) % BossKind::CYCLE.len()])
 }
 
 /// The one miniboss wave in a ten-wave block: positions 4 to 7.
@@ -415,10 +671,11 @@ pub fn miniboss_wave(seed: u64, block: u32) -> u32 {
     block * 10 + 4 + Rng::stream(seed, STREAM_SCHEDULE, u64::from(block)).below(4)
 }
 
-/// Minibosses come from a shuffled bag of the three types; a new bag never
+/// Minibosses come from a shuffled bag of every type; a new bag never
 /// starts with the type the last one ended on.
 pub fn miniboss_kind(seed: u64, block: u32) -> MinibossKind {
-    let bag_index = block / 3;
+    let size = MinibossKind::ALL.len() as u32;
+    let bag_index = block / size;
     let mut previous_last: Option<MinibossKind> = None;
     let mut bag = MinibossKind::ALL;
     for index in 0..=bag_index {
@@ -427,9 +684,9 @@ pub fn miniboss_kind(seed: u64, block: u32) -> MinibossKind {
         if previous_last == Some(bag[0]) {
             bag.swap(0, 1);
         }
-        previous_last = Some(bag[2]);
+        previous_last = bag.last().copied();
     }
-    bag[(block % 3) as usize]
+    bag[(block % size) as usize]
 }
 
 pub fn encounter_for(seed: u64, wave: u32) -> EncounterKind {
@@ -441,6 +698,36 @@ pub fn encounter_for(seed: u64, wave: u32) -> EncounterKind {
         EncounterKind::Miniboss(miniboss_kind(seed, block))
     } else {
         EncounterKind::Ordinary
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WaveEvent {
+    /// Ships arrive faster and more may be alive at once.
+    Flood,
+    /// Far more ships carry cargo.
+    ElitePack,
+}
+
+impl WaveEvent {
+    pub fn name(self) -> &'static str {
+        match self {
+            WaveEvent::Flood => "Flood",
+            WaveEvent::ElitePack => "Elite Pack",
+        }
+    }
+}
+
+/// Some ordinary waves from wave 5 on carry a modifier. It rolls on its own
+/// stream so no other seeded result moves.
+pub fn wave_event(seed: u64, wave: u32) -> Option<WaveEvent> {
+    if wave < 5 || encounter_for(seed, wave) != EncounterKind::Ordinary {
+        return None;
+    }
+    match Rng::stream(seed, STREAM_SCHEDULE ^ 0xE7E, u64::from(wave)).below(5) {
+        0 => Some(WaveEvent::Flood),
+        1 => Some(WaveEvent::ElitePack),
+        _ => None,
     }
 }
 
@@ -481,12 +768,23 @@ fn device_group(rng: &mut Rng, wave: u32, count: usize) -> Vec<DeviceKind> {
     let max_firewalls = if wave < 10 { 4 } else { (4 + (wave - 10) / 6).min(8) as usize };
     let max_switches = (2 + wave / 8).min(6) as usize;
     let max_ids = (1 + wave / 10).min(5) as usize;
+    let max_bots = (4 + wave / 5).min(10) as usize;
+    let max_hypervisors = (1 + wave / 10).min(4) as usize;
+    let max_repeaters = (1 + wave / 15).min(3) as usize;
     let endpoints =
         ((count as f32 * min_endpoints).ceil() as usize + rng.below(count as u32 / 8 + 1) as usize).min(count);
     let mut kinds: Vec<DeviceKind> = Vec::with_capacity(count);
     // Toughness ramps in slowly before the first boss.
     let firewall = if wave < 10 { 1.5 } else { 2.5 };
-    let weights = [(Router, 4.0), (Firewall, firewall), (Switch, 2.0), (IdsProbe, 1.5)];
+    let weights = [
+        (Router, 4.0),
+        (Firewall, firewall),
+        (Switch, 2.0),
+        (IdsProbe, 1.5),
+        (Bot, 2.5),
+        (Hypervisor, 1.0),
+        (Repeater, 1.0),
+    ];
     for _ in endpoints..count {
         let available: Vec<(DeviceKind, f32)> = weights
             .iter()
@@ -498,6 +796,9 @@ fn device_group(rng: &mut Rng, wave: u32, count: usize) -> Vec<DeviceKind> {
                     Firewall => have < max_firewalls,
                     Switch => have < max_switches,
                     IdsProbe => have < max_ids,
+                    Bot => have < max_bots,
+                    Hypervisor => have < max_hypervisors,
+                    Repeater => have < max_repeaters,
                     _ => true,
                 }
             })
@@ -553,6 +854,9 @@ pub fn device_flight(kind: DeviceKind) -> Flight {
         DeviceKind::Router => Flight { turn_rate: 3.2, spool: 0.5 },
         DeviceKind::Firewall => Flight { turn_rate: 1.6, spool: 0.9 },
         DeviceKind::Switch | DeviceKind::IdsProbe => Flight { turn_rate: 2.2, spool: 0.6 },
+        DeviceKind::Bot => Flight { turn_rate: 3.6, spool: 0.35 },
+        DeviceKind::Hypervisor => Flight { turn_rate: 1.8, spool: 0.8 },
+        DeviceKind::Repeater => Flight { turn_rate: 2.2, spool: 0.6 },
     }
 }
 
@@ -564,6 +868,10 @@ pub fn flight_speed(kind: DeviceKind, wave: u32) -> f32 {
         DeviceKind::Firewall => 3.6,
         DeviceKind::Switch => 4.8,
         DeviceKind::IdsProbe => 4.2,
+        // Slower than every rig, so a Bot can be outrun or shot down.
+        DeviceKind::Bot => 9.0,
+        DeviceKind::Hypervisor => 3.8,
+        DeviceKind::Repeater => 4.6,
     };
     base * (1.0 + 0.4 * level(wave))
 }
@@ -594,14 +902,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bosses_every_tenth_wave_cycle_through_four_encounters() {
+    fn every_device_and_encounter_has_a_description() {
+        let all = DeviceKind::ALL.map(DeviceKind::description).into_iter();
+        let all = all.chain(MinibossKind::ALL.map(MinibossKind::description));
+        for text in all.chain(BossKind::CYCLE.map(BossKind::description)) {
+            assert!(!text.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn codex_reveals_each_entry_once_its_first_wave_is_reached() {
+        let revealed = |best: u32, section: &str, name: &str| {
+            let (_, entries) = codex(best).into_iter().find(|(s, _)| *s == section).unwrap();
+            entries.iter().any(|e| e.revealed && e.name == name)
+        };
+        let fresh = codex(0);
+        assert_eq!(
+            fresh.iter().map(|(s, e)| (*s, e.len())).collect::<Vec<_>>(),
+            [
+                ("Devices", DeviceKind::ALL.len()),
+                ("Minibosses", MinibossKind::ALL.len()),
+                ("Bosses", BossKind::CYCLE.len())
+            ]
+        );
+        let hidden: Vec<_> = fresh.iter().flat_map(|(_, e)| e).filter(|e| !e.revealed).collect();
+        assert!(hidden.iter().all(|e| e.name == "???" && e.detail.starts_with("Reach wave ")));
+        assert!(revealed(0, "Devices", "Endpoint") && !revealed(0, "Devices", "Router"));
+        assert!(revealed(1, "Devices", "Router"));
+        assert!(!revealed(7, "Devices", "Repeater") && revealed(8, "Devices", "Repeater"));
+        assert!(!revealed(2, "Minibosses", "Port Sentry") && revealed(3, "Minibosses", "Bot Herder"));
+        assert!(!revealed(8, "Bosses", "Gateway") && revealed(9, "Bosses", "Gateway"));
+        assert!(!revealed(28, "Bosses", "Null Route") && revealed(29, "Bosses", "Null Route"));
+        assert!(!revealed(48, "Bosses", "Root Controller") && revealed(49, "Bosses", "Root Controller"));
+        let all = codex(49);
+        assert!(all.iter().flat_map(|(_, e)| e).all(|e| e.revealed));
+        let (_, devices) = &all[0];
+        assert_eq!(devices[0].sprite, "[.]");
+        assert!(devices[0].detail.contains("HP 4") && devices[0].detail.contains("from wave 1"));
+        assert!(all[2].1[2].detail.contains("wave 30"));
+    }
+
+    #[test]
+    fn bosses_every_tenth_wave_cycle_through_five_encounters() {
         let bosses: Vec<_> = (1..=90).filter_map(boss_for_wave).collect();
         assert_eq!(bosses.len(), 9);
         assert_eq!(
-            &bosses[..5],
+            &bosses[..6],
             &[
                 BossKind::Gateway,
                 BossKind::LoadBalancer,
+                BossKind::NullRoute,
                 BossKind::SentinelIds,
                 BossKind::RootController,
                 BossKind::Gateway
@@ -628,8 +978,8 @@ mod tests {
     #[test]
     fn miniboss_bags_use_every_type_and_never_repeat_across_boundaries() {
         for seed in 0..200u64 {
-            let kinds: Vec<_> = (0..30).map(|block| miniboss_kind(seed, block)).collect();
-            for bag in kinds.chunks(3) {
+            let kinds: Vec<_> = (0..32).map(|block| miniboss_kind(seed, block)).collect();
+            for bag in kinds.chunks(MinibossKind::ALL.len()) {
                 for kind in MinibossKind::ALL {
                     assert!(bag.contains(&kind));
                 }
@@ -711,6 +1061,27 @@ mod tests {
         for kind in DeviceKind::ALL {
             assert_eq!(flight_speed(kind, 60), flight_speed(kind, 500));
         }
+    }
+
+    #[test]
+    fn wave_events_are_seeded_ordinary_only_and_neither_rare_nor_constant() {
+        let (mut flood, mut elite, mut ordinary) = (0, 0, 0);
+        for seed in 0..200u64 {
+            for wave in 1..=60 {
+                let event = wave_event(seed, wave);
+                assert_eq!(event, wave_event(seed, wave), "deterministic");
+                if wave < 5 || encounter_for(seed, wave) != EncounterKind::Ordinary {
+                    assert_eq!(event, None, "seed {seed} wave {wave}");
+                } else {
+                    ordinary += 1;
+                    flood += usize::from(event == Some(WaveEvent::Flood));
+                    elite += usize::from(event == Some(WaveEvent::ElitePack));
+                }
+            }
+        }
+        assert!(flood > 0 && elite > 0);
+        let share = (flood + elite) as f32 / ordinary as f32;
+        assert!((0.25..=0.55).contains(&share), "share {share}");
     }
 
     #[test]

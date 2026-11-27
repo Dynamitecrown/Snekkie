@@ -174,7 +174,18 @@ impl ProgressStore {
             parse(&bytes)
         })();
         match result {
-            Ok(progress) => store.progress = progress,
+            Ok(mut progress) => {
+                // Milestones added later still count for waves already beaten.
+                let best = progress.best.values().map(|best| best.wave).max().unwrap_or(0);
+                for unlock in Unlock::ALL {
+                    // Load Balancer has always been the wave-20 boss, and Failover was free before it gated it.
+                    let needed = unlock.wave().or((unlock == Unlock::Failover).then_some(20));
+                    if needed.is_some_and(|needed| best >= needed) {
+                        progress.unlocked.insert(unlock.id().into());
+                    }
+                }
+                store.progress = progress;
+            }
             Err(error) => store.load_error = Some(error),
         }
         store
@@ -227,6 +238,7 @@ mod tests {
             seed: 7,
             reason: EndReason::Defeated,
             compromised: 10,
+            best_streak: 0,
             unlocks: Vec::new(),
         }
     }
@@ -272,6 +284,20 @@ mod tests {
         assert_eq!(store.progress.selected_rig(), Rig::Probe);
         store.progress.selected_rig = "warp".into();
         assert_eq!(store.progress.selected_rig(), Rig::Probe);
+    }
+
+    #[test]
+    fn opening_backfills_milestones_already_beaten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invade.json");
+        let mut store = ProgressStore::open(path.clone());
+        store.progress.add_record(&summary(Rig::Probe, 900, 25));
+        store.save().unwrap();
+        let reopened = ProgressStore::open(path);
+        for unlock in [Unlock::RateLimit, Unlock::Worm, Unlock::Relay, Unlock::Failover] {
+            assert!(reopened.progress.is_unlocked(unlock), "{unlock:?}");
+        }
+        assert!(!reopened.progress.is_unlocked(Unlock::LogicBomb) && !reopened.progress.is_unlocked(Unlock::Kernel));
     }
 
     #[test]

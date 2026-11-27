@@ -570,6 +570,13 @@ fn build_and_upgrade_screens_work_from_the_keyboard_and_mouse() {
     app.get_by_label_contains("No modules yet");
     press(&mut app, Key::Escape);
     app.get_by_label("PAUSED");
+    // The codex opens on click, reveals what this run has met and keeps Esc working.
+    app.get_by_label("Codex").scroll_to_me();
+    frames(&mut app, 5);
+    app.get_by_label("Codex").click();
+    frames(&mut app, 3);
+    app.get_by_label("Endpoint");
+    app.get_by_label("Reach wave 2");
     press(&mut app, Key::Escape);
     assert_eq!(status(&app).state, "Get ready");
     frames(&mut app, 34);
@@ -1798,7 +1805,7 @@ fn missile_pivot_and_elite_cargo_are_visible_and_reset_with_a_retried_run() {
         r.spawn_item_drop(kind, at);
     }
     r.step(Default::default());
-    assert_eq!(r.items().count(), 2);
+    assert_eq!(r.items().count(), ItemKind::ALL.len());
     frames(&mut app, 3);
     press(&mut app, Key::B);
     assert!(app.query_by_label_contains("Jumbo Frame:").is_some());
@@ -1806,6 +1813,9 @@ fn missile_pivot_and_elite_cargo_are_visible_and_reset_with_a_retried_run() {
     assert!(app.query_by_label_contains("Flamethrower — rank").is_some());
     assert!(app.query_by_label_contains("Shield — rank").is_some());
     press(&mut app, Key::Escape);
+    // Failover is among the cargo: the first fatal hit only spends it.
+    run(&mut app).lose();
+    assert_eq!(run(&mut app).integrity(), 1);
     run(&mut app).lose();
     frames(&mut app, 3);
     app.get_by_label_contains("Retry").click();
@@ -1829,4 +1839,59 @@ fn compact_loadout_scrolls_to_missile_pivot_and_back_to_start() {
     frames(&mut app, 5);
     start_run(&mut app);
     assert_eq!(run(&mut app).pivot_kind(), snekkie::invade::PivotKind::Missile);
+}
+
+#[test]
+fn cloak_and_stinger_stay_locked_until_earned_and_can_then_start_a_run() {
+    use snekkie::invade::PivotKind;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("invade.json"), r#"{"version":1,"selected_rig":"ghost","unlocked":["ghost"]}"#)
+        .unwrap();
+    let mut app = harness(&dir);
+    open_loadout(&mut app);
+    assert!(!app.get_by_label("Slip").accesskit_node().is_disabled());
+    assert!(app.get_by_label("Cloak (locked)").accesskit_node().is_disabled());
+    assert!(app.get_by_label("Stinger (locked)").accesskit_node().is_disabled());
+    start_run(&mut app);
+    assert_eq!(run(&mut app).pivot_kind(), PivotKind::Chain);
+
+    // A wave already beaten counts, including from before these milestones existed.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("invade.json"),
+        r#"{"version":1,"selected_rig":"ghost","unlocked":["ghost"],"best":{"probe":{"wave":10}}}"#,
+    )
+    .unwrap();
+    let mut app = harness(&dir);
+    open_loadout(&mut app);
+    app.get_by_label("Cloak").click();
+    frames(&mut app, 2);
+    assert!(app.get_by_label("Stinger (locked)").accesskit_node().is_disabled(), "Stinger comes later");
+    start_run(&mut app);
+    assert_eq!(run(&mut app).pivot_kind(), PivotKind::Cloak);
+}
+
+#[test]
+fn tonk_and_train_are_selectable_from_the_start_with_their_own_specials() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    open_loadout(&mut app);
+    assert!(app.query_by_label("Reflect").is_none());
+    app.get_by_label("Tonk").click();
+    frames(&mut app, 2);
+    app.get_by_label("Reflect").scroll_to_me();
+    start_run(&mut app);
+    assert_eq!((status(&app).rig, status(&app).integrity), (Rig::Tonk, 8));
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = harness(&dir);
+    open_loadout(&mut app);
+    app.get_by_label("Train").click();
+    frames(&mut app, 2);
+    start_run(&mut app);
+    assert_eq!(status(&app).rig, Rig::Train);
+    play(&mut app);
+    run(&mut app).grant(snekkie::invade::UpgradeId::TailCar);
+    frames(&mut app, 8);
+    assert_eq!(run(&mut app).player().tail.len(), 1);
 }

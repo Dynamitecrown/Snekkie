@@ -28,6 +28,7 @@ pub enum UpgradeId {
     ToolCharge,
     ToolAmplifier,
     Feedback,
+    TailCar,
 }
 
 pub const PIERCE_RETAIN: f32 = 0.65;
@@ -40,9 +41,11 @@ pub const CACHE_SHIELD_RECHARGE: u32 = 3;
 pub const FEEDBACK_PER_SECOND: usize = 2;
 /// However recharge modifiers stack, a charge never takes less than this.
 pub const MIN_RECHARGE: f32 = 2.5;
+/// Train's longest tail.
+pub const TAIL_CAR_CAP: u8 = 8;
 
 impl UpgradeId {
-    pub const ALL: [UpgradeId; 18] = [
+    pub const ALL: [UpgradeId; 19] = [
         UpgradeId::Payload,
         UpgradeId::ClockBoost,
         UpgradeId::Overclock,
@@ -61,6 +64,7 @@ impl UpgradeId {
         UpgradeId::ToolCharge,
         UpgradeId::ToolAmplifier,
         UpgradeId::Feedback,
+        UpgradeId::TailCar,
     ];
 
     fn index(self) -> usize {
@@ -87,6 +91,7 @@ impl UpgradeId {
             UpgradeId::ToolCharge => "tool_charge",
             UpgradeId::ToolAmplifier => "tool_amplifier",
             UpgradeId::Feedback => "feedback",
+            UpgradeId::TailCar => "tail_car",
         }
     }
 
@@ -114,6 +119,7 @@ impl UpgradeId {
             UpgradeId::ToolCharge => "Tool Charge",
             UpgradeId::ToolAmplifier => "Tool Amplifier",
             UpgradeId::Feedback => "Feedback",
+            UpgradeId::TailCar => "Tail Car",
         }
     }
 
@@ -127,6 +133,7 @@ impl UpgradeId {
             | UpgradeId::Heatsink
             | UpgradeId::ToolAmplifier
             | UpgradeId::Feedback => 2,
+            UpgradeId::TailCar => TAIL_CAR_CAP,
             _ => 1,
         }
     }
@@ -142,6 +149,11 @@ impl UpgradeId {
             UpgradeId::Feedback => Some(Unlock::Feedback),
             _ => None,
         }
+    }
+
+    /// The one rig this module is offered to, if it is rig-specific.
+    pub fn rig(self) -> Option<Rig> {
+        (self == UpgradeId::TailCar).then_some(Rig::Train)
     }
 
     /// The catalog's one-line rule, independent of the current rig.
@@ -165,6 +177,7 @@ impl UpgradeId {
             UpgradeId::ToolCharge => "Store a second special charge",
             UpgradeId::ToolAmplifier => "Strengthens the rig's special per rank",
             UpgradeId::Feedback => "Primary hits refund special recharge (0.10 s, then 0.15 s)",
+            UpgradeId::TailCar => "Train only: one more tail car, +10% damage and +6% fire rate; cars can be hit",
         }
     }
 }
@@ -172,7 +185,7 @@ impl UpgradeId {
 /// The ranks a run has acquired.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Build {
-    ranks: [u8; 18],
+    ranks: [u8; 19],
 }
 
 impl Build {
@@ -224,16 +237,28 @@ pub struct Stats {
     pub pivot_direct: f32,
     pub slip_protection: f32,
     pub barrier_protection: f32,
+    pub reflect_protection: f32,
+    /// Seconds of Relay's Overclock.
+    pub overclock_time: f32,
+    /// Visual units Kernel's Purge reaches.
+    pub purge_radius: f32,
+    pub max_integrity: u8,
+    /// Train's tail cars.
+    pub tail: u8,
 }
 
 pub fn stats(rig: Rig, build: &Build) -> Stats {
     let base = rig.base();
     let r = |id| f32::from(build.rank(id));
     let has = |id| build.rank(id) > 0;
-    let damage_bonus =
-        1.0 + 0.15 * r(UpgradeId::Payload) + 0.5 * r(UpgradeId::HeavyPackets) + 0.25 * r(UpgradeId::Grounded);
+    let damage_bonus = 1.0
+        + 0.15 * r(UpgradeId::Payload)
+        + 0.5 * r(UpgradeId::HeavyPackets)
+        + 0.25 * r(UpgradeId::Grounded)
+        + 0.10 * r(UpgradeId::TailCar);
     let damage_penalty = 1.0 - 0.2 * r(UpgradeId::Overclock);
-    let rate_bonus = 1.0 + 0.12 * r(UpgradeId::ClockBoost) + 0.35 * r(UpgradeId::Overclock);
+    let rate_bonus =
+        1.0 + 0.12 * r(UpgradeId::ClockBoost) + 0.35 * r(UpgradeId::Overclock) + 0.06 * r(UpgradeId::TailCar);
     let rate_penalty = 1.0 - 0.25 * r(UpgradeId::HeavyPackets);
     let move_bonus = 1.0 + 0.15 * r(UpgradeId::LightFrame);
     let move_penalty = 1.0 - 0.15 * r(UpgradeId::Grounded);
@@ -266,6 +291,11 @@ pub fn stats(rig: Rig, build: &Build) -> Stats {
         pivot_direct: 6.0 + f32::from(amplifier),
         slip_protection: 1.0 + 0.15 * f32::from(amplifier),
         barrier_protection: 2.0 + 0.4 * f32::from(amplifier),
+        reflect_protection: 2.5 + 0.5 * f32::from(amplifier),
+        overclock_time: 4.0 + 0.5 * f32::from(amplifier),
+        purge_radius: 16.0 + f32::from(amplifier),
+        max_integrity: base.max_integrity,
+        tail: build.rank(UpgradeId::TailCar),
     }
 }
 
@@ -325,6 +355,7 @@ pub fn eligible(ctx: &OfferContext<'_>, unlocked: impl Fn(Unlock) -> bool) -> Ve
     UpgradeId::ALL
         .into_iter()
         .filter(|id| id.unlock().is_none_or(&unlocked))
+        .filter(|id| id.rig().is_none_or(|rig| rig == ctx.rig))
         .filter(|id| ctx.build.rank(*id) < id.cap())
         .collect()
 }
@@ -364,7 +395,7 @@ pub fn level_offers(
 ) -> Vec<LevelChoice> {
     let mut weapon_pool: Vec<_> = WeaponKind::ALL
         .into_iter()
-        .filter(|&kind| can_acquire_weapon(kind, weapons))
+        .filter(|&kind| can_acquire_weapon(kind, weapons) && kind.unlock().is_none_or(&unlocked))
         .map(LevelChoice::Weapon)
         .collect();
     let mut module_pool: Vec<_> =
@@ -441,6 +472,13 @@ pub fn weapon_details(kind: WeaponKind, spec: &WeaponSpec) -> String {
             "{cadence} per contact; {} shields at {:.1} radius; reflect ordinary packets for {:.2} damage.",
             spec.projectiles, spec.radius, spec.damage
         ),
+        WeaponKind::Worm => format!(
+            "{cadence}; {} worm; homes on visible devices; burrows through {} more at 65% damage each; {:.1} range.",
+            spec.projectiles, spec.pierce, spec.range
+        ),
+        WeaponKind::Mine => {
+            format!("{cadence} to each device within {:.1} radius; armed for {:.0} s.", spec.radius, spec.range)
+        }
     }
 }
 
@@ -449,7 +487,7 @@ fn weapon_downside(kind: WeaponKind) -> Option<String> {
         WeaponKind::Packet => None,
         WeaponKind::Scatter => Some("Weaker individual packets and shorter range than Packet.".into()),
         WeaponKind::Rail => Some("Slower fire; each penetration keeps 65% of the previous hit's damage.".into()),
-        WeaponKind::Arc => Some("One chain can hit at most three distinct devices.".into()),
+        WeaponKind::Arc => Some("One chain can hit at most three distinct devices, five once evolved.".into()),
         WeaponKind::Orbit => {
             Some("The rotating packets stay near your rig instead of pursuing distant targets.".into())
         }
@@ -459,6 +497,8 @@ fn weapon_downside(kind: WeaponKind) -> Option<String> {
             "Only packets touching a shield are reflected. Boss packets, streams, scans and curtains pass through."
                 .into(),
         ),
+        WeaponKind::Worm => Some("Slower than a packet, and it chases durable devices first.".into()),
+        WeaponKind::Mine => Some("Stays where it was dropped: lead devices over it. Rocks set it off.".into()),
     }
 }
 
@@ -474,14 +514,17 @@ fn weapon_changes(ctx: &OfferContext<'_>, weapons: &[WeaponState], next: &Stats,
             } else {
                 arrow(1.0 / before.cooldown, 1.0 / after.cooldown, 2)
             };
-            format!("{} {values}", weapon.kind.name())
+            format!("{} {values}", weapon.display_name())
         })
         .collect();
     format!("{}: {}.", if damage { "Damage per hit" } else { "Activations/s" }, changes.join("; "))
 }
 
 fn projectile_weapon(kind: WeaponKind) -> bool {
-    matches!(kind, WeaponKind::Packet | WeaponKind::Scatter | WeaponKind::Rail | WeaponKind::Flamethrower)
+    matches!(
+        kind,
+        WeaponKind::Packet | WeaponKind::Scatter | WeaponKind::Rail | WeaponKind::Flamethrower | WeaponKind::Worm
+    )
 }
 
 pub fn describe_level(choice: LevelChoice, ctx: &OfferContext<'_>, weapons: &[WeaponState]) -> Card {
@@ -508,7 +551,11 @@ pub fn describe_level(choice: LevelChoice, ctx: &OfferContext<'_>, weapons: &[We
                             .iter()
                             .filter(|weapon| projectile_weapon(weapon.kind))
                             .map(|weapon| {
-                                format!("{} {:.2}", weapon.kind.name(), weapon.spec(ctx.rig, &next).damage * FORK_SHARE)
+                                format!(
+                                    "{} {:.2}",
+                                    weapon.display_name(),
+                                    weapon.spec(ctx.rig, &next).damage * FORK_SHARE
+                                )
                             })
                             .collect();
                         card.effect = format!(
@@ -529,7 +576,7 @@ pub fn describe_level(choice: LevelChoice, ctx: &OfferContext<'_>, weapons: &[We
                                     .collect();
                                 format!(
                                     "{} {} -> {} extra targets; damage {}",
-                                    weapon.kind.name(),
+                                    weapon.display_name(),
                                     before.pierce,
                                     after.pierce,
                                     hits.join(", ")
@@ -562,10 +609,13 @@ pub fn describe_level(choice: LevelChoice, ctx: &OfferContext<'_>, weapons: &[We
         LevelChoice::Weapon(kind) => {
             let rank = weapons.iter().find(|weapon| weapon.kind == kind).map_or(0, |weapon| weapon.rank);
             let next = rank.saturating_add(1).min(kind.cap());
+            let evolves = rank > 0 && rank < kind.cap() && next == kind.cap();
             Card {
-                title: kind.name().into(),
+                title: if evolves { format!("{} -> {}", kind.name(), kind.evolved_name()) } else { kind.name().into() },
                 rank: if rank == 0 {
                     format!("New weapon · rank 1 of {} · slot {} of {MAX_WEAPONS}", kind.cap(), weapons.len() + 1)
+                } else if evolves {
+                    format!("Weapon rank {rank} -> {next} of {} · EVOLVES", kind.cap())
                 } else {
                     format!("Weapon rank {rank} -> {next} of {}", kind.cap())
                 },
@@ -706,7 +756,7 @@ pub fn describe(offer: Offer, ctx: &OfferContext<'_>) -> Card {
         }
         UpgradeId::ToolAmplifier => (
             match rig {
-                Rig::Probe => format!(
+                Rig::Probe | Rig::Train => format!(
                     "Pivot chains {} extra devices and hits for {} direct damage.",
                     format_args!("{} -> {}", now.pivot_jumps, next.pivot_jumps),
                     arrow(now.pivot_direct, next.pivot_direct, 0)
@@ -715,6 +765,11 @@ pub fn describe(offer: Offer, ctx: &OfferContext<'_>) -> Card {
                 Rig::Bastion => {
                     format!("Barrier lasts {} s.", arrow(now.barrier_protection, next.barrier_protection, 1))
                 }
+                Rig::Tonk => {
+                    format!("Reflect lasts {} s.", arrow(now.reflect_protection, next.reflect_protection, 1))
+                }
+                Rig::Relay => format!("Overclock lasts {} s.", arrow(now.overclock_time, next.overclock_time, 1)),
+                Rig::Kernel => format!("Purge radius {}.", arrow(now.purge_radius, next.purge_radius, 0)),
             },
             None,
         ),
@@ -727,6 +782,16 @@ pub fn describe(offer: Offer, ctx: &OfferContext<'_>) -> Card {
                 _ => String::new(),
             },
             None,
+        ),
+        UpgradeId::TailCar => (
+            format!(
+                "Tail {} -> {} cars. Primary damage {}; fire rate {} packets/s.",
+                now.tail,
+                next.tail,
+                arrow(now.damage, next.damage, 2),
+                arrow(now.fire_rate, next.fire_rate, 1)
+            ),
+            Some("A longer tail is a bigger target: packets that hit a car cost integrity.".into()),
         ),
     };
     Card { title: id.name().into(), rank: rank_text, effect, downside }
@@ -802,6 +867,12 @@ mod tests {
         let before = WeaponKind::Packet.spec(2, ctx.rig, &current);
         let after = WeaponKind::Packet.spec(3, ctx.rig, &current);
         assert_eq!(card.rank, "Weapon rank 2 -> 3 of 5");
+        assert_eq!(card.title, "Packet");
+        let rank4 = [WeaponState { kind: WeaponKind::Packet, rank: 4 }];
+        let evolving = describe_level(LevelChoice::Weapon(WeaponKind::Packet), &ctx, &rank4);
+        assert_eq!(evolving.title, "Packet -> Burst Packet");
+        assert_eq!(evolving.rank, "Weapon rank 4 -> 5 of 5 · EVOLVES");
+        assert!(evolving.effect.contains("After:") && evolving.effect.contains("2 packet"));
         assert!(card.effect.contains(&format!("{:.2} damage", before.damage)));
         assert!(card.effect.contains(&format!("{:.2} damage", after.damage)));
         let new = describe_level(LevelChoice::Weapon(WeaponKind::Pulse), &ctx, &weapons);
@@ -811,13 +882,41 @@ mod tests {
         assert!(overclock.effect.contains("Activations/s: Packet") && overclock.effect.contains("Rail"));
         let downside = overclock.downside.unwrap();
         assert!(downside.contains("Damage per hit: Packet") && downside.contains("Rail"));
+        let evolved = [WeaponState { kind: WeaponKind::Packet, rank: 5 }];
+        let evolved_card = describe_level(LevelChoice::Module(Offer::Upgrade(UpgradeId::Overclock)), &ctx, &evolved);
+        assert!(evolved_card.effect.contains("Activations/s: Burst Packet"), "{}", evolved_card.effect);
         assert_eq!(describe_level(LevelChoice::Module(Offer::Patch), &ctx, &weapons), describe(Offer::Patch, &ctx));
+    }
+
+    #[test]
+    fn locked_weapons_are_never_offered_until_unlocked() {
+        let build = Build::default();
+        let ctx = OfferContext { rig: Rig::Probe, build: &build, integrity: 5, max_integrity: 5, charges: 1, wave: 1 };
+        let weapons = [WeaponState::new(WeaponKind::Packet)];
+        let locked = [WeaponKind::Worm, WeaponKind::Mine];
+        assert_eq!(locked.map(WeaponKind::unlock), [Some(Unlock::Worm), Some(Unlock::LogicBomb)]);
+        let offered = |unlocked: fn(Unlock) -> bool| {
+            let mut seen = Vec::new();
+            for seed in 0..300 {
+                for choice in level_offers(&mut Rng::new(seed), &ctx, &weapons, unlocked) {
+                    if let LevelChoice::Weapon(kind) = choice
+                        && !seen.contains(&kind)
+                    {
+                        seen.push(kind);
+                    }
+                }
+            }
+            seen
+        };
+        assert!(!offered(|_| false).iter().any(|k| locked.contains(k)));
+        let open = offered(|u| matches!(u, Unlock::Worm | Unlock::LogicBomb));
+        assert!(locked.iter().all(|k| open.contains(k)), "{open:?}");
     }
 
     #[test]
     fn twelve_upgrades_start_available_and_six_modules_unlock() {
         let initial: Vec<_> = UpgradeId::ALL.into_iter().filter(|id| id.unlock().is_none()).collect();
-        assert_eq!(initial.len(), 12);
+        assert_eq!(initial.len(), 13, "including Train's Tail Car");
         let locked: Vec<_> = UpgradeId::ALL.into_iter().filter_map(UpgradeId::unlock).collect();
         assert_eq!(
             locked,
@@ -846,7 +945,7 @@ mod tests {
             assert_eq!(build.rank(id), id.cap());
         }
         let caps: Vec<u8> = UpgradeId::ALL.map(UpgradeId::cap).into();
-        assert_eq!(caps, [3, 3, 1, 1, 1, 2, 2, 1, 1, 1, 1, 2, 2, 1, 2, 1, 2, 2]);
+        assert_eq!(caps, [3, 3, 1, 1, 1, 2, 2, 1, 1, 1, 1, 2, 2, 1, 2, 1, 2, 2, 8]);
     }
 
     #[test]
@@ -997,8 +1096,14 @@ mod tests {
                 .effect,
             "Fragments deal 40% -> 60% of the killing hit (1.20 -> 1.80 each from a full packet)."
         );
-        // Exactly the four tradeoff upgrades state a downside, on every rig.
-        let tradeoffs = [UpgradeId::Overclock, UpgradeId::HeavyPackets, UpgradeId::LightFrame, UpgradeId::Grounded];
+        // Exactly the tradeoff upgrades state a downside, on every rig.
+        let tradeoffs = [
+            UpgradeId::Overclock,
+            UpgradeId::HeavyPackets,
+            UpgradeId::LightFrame,
+            UpgradeId::Grounded,
+            UpgradeId::TailCar,
+        ];
         for id in UpgradeId::ALL {
             for rig in Rig::ALL {
                 let card = describe(Offer::Upgrade(id), &ctx(rig));

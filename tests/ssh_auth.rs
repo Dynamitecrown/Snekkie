@@ -11,7 +11,7 @@ use common::{Event, Recorder};
 use russh::server::{self, Auth, Msg, Response, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use snekkie::profiles::Profile;
-use snekkie::transport::ssh::{self, Credentials, HostKeyAsker, HostKeyQuestion};
+use snekkie::transport::ssh::{self, Credentials, HostKeyAsker, HostKeyQuestion, PromptAsker, PromptQuestion};
 use snekkie::transport::{Link, Sink};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -39,7 +39,11 @@ enum Mode {
     /// Offers password, but always rejects it, then accepts the same
     /// password through keyboard-interactive after an empty first round.
     PasswordRejectedThenKeyboardInteractive,
+    /// Keyboard-interactive asking for the password, then a one-time code.
+    PasswordThenCode,
 }
+
+const CODE: &str = "123456";
 
 struct Handler {
     mode: Mode,
@@ -69,6 +73,19 @@ impl server::Handler for Handler {
             return Ok(Auth::reject());
         }
         self.round += 1;
+        if matches!(self.mode, Mode::PasswordThenCode) {
+            let answer = response.and_then(|mut r| r.next()).unwrap_or_default();
+            let (expected, next) = match self.round {
+                1 => return Ok(partial("Password: ")),
+                2 => (PASSWORD, Some("Verification code: ")),
+                _ => (CODE, None),
+            };
+            return Ok(match (answer.as_ref() == expected.as_bytes(), next) {
+                (true, Some(prompt)) => partial(prompt),
+                (true, None) => Auth::Accept,
+                (false, _) => Auth::reject(),
+            });
+        }
         // Rounds that ask something before the answer is checked. The
         // fallback mode starts with an empty round, as some servers do.
         let empty_first = matches!(self.mode, Mode::PasswordRejectedThenKeyboardInteractive);
@@ -103,6 +120,10 @@ impl server::Handler for Handler {
     }
 }
 
+fn partial(prompt: &'static str) -> Auth {
+    Auth::Partial { name: "".into(), instructions: "".into(), prompts: vec![(prompt.into(), false)].into() }
+}
+
 struct Harness {
     runtime: tokio::runtime::Runtime,
     port: u16,
@@ -114,7 +135,7 @@ fn start_server(mode: Mode) -> Harness {
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let methods: &[MethodKind] = match mode {
         Mode::Password => &[MethodKind::Password],
-        Mode::KeyboardInteractive => &[MethodKind::KeyboardInteractive],
+        Mode::KeyboardInteractive | Mode::PasswordThenCode => &[MethodKind::KeyboardInteractive],
         Mode::PasswordRejectedThenKeyboardInteractive => &[MethodKind::Password, MethodKind::KeyboardInteractive],
     };
     let config = Arc::new(server::Config {
@@ -150,6 +171,16 @@ impl Harness {
     }
 
     fn connect_to(&self, port: u16, password: &str, keepalive: u32) -> (Arc<Recorder>, Link) {
+        self.connect_asking(port, password, keepalive, None)
+    }
+
+    fn connect_asking(
+        &self,
+        port: u16,
+        password: &str,
+        keepalive: u32,
+        ask_prompts: Option<PromptAsker>,
+    ) -> (Arc<Recorder>, Link) {
         let recorder = Recorder::new();
         let profile = Profile {
             host: "127.0.0.1".into(),
@@ -163,6 +194,8 @@ impl Harness {
             password: password.into(),
             key_passphrase: String::new(),
             known_hosts: self.known_hosts.path().join("known_hosts"),
+            ask_prompts,
+            jumps: Vec::new(),
         };
         let ask: HostKeyAsker = Arc::new(|q: HostKeyQuestion| {
             let _ = q.reply.send(true);
@@ -294,4 +327,38 @@ fn keepalives_notice_a_dead_connection() {
         }
         other => panic!("expected the connection to be given up, got {other:?}"),
     }
+}
+
+/// Every set of prompts the user was shown.
+type Asked = Arc<parking_lot::Mutex<Vec<Vec<(String, bool)>>>>;
+
+/// The password answers the password round; the code round goes to the user.
+fn connect_with_code(answer: Option<&'static str>) -> (Harness, Arc<Recorder>, Link, Asked) {
+    let harness = start_server(Mode::PasswordThenCode);
+    let asked = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    let ask: PromptAsker = Arc::new(move |q: PromptQuestion| {
+        seen.lock().push(q.prompts.clone());
+        let _ = q.reply.send(answer.map(|a| vec![a.to_string()]));
+    });
+    let (recorder, link) = harness.connect_asking(harness.port, PASSWORD, 0, Some(ask));
+    (harness, recorder, link, asked)
+}
+
+#[test]
+fn one_time_code_is_asked_for_after_the_password() {
+    let (_harness, recorder, _link, asked) = connect_with_code(Some(CODE));
+    recorder.wait_event(WAIT, |e| *e == Event::Connected);
+    recorder.wait_text(WAIT, "welcome");
+    assert_eq!(*asked.lock(), vec![vec![("Verification code: ".to_string(), false)]]);
+}
+
+#[test]
+fn canceling_the_code_prompt_aborts_the_login() {
+    let (_harness, recorder, _link, _) = connect_with_code(None);
+    match recorder.wait_event(WAIT, |e| matches!(e, Event::Closed(_))) {
+        Event::Closed(Some(reason)) => assert_eq!(reason, "Login canceled"),
+        other => panic!("expected a canceled login, got {other:?}"),
+    }
+    assert!(!recorder.events().contains(&Event::Connected));
 }

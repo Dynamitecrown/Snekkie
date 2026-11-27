@@ -27,6 +27,7 @@ impl SyntaxPreview {
             theme,
             syntax,
             highlighting_intensity: intensity,
+            user_rules: &highlight::NO_USER_RULES,
             regular: font.clone(),
             bold: font,
             keyboard: false,

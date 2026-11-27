@@ -6,10 +6,10 @@
 use egui::{ComboBox, DragValue, RichText, TextEdit, Ui};
 
 use super::style;
-use crate::profiles::{self, Auth, Kind, LocalEcho, Profile, ProfileStore};
+use crate::profiles::{self, Auth, Kind, LocalEcho, Profile, ProfileStore, Tunnel, TunnelKind};
 use crate::settings::AppSettings;
 use crate::terminal::highlight::{syntax_label, syntax_options};
-use crate::terminal::keys::Backspace;
+use crate::terminal::keys::{Backspace, EnterSends};
 use crate::transport::serial::{self, BAUD_RATES, DATA_BITS, PARITIES, PortInfo, STOP_BITS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +56,8 @@ pub enum Action {
     /// Start a blank form that will save into this folder.
     NewSessionIn(String),
     ProfileColor(String),
+    /// One TCP connect to the saved session's host and port.
+    CheckPort(Profile),
     ImportProfiles,
     ExportProfiles,
     /// Ask for a device path typed by hand ("Other…").
@@ -314,7 +316,7 @@ impl Sidebar {
                 .id_salt("new_session_form")
                 .default_open(true)
                 .open(expand.then_some(true))
-                .show_unindented(ui, |ui| self.form_ui(ui, monospace_fonts, accent, &mut actions));
+                .show_unindented(ui, |ui| self.form_ui(ui, store, monospace_fonts, accent, &mut actions));
         self.blocks_terminal_input |= form.header_response.has_focus() || form.header_response.lost_focus();
         if expand {
             form.header_response.scroll_to_me(Some(egui::Align::TOP));
@@ -324,7 +326,14 @@ impl Sidebar {
         actions
     }
 
-    fn form_ui(&mut self, ui: &mut Ui, monospace_fonts: &[String], accent: egui::Color32, actions: &mut Vec<Action>) {
+    fn form_ui(
+        &mut self,
+        ui: &mut Ui,
+        store: &ProfileStore,
+        monospace_fonts: &[String],
+        accent: egui::Color32,
+        actions: &mut Vec<Action>,
+    ) {
         ui.columns(2, |columns| {
             for ui in columns.iter_mut() {
                 ui.spacing_mut().item_spacing.y = 2.0;
@@ -377,7 +386,7 @@ impl Sidebar {
             match self.page {
                 Page::Network => self.network_page(ui, actions),
                 Page::Serial => self.serial_page(ui, actions),
-                Page::Advanced => self.advanced_page(ui, monospace_fonts, actions),
+                Page::Advanced => self.advanced_page(ui, store, monospace_fonts, actions),
             }
         });
 
@@ -432,6 +441,95 @@ impl Sidebar {
             .on_hover_text(
                 "Seconds between keepalives, which stop a firewall dropping an idle session. 0 turns them off.",
             )
+        });
+    }
+
+    fn jump_host_ui(&mut self, ui: &mut Ui, store: &ProfileStore) {
+        let selected = if self.draft.jump_host.is_empty() { "None (direct)" } else { self.draft.jump_host.as_str() };
+        let selected = selected.to_string();
+        row(ui, "Jump host", |ui| {
+            ComboBox::from_id_salt("jump_host")
+                .width(ui.available_width())
+                .truncate()
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.draft.jump_host, String::new(), "None (direct)");
+                    for profile in store.profiles.iter().filter(|p| p.kind().is_ssh() && p.name != self.draft.name) {
+                        ui.selectable_value(&mut self.draft.jump_host, profile.name.clone(), &profile.name);
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Log in to this saved SSH session first and connect through it, like OpenSSH's ProxyJump. Each hop asks for its own password and checks its own host key.",
+                )
+        });
+    }
+
+    /// Port forwards started with the shell, like ssh -L, -R and -D.
+    fn tunnels_ui(&mut self, ui: &mut Ui) {
+        let title = format!("Tunnels ({})", self.draft.tunnels.len());
+        egui::CollapsingHeader::new(title).id_salt("tunnels").show(ui, |ui| {
+            let mut remove = None;
+            for (index, tunnel) in self.draft.tunnels.iter_mut().enumerate() {
+                ui.push_id(index, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut tunnel.enabled, "").on_hover_text("Start this tunnel with the session");
+                        ComboBox::from_id_salt("tunnel_kind")
+                            .selected_text(tunnel.kind.label())
+                            .show_ui(ui, |ui| {
+                                for kind in TunnelKind::ALL {
+                                    ui.selectable_value(&mut tunnel.kind, kind, kind.label());
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Local: a port on this computer reaches a host as the server sees it (ssh -L).\nRemote: a port on the server reaches a host as this computer sees it (ssh -R).\nDynamic: a SOCKS5 proxy on this computer (ssh -D).",
+                            );
+                        if ui.small_button("×").on_hover_text("Remove this tunnel").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                    let listen = if tunnel.kind == TunnelKind::Remote { "Server port" } else { "Local port" };
+                    row(ui, listen, |ui| ui.add(DragValue::new(&mut tunnel.listen_port).range(0..=65535)));
+                    if tunnel.kind != TunnelKind::Dynamic {
+                        let seen = if tunnel.kind == TunnelKind::Remote {
+                            "Host and port as this computer sees them"
+                        } else {
+                            "Host and port as the server sees them"
+                        };
+                        row(ui, "Destination", |ui| {
+                            let width = (ui.available_width() - 70.0).max(60.0);
+                            ui.add(text_field(&mut tunnel.host, "host", width)).on_hover_text(seen);
+                            ui.add(DragValue::new(&mut tunnel.port).range(0..=65535)).on_hover_text(seen);
+                        });
+                    }
+                    ui.checkbox(&mut tunnel.allow_others, "Allow other computers to connect").on_hover_text(
+                        "Listen on every network interface instead of 127.0.0.1 only. Off by default.",
+                    );
+                    if tunnel.allow_others {
+                        let place = if tunnel.kind == TunnelKind::Remote { "the server" } else { "this computer" };
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "Anyone who can reach {place} can use this tunnel, with no password."
+                                ))
+                                .color(ui.visuals().warn_fg_color),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    if let Some(problem) = tunnel.problem() {
+                        ui.label(RichText::new(format!("Not started: {problem}")).color(style::secondary(ui)));
+                    }
+                    ui.separator();
+                });
+            }
+            if let Some(index) = remove {
+                self.draft.tunnels.remove(index);
+            }
+            if ui.button("Add tunnel").clicked() {
+                self.draft.tunnels.push(Tunnel::default());
+            }
         });
     }
 
@@ -586,9 +684,21 @@ impl Sidebar {
         );
     }
 
-    fn advanced_page(&mut self, ui: &mut Ui, monospace_fonts: &[String], actions: &mut Vec<Action>) {
+    fn advanced_page(
+        &mut self,
+        ui: &mut Ui,
+        store: &ProfileStore,
+        monospace_fonts: &[String],
+        actions: &mut Vec<Action>,
+    ) {
         if self.draft.kind().is_network() {
             self.keepalive_ui(ui);
+        }
+        if self.draft.kind().is_ssh() {
+            self.jump_host_ui(ui, store);
+        }
+        if self.draft.kind() == Kind::Ssh {
+            self.tunnels_ui(ui);
         }
         // Everything below is about a terminal, which SFTP doesn't have.
         if self.draft.kind() == Kind::Sftp {
@@ -671,6 +781,25 @@ impl Sidebar {
                 );
             self.draft.backspace = backspace.as_str().to_string();
         });
+        if self.draft.kind() == Kind::Serial {
+            row(ui, "Enter sends", |ui| {
+                let mut enter = EnterSends::parse(&self.draft.enter_sends);
+                ComboBox::from_id_salt("enter_sends")
+                    .width(ui.available_width())
+                    .truncate()
+                    .selected_text(enter.label())
+                    .show_ui(ui, |ui| {
+                        for option in EnterSends::ALL {
+                            ui.selectable_value(&mut enter, option, option.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text("The line ending Enter and pasted lines send. Most consoles want CR.");
+                self.draft.enter_sends = enter.as_str().to_string();
+            });
+            ui.checkbox(&mut self.draft.lf_to_crlf, "Treat received LF as CR+LF")
+                .on_hover_text("For devices whose output steps down without returning to the left edge.");
+        }
     }
 
     /// The folders inside `parent`, then its sessions.
@@ -851,6 +980,12 @@ impl Sidebar {
         let menu = response.context_menu(|ui| {
             if ui.button("Default tab color…").clicked() {
                 actions.push(Action::ProfileColor(profile.name.clone()));
+                ui.close();
+            }
+            if matches!(profile.kind(), Kind::Ssh | Kind::Telnet | Kind::Raw)
+                && ui.button("Check port").on_hover_text("Try one TCP connection to the host and port").clicked()
+            {
+                actions.push(Action::CheckPort((*profile).clone()));
                 ui.close();
             }
             ui.menu_button("Move to folder", |ui| {
@@ -1357,6 +1492,53 @@ mod tests {
         harness.get_by_label("Advanced").click();
         harness.run_ok();
         assert!(harness.query_by_label("Keepalive").is_none());
+    }
+
+    #[test]
+    fn jump_host_picks_a_saved_ssh_session_on_the_advanced_page() {
+        let mut harness = saved_sessions_harness();
+        harness.get_by_label("Advanced").click();
+        harness.run_ok();
+        harness.get_by_label("Jump host");
+        harness.get_by_value("None (direct)").click();
+        harness.run_ok();
+        // Alpha is an SSH session; Beta, a serial one, isn't offered.
+        assert_eq!(harness.query_all_by_label("Beta").count(), 1);
+        harness.query_all_by_label("Alpha").last().unwrap().click();
+        harness.run_ok();
+        assert_eq!(harness.state().sidebar.collect().jump_host, "Alpha");
+        harness.get_by_value("Alpha");
+
+        harness.state_mut().sidebar.set_kind(Kind::Telnet);
+        harness.get_by_label("Advanced").click();
+        harness.run_ok();
+        assert!(harness.query_by_label("Jump host").is_none());
+    }
+
+    #[test]
+    fn tunnels_are_added_on_the_advanced_page_and_warn_when_open_to_other_computers() {
+        let mut harness = saved_sessions_harness();
+        harness.get_by_label("Advanced").click();
+        harness.run_ok();
+        harness.get_by_label("Tunnels (0)").click();
+        harness.run_ok();
+        harness.get_by_label("Add tunnel").click();
+        harness.run_ok();
+        harness.get_by_label("Not started: choose a listen port");
+        let tunnel = &harness.state().sidebar.collect().tunnels[0];
+        assert!(tunnel.enabled && !tunnel.allow_others);
+        assert!(harness.query_by_label_contains("Anyone who can reach").is_none());
+        harness.get_by_label("Allow other computers to connect").click();
+        harness.run_ok();
+        harness.get_by_label_contains("Anyone who can reach this computer");
+        assert!(harness.state().sidebar.collect().tunnels[0].allow_others);
+        harness.get_by_label("×").click();
+        harness.run_ok();
+        assert!(harness.state().sidebar.collect().tunnels.is_empty());
+
+        harness.state_mut().sidebar.set_kind(Kind::Sftp);
+        harness.run_ok();
+        assert!(harness.query_by_label_contains("Tunnels").is_none());
     }
 
     #[test]

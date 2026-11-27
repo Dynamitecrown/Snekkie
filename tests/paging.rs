@@ -44,6 +44,8 @@ impl Console {
         session.connect(ConnectContext {
             runtime: runtime.handle(),
             ask_host_key: Arc::new(|_| {}),
+            ask_prompts: None,
+            jumps: Vec::new(),
             password: String::new(),
             key_passphrase: String::new(),
             network: Default::default(),

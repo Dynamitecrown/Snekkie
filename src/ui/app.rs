@@ -32,12 +32,16 @@ use crate::network::{NetworkAccess, NetworkQuestion};
 use crate::paste::{PasteQueue, PasteTarget};
 use crate::profiles::{self, Auth, Kind, Profile, ProfileStore};
 use crate::session::{ConnectContext, LogStatus, NoticeLevel, Session, State};
-use crate::settings::{AppSettings, SettingsStore, Theme};
+use crate::settings::{AppSettings, LastTab, LastTabs, SettingsStore, Theme};
 use crate::snippets::{Snippet, SnippetStore};
+use crate::terminal::highlight::UserRules;
 use crate::terminal::keys;
+use crate::terminal::links::Link;
+use crate::terminal::paging::{CliMode, Prompt, parse_prompt};
 use crate::transport::serial::PortInfo;
-use crate::transport::ssh::{self, HostKeyAsker, HostKeyQuestion};
+use crate::transport::ssh::{self, HostKeyAsker, HostKeyQuestion, PromptAsker, PromptQuestion};
 use crate::transport::transfer::Direction;
+use crate::transport::tunnel::TunnelState;
 use crate::update::{self, Release};
 
 /// How long a status bar message stays up, in seconds.
@@ -57,6 +61,7 @@ Ctrl+Shift+V    Paste     (right-click pastes by default; configurable)
 Ctrl+F          Find in output (Enter: older, Shift+Enter: newer)
 Ctrl+Shift+S    Command snippets
 Ctrl+Right-click  Terminal context menu (copy, save text, selection)
+Ctrl+click      Open a link, or a new session to an address
 Shift+PgUp/Dn   Scroll back through history
 Ctrl+Shift+L    Clear screen and scrollback
 Ctrl+Shift+B    Send break (serial, telnet)
@@ -79,6 +84,7 @@ Cmd+A           Select all
 Cmd+F           Find in output (Enter: older, Shift+Enter: newer)
 Cmd+Shift+S     Command snippets
 Ctrl+Right-click  Terminal context menu (copy, save text, selection)
+Cmd+click       Open a link, or a new session to an address
 Shift+PgUp/Dn   Scroll back through history
 Cmd+Shift+L     Clear screen and scrollback
 Cmd+Shift+B     Send break (serial, telnet)
@@ -91,6 +97,8 @@ Ctrl+C/X/V      Send terminal control characters";
 enum Target {
     NewTab,
     Reconnect(u64),
+    /// As Reconnect, but an agent asked, so the user stays on their own tab.
+    AgentReconnect(u64),
     /// Log an explorer tab in again, on its own connection.
     ReconnectExplorer(u64),
 }
@@ -99,6 +107,8 @@ enum Target {
 struct PendingConnect {
     profile: Profile,
     target: Target,
+    /// Jump hosts to go through, first hop first.
+    jumps: Vec<Profile>,
 }
 
 enum ConfirmAction {
@@ -134,6 +144,7 @@ enum Dialog {
     Confirm { title: String, text: String, action: ConfirmAction },
     Input { title: String, label: String, text: String, secret: bool, action: InputAction, focus: bool },
     HostKey(Box<HostKeyQuestion>),
+    Prompts(Box<PromptQuestion>, Vec<String>, bool),
     Network(Box<NetworkQuestion>),
     Update { release: Release, installable: bool },
     Import(Box<PuttyImport>),
@@ -159,9 +170,11 @@ enum Command {
     ResetTerminal,
     SendBreak,
     ToggleSidebar,
+    ToggleButtonBar,
     ToggleAutoPaging,
     Preferences,
     ImportPutty,
+    ImportOpenSsh,
     ImportProfiles,
     ExportProfiles,
     Shortcuts,
@@ -247,6 +260,13 @@ struct Tab {
     color: Option<Color32>,
     /// Clearing a color is an explicit override, distinct from using the default.
     color_override: bool,
+    /// The far end rang the bell while the tab was out of sight.
+    bell: bool,
+    /// Reconnect when back: true once the port accepts, false on giving up.
+    /// Dropping it stops the wait.
+    waiting: Option<tokio::sync::oneshot::Receiver<bool>>,
+    /// The last device prompt seen at the cursor.
+    prompt: Option<Prompt>,
 }
 
 /// What a tab in the strip shows: a real connection, found by its stable
@@ -278,6 +298,8 @@ pub struct SnekkieApp {
     store: ProfileStore,
     snippet_store: SnippetStore,
     snippets: Option<SnippetWindow>,
+    /// The tab whose Tunnels window is open.
+    tunnels_window: Option<u64>,
     paste_preview: Option<PastePreview>,
     paste_queue: Option<PasteQueue>,
     retired_log_workers: Vec<std::thread::JoinHandle<()>>,
@@ -285,6 +307,8 @@ pub struct SnekkieApp {
     /// Shared with open explorers, so a new choice reaches them straight away.
     explorer_editor: Arc<Mutex<String>>,
     settings: AppSettings,
+    /// `settings.highlight_rules`, compiled.
+    user_rules: UserRules,
     sidebar: Sidebar,
     /// Connection tabs, in the order they are shown.
     tabs: Vec<Tab>,
@@ -311,7 +335,10 @@ pub struct SnekkieApp {
     runtime: tokio::runtime::Runtime,
     fonts: Fonts,
     host_keys: Arc<Mutex<VecDeque<HostKeyQuestion>>>,
+    prompt_questions: Arc<Mutex<VecDeque<PromptQuestion>>>,
     network_questions: Arc<Mutex<VecDeque<NetworkQuestion>>>,
+    /// Finished "Check port" results, shown in the status bar.
+    port_checks: Arc<Mutex<Vec<String>>>,
     network: NetworkAccess,
     dialogs: Vec<Dialog>,
     preferences: Option<Preferences>,
@@ -321,6 +348,7 @@ pub struct SnekkieApp {
     allow_close: bool,
     accent: Color32,
     styled_theme: Option<Theme>,
+    space: super::space::Scene,
     dragging_tab: Option<usize>,
     /// The tab a dragged tab would go beside, if dropped on the workspace.
     tab_drag_target: Option<WorkspaceTabId>,
@@ -330,6 +358,8 @@ pub struct SnekkieApp {
     workspace_area: Option<egui::Rect>,
     /// What showed before the current tab, to go beside it.
     last_shown: Option<WorkspaceTabId>,
+    /// Tabs from last time were put back, on the first frame.
+    tabs_restored: bool,
     /// Whether the terminal had the keyboard when a dialog opened, so it
     /// can have it back when the dialog closes.
     terminal_had_focus: bool,
@@ -382,15 +412,18 @@ impl SnekkieApp {
         SnekkieApp {
             network: NetworkAccess::new(settings.offline_mode, Arc::new(|_| {})),
             network_questions: Arc::new(Mutex::new(VecDeque::new())),
+            port_checks: Arc::new(Mutex::new(Vec::new())),
             sidebar: Sidebar::with_port_lister(&settings, list_ports),
             store,
             snippet_store,
             snippets: None,
+            tunnels_window: None,
             paste_preview: None,
             paste_queue: None,
             retired_log_workers: Vec::new(),
             settings_store,
             explorer_editor: Arc::new(Mutex::new(settings.explorer_editor.clone())),
+            user_rules: UserRules::compile(&settings.highlight_rules),
             settings,
             tabs: Vec::new(),
             explorers: Vec::new(),
@@ -405,6 +438,7 @@ impl SnekkieApp {
             runtime,
             fonts: Fonts::new(),
             host_keys: Arc::new(Mutex::new(VecDeque::new())),
+            prompt_questions: Arc::new(Mutex::new(VecDeque::new())),
             dialogs: Vec::new(),
             preferences: None,
             flash: None,
@@ -415,11 +449,13 @@ impl SnekkieApp {
             // the style.
             accent: Color32::TRANSPARENT,
             styled_theme: None,
+            space: Default::default(),
             dragging_tab: None,
             tab_drag_target: None,
             tab_dropped: None,
             workspace_area: None,
             last_shown: None,
+            tabs_restored: false,
             terminal_had_focus: false,
             updater: Updater::new(),
             agents: None,
@@ -489,6 +525,41 @@ impl SnekkieApp {
             Some(WorkspaceTabId::Session(id)) => self.tab_index(id),
             _ => None,
         }
+    }
+
+    /// What a session's tab says: the title the far end set, if the user
+    /// chose that and the tab is still connected, or else the device's
+    /// hostname (serial and unsaved tabs) or the profile name.
+    fn tab_label(&self, tab: &Tab) -> String {
+        let closed = matches!(tab.session.state(), State::Closed(_));
+        let remote = self.settings.remote_titles && !closed;
+        let host = tab.prompt.as_ref().filter(|_| self.names_from_prompt(tab)).map(|p| match closed {
+            true => format!("{} (closed)", p.host),
+            false => p.host.clone(),
+        });
+        remote
+            .then(|| tab.session.shared.emulator.lock().remote_title())
+            .flatten()
+            .map(|title| title.trim().chars().filter(|c| !c.is_control()).take(48).collect::<String>())
+            .filter(|title| !title.is_empty())
+            .or(host)
+            .unwrap_or_else(|| tab.session.title())
+    }
+
+    /// Serial tabs and unsaved sessions take their name from the device
+    /// prompt; saved sessions keep the name the user gave them.
+    fn names_from_prompt(&self, tab: &Tab) -> bool {
+        let profile = &tab.session.profile;
+        profile.kind() == Kind::Serial
+            || self.store.get(&profile.name).is_none_or(|saved| !same_destination(saved, profile))
+    }
+
+    /// The New session form, filled in with a host clicked in the output.
+    /// Nothing connects until the user does.
+    fn new_session_to(&mut self, ctx: &egui::Context, host: String) {
+        self.run_command(ctx, Command::NewSession);
+        let profile = Profile { host, ..self.sidebar.draft.clone() };
+        self.sidebar.load(profile);
     }
 
     fn tab_index(&self, id: u64) -> Option<usize> {
@@ -716,6 +787,95 @@ impl SnekkieApp {
         }
     }
 
+    /// Note the saved-session tabs for next time, or forget them when the
+    /// user doesn't want them back. Ad-hoc tabs and the game are left out.
+    fn remember_tabs(&mut self) {
+        let mut last = LastTabs::default();
+        if self.settings.restore_tabs {
+            let explorers = std::mem::take(&mut self.explorers);
+            for explorer in &explorers {
+                self.remember_folders(explorer);
+            }
+            self.explorers = explorers;
+            let mut kept = Vec::new();
+            for id in self.workspace_order() {
+                let profile = match id {
+                    WorkspaceTabId::Session(s) => self.tab_index(s).map(|i| (&self.tabs[i].session.profile, false)),
+                    WorkspaceTabId::Explorer(e) => {
+                        self.explorers.iter().find(|t| t.id == e).map(|t| (&t.profile, true))
+                    }
+                    WorkspaceTabId::Invade => None,
+                };
+                let saved = |p: &Profile| self.store.get(&p.name).is_some_and(|saved| same_destination(saved, p));
+                if let Some((profile, explorer)) = profile.filter(|(p, _)| saved(p)) {
+                    kept.push(id);
+                    last.tabs.push(LastTab { profile: profile.name.clone(), explorer });
+                }
+            }
+            let index = |id: &WorkspaceTabId| kept.iter().position(|t| t == id);
+            last.active = self.active.as_ref().and_then(index);
+            if let Some(split) = &self.split {
+                let rows: Vec<Vec<_>> =
+                    split.rows().iter().map(|column| column.iter().filter_map(index).collect()).collect();
+                last.split = TabLayout::from_rows(&rows).map(|split| split.rows()).unwrap_or_default();
+            }
+        }
+        if self.settings.last_tabs != last {
+            self.settings.last_tabs = last;
+            self.save_settings();
+        }
+    }
+
+    /// Put back the tabs from last time, disconnected: nothing dials until
+    /// the user chooses Reconnect. Profiles deleted since are skipped.
+    fn restore_tabs(&mut self, ctx: &egui::Context) {
+        let last = self.settings.last_tabs.clone();
+        let mut ids = Vec::new();
+        for entry in &last.tabs {
+            let Some(profile) = self.store.get(&entry.profile).cloned() else {
+                ids.push(None);
+                continue;
+            };
+            let id = if entry.explorer {
+                let id = crate::session::next_tab_id();
+                // Never answered: the tab starts closed and connects on Reconnect.
+                let (_, connection) = tokio::sync::oneshot::channel();
+                let mut tab = ExplorerTab::new(id, profile, connection, None, self.explorer_context(ctx));
+                tab.shutdown("Reopened from last time. Choose Reconnect to connect.");
+                tab.slot = self.workspace_order().len();
+                self.explorers.push(tab);
+                WorkspaceTabId::Explorer(id)
+            } else {
+                let repaint = {
+                    let ctx = ctx.clone();
+                    move || ctx.request_repaint()
+                };
+                let session = Session::new(profile, self.settings.colors(), repaint);
+                session.set_auto_paging(self.settings.auto_paging);
+                session.shutdown();
+                let color = crate::settings::parse_hex(&session.profile.tab_color);
+                let id = session.id;
+                self.tabs.push(Tab {
+                    session,
+                    view: TerminalView::default(),
+                    color,
+                    color_override: false,
+                    bell: false,
+                    waiting: None,
+                    prompt: None,
+                });
+                WorkspaceTabId::Session(id)
+            };
+            ids.push(Some(id));
+        }
+        let id = |index: &usize| ids.get(*index).copied().flatten();
+        let rows: Vec<Vec<_>> = last.split.iter().map(|column| column.iter().filter_map(id).collect()).collect();
+        self.split = TabLayout::from_rows(&rows);
+        if let Some(active) = last.active.as_ref().and_then(id).or_else(|| ids.iter().flatten().next().copied()) {
+            self.select_workspace_tab(active);
+        }
+    }
+
     /// Reopen at these folders next time, if this is a saved session.
     fn remember_folders(&mut self, tab: &ExplorerTab) {
         let (local, remote) = tab.folders();
@@ -775,6 +935,9 @@ impl SnekkieApp {
         };
         let connection = explorer::shared_connection(self.runtime.handle(), shared);
         self.add_explorer(ctx, profile, connection, None);
+        if let Some(explorer) = self.explorers.last_mut() {
+            explorer.session = Some(id);
+        }
     }
 
     /// The active stores an export must never overwrite.
@@ -817,6 +980,15 @@ impl SnekkieApp {
 
     fn host_key_asker(&self, ctx: &egui::Context) -> HostKeyAsker {
         let queue = self.host_keys.clone();
+        let ctx = ctx.clone();
+        Arc::new(move |question| {
+            queue.lock().push_back(question);
+            ctx.request_repaint();
+        })
+    }
+
+    fn prompt_asker(&self, ctx: &egui::Context) -> PromptAsker {
+        let queue = self.prompt_questions.clone();
         let ctx = ctx.clone();
         Arc::new(move |question| {
             queue.lock().push_back(question);
@@ -918,6 +1090,14 @@ impl SnekkieApp {
 
     /// Collect anything we deliberately don't store, then connect.
     fn request_connect(&mut self, ctx: &egui::Context, profile: Profile, target: Target) {
+        let jumps = if profile.kind().is_ssh() {
+            match profiles::jump_chain(&profile, &self.store.profiles) {
+                Ok(jumps) => jumps,
+                Err(e) => return self.message("Jump host", e),
+            }
+        } else {
+            Vec::new()
+        };
         if profile.kind().is_ssh() {
             match profile.auth() {
                 Auth::Password => {
@@ -928,7 +1108,7 @@ impl SnekkieApp {
                         label,
                         "",
                         true,
-                        InputAction::Password(Box::new(PendingConnect { profile, target })),
+                        InputAction::Password(Box::new(PendingConnect { profile, target, jumps })),
                     );
                     return;
                 }
@@ -942,7 +1122,7 @@ impl SnekkieApp {
                             label,
                             "",
                             true,
-                            InputAction::Passphrase(Box::new(PendingConnect { profile, target })),
+                            InputAction::Passphrase(Box::new(PendingConnect { profile, target, jumps })),
                         );
                         return;
                     }
@@ -950,7 +1130,7 @@ impl SnekkieApp {
                 _ => {}
             }
         }
-        self.start_connect(ctx, PendingConnect { profile, target }, String::new(), String::new());
+        self.start_connect(ctx, PendingConnect { profile, target, jumps }, String::new(), String::new());
     }
 
     fn start_connect(
@@ -960,7 +1140,12 @@ impl SnekkieApp {
         password: String,
         key_passphrase: String,
     ) {
-        if let Target::Reconnect(id) = pending.target
+        if let Target::Reconnect(id) | Target::AgentReconnect(id) = pending.target
+            && let Some(index) = self.tab_index(id)
+        {
+            self.tabs[index].waiting = None;
+        }
+        if let Target::Reconnect(id) | Target::AgentReconnect(id) = pending.target
             && self.paste_queue.as_ref().is_some_and(|q| q.target.id == id)
         {
             self.paste_queue = None;
@@ -969,16 +1154,11 @@ impl SnekkieApp {
         let cx = ConnectContext {
             runtime: self.runtime.handle(),
             ask_host_key: self.host_key_asker(ctx),
+            ask_prompts: Some(self.prompt_asker(ctx)),
+            jumps: pending.jumps.clone(),
             password,
             key_passphrase,
-            network: {
-                let queue = self.network_questions.clone();
-                let ctx = ctx.clone();
-                self.network.with_asker(Arc::new(move |question| {
-                    queue.lock().push_back(question);
-                    ctx.request_repaint();
-                }))
-            },
+            network: self.network_access(ctx),
         };
         // A session of its own for the explorer, whichever way it came to need one.
         let explorer = match pending.target {
@@ -992,6 +1172,8 @@ impl SnekkieApp {
                 password: cx.password,
                 key_passphrase: cx.key_passphrase,
                 known_hosts: ssh::known_hosts_path(),
+                ask_prompts: cx.ask_prompts,
+                jumps: cx.jumps,
             };
             let connection = ssh::connect(
                 self.runtime.handle(),
@@ -1026,10 +1208,18 @@ impl SnekkieApp {
                 view.focus();
                 let color = crate::settings::parse_hex(&session.profile.tab_color);
                 let id = session.id;
-                self.tabs.push(Tab { session, view, color, color_override: false });
+                self.tabs.push(Tab {
+                    session,
+                    view,
+                    color,
+                    color_override: false,
+                    bell: false,
+                    waiting: None,
+                    prompt: None,
+                });
                 self.select_workspace_tab(WorkspaceTabId::Session(id));
             }
-            Target::Reconnect(id) => {
+            Target::Reconnect(id) | Target::AgentReconnect(id) => {
                 let Some(index) = self.tab_index(id) else { return };
                 let tab = &mut self.tabs[index];
                 tab.session.shutdown();
@@ -1038,8 +1228,41 @@ impl SnekkieApp {
                 tab.view.clear_highlight_cache();
                 tab.view.reset_animations();
                 tab.session.connect(cx);
-                self.select_workspace_tab(WorkspaceTabId::Session(id));
+                if pending.target == Target::Reconnect(id) {
+                    self.select_workspace_tab(WorkspaceTabId::Session(id));
+                }
             }
+        }
+    }
+
+    /// Sessions whose reconnect waits for the user to type a password or passphrase.
+    fn sessions_asking_user(&self) -> Vec<u64> {
+        self.dialogs
+            .iter()
+            .filter_map(|dialog| match dialog {
+                Dialog::Input { action: InputAction::Password(pending) | InputAction::Passphrase(pending), .. } => {
+                    match pending.target {
+                        Target::Reconnect(id) | Target::AgentReconnect(id) => Some(id),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn handle_agent_reconnects(&mut self, ctx: &egui::Context) {
+        let requests = self.agents.as_ref().map(|agents| agents.take_reconnects()).unwrap_or_default();
+        for (id, agent) in requests {
+            let Some(index) = self.tab_index(id) else { continue };
+            let session = &self.tabs[index].session;
+            // It may have changed since the agent asked, or already be asking the user.
+            if !matches!(session.state(), State::Closed(Some(_))) || self.sessions_asking_user().contains(&id) {
+                continue;
+            }
+            let profile = session.profile.clone();
+            self.flash(ctx, format!("{agent} is reconnecting {}.", profile.name));
+            self.request_connect(ctx, profile, Target::AgentReconnect(id));
         }
     }
 
@@ -1141,14 +1364,7 @@ impl SnekkieApp {
                     tab.view.open_search(selected.filter(|t| !t.contains('\n') && t.chars().count() <= 200));
                 }
             }
-            Command::Snippets => {
-                let target = self.current().filter(|t| t.session.is_connected()).map(|t| SnippetTarget {
-                    id: t.session.id,
-                    generation: t.session.connection_generation(),
-                    description: format!("{} — {}", t.session.title(), t.session.description()),
-                });
-                self.snippets = Some(SnippetWindow::new(target));
-            }
+            Command::Snippets => self.snippets = Some(SnippetWindow::new(self.snippet_target())),
             Command::ClearScreen => {
                 if let Some(tab) = self.current_mut() {
                     tab.session.shared.emulator.lock().clear();
@@ -1181,6 +1397,10 @@ impl SnekkieApp {
                     self.save_settings();
                 }
             }
+            Command::ToggleButtonBar => {
+                self.settings.button_bar = !self.settings.button_bar;
+                self.save_settings();
+            }
             Command::ToggleAutoPaging => {
                 self.settings.auto_paging = !self.settings.auto_paging;
                 for tab in &self.tabs {
@@ -1190,6 +1410,9 @@ impl SnekkieApp {
             }
             Command::Preferences => self.preferences = Some(Preferences::new(&self.settings)),
             Command::ImportPutty => self.dialogs.push(Dialog::Import(Box::new(PuttyImport::new(&self.settings)))),
+            Command::ImportOpenSsh => {
+                self.dialogs.push(Dialog::Import(Box::new(PuttyImport::openssh(ctx, &self.settings))));
+            }
             Command::ImportProfiles => {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title("Import Snekkie profiles")
@@ -1374,8 +1597,124 @@ impl SnekkieApp {
 
     // -- per-frame plumbing ---------------------------------------------
 
+    /// Offline mode's policy, asking the user through a dialog.
+    fn network_access(&self, ctx: &egui::Context) -> NetworkAccess {
+        let queue = self.network_questions.clone();
+        let ctx = ctx.clone();
+        self.network.with_asker(Arc::new(move |question| {
+            queue.lock().push_back(question);
+            ctx.request_repaint();
+        }))
+    }
+
+    /// One TCP connect to a saved session's port, off the UI thread.
+    fn check_port(&mut self, ctx: &egui::Context, profile: &Profile) {
+        let (host, port) = (profile.host.trim().to_string(), profile.port);
+        self.flash(ctx, format!("Checking {host}:{port}…"));
+        let access = self.network_access(ctx);
+        let results = self.port_checks.clone();
+        let ctx = ctx.clone();
+        self.runtime.spawn(async move {
+            let check = crate::transport::check_port(&host, port, std::time::Duration::from_secs(3), &access).await;
+            results.lock().push(check.describe(&host, port));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Check the tab's port in the background and reconnect once it accepts.
+    fn wait_for_host(&mut self, ctx: &egui::Context, id: u64) {
+        let Some(index) = self.tab_index(id) else { return };
+        let profile = &self.tabs[index].session.profile;
+        let (host, port) = (profile.host.trim().to_string(), profile.port);
+        // Offline approval is per connection, so each check would ask again.
+        if self.settings.offline_mode && !crate::transport::is_local_destination(&host) {
+            self.message(
+                "Reconnect when back",
+                format!(
+                    "Offline mode is on. Waiting only works for private or local IP addresses, because every \
+                     check of {host} would need your approval. Reconnect by hand instead."
+                ),
+            );
+            return;
+        }
+        let (mut reply, answer) = tokio::sync::oneshot::channel();
+        // Never asks: in offline mode only local addresses get this far.
+        let access = self.network.with_asker(Arc::new(|_| {}));
+        let ctx = ctx.clone();
+        self.runtime.spawn(async move {
+            let (first, give_up) = (std::time::Duration::from_secs(5), std::time::Duration::from_secs(30 * 60));
+            tokio::select! {
+                back = crate::transport::wait_for_port(&host, port, &access, first, give_up) => {
+                    let _ = reply.send(back);
+                    ctx.request_repaint();
+                }
+                // Stopped, reconnected by hand or the tab closed.
+                () = reply.closed() => {}
+            }
+        });
+        self.tabs[index].waiting = Some(answer);
+    }
+
+    fn poll_waiting(&mut self, ctx: &egui::Context) {
+        let mut done = Vec::new();
+        for tab in &mut self.tabs {
+            let Some(answer) = &mut tab.waiting else { continue };
+            match answer.try_recv() {
+                Ok(back) => done.push((tab.session.id, tab.session.profile.clone(), back)),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => continue,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+            }
+            tab.waiting = None;
+        }
+        for (id, profile, back) in done {
+            if back {
+                self.flash(ctx, format!("{} is accepting connections again. Reconnecting.", profile.name));
+                self.request_connect(ctx, profile, Target::Reconnect(id));
+            } else {
+                let text = format!(
+                    "Stopped waiting: {}:{} did not accept connections within 30 minutes.",
+                    profile.host, profile.port
+                );
+                self.message(&profile.name, text);
+            }
+        }
+    }
+
+    /// Bells mark tabs out of sight until they're shown; OSC 52 clipboard
+    /// writes go through only when the user allowed them.
+    fn poll_remote_events(&mut self, ctx: &egui::Context) {
+        if self.user_rules.source != self.settings.highlight_rules {
+            self.user_rules = UserRules::compile(&self.settings.highlight_rules);
+        }
+        let shown: Vec<WorkspaceTabId> = match self.visible_split() {
+            Some(split) => split.tabs(),
+            None => self.active.into_iter().collect(),
+        };
+        let mut remote_copied = None;
+        for tab in &mut self.tabs {
+            let emulator = tab.session.shared.emulator.lock();
+            let rang = emulator.take_bell();
+            let copied = emulator.take_clipboard();
+            if let Some(prompt) = parse_prompt(&emulator.cursor_line_text()) {
+                tab.prompt = Some(prompt);
+            }
+            drop(emulator);
+            tab.bell = (tab.bell || rang) && !shown.contains(&WorkspaceTabId::Session(tab.session.id));
+            if let Some(text) = copied.filter(|_| self.settings.remote_clipboard) {
+                ctx.copy_text(text);
+                remote_copied = Some(tab.session.profile.name.clone());
+            }
+        }
+        if let Some(name) = remote_copied {
+            self.flash(ctx, format!("{name} set the clipboard (OSC 52)"));
+        }
+    }
+
     fn poll_background(&mut self, ctx: &egui::Context) {
         self.fonts.poll(ctx);
+        if !std::mem::replace(&mut self.tabs_restored, true) && self.settings.restore_tabs {
+            self.restore_tabs(ctx);
+        }
         if let Some(receiver) = &self.folder_open {
             match receiver.try_recv() {
                 Ok(result) => {
@@ -1400,6 +1739,12 @@ impl SnekkieApp {
         // A host key question whose connection gave up (tab closed, timed
         // out) has nobody left to answer.
         self.dialogs.retain(|d| !matches!(d, Dialog::HostKey(q) if q.reply.is_closed()));
+        let prompts: Vec<PromptQuestion> = self.prompt_questions.lock().drain(..).collect();
+        self.dialogs.extend(prompts.into_iter().map(|q| {
+            let answers = vec![String::new(); q.prompts.len()];
+            Dialog::Prompts(Box::new(q), answers, true)
+        }));
+        self.dialogs.retain(|d| !matches!(d, Dialog::Prompts(q, ..) if q.reply.is_closed()));
         let network_questions: Vec<_> = self.network_questions.lock().drain(..).collect();
         self.dialogs.extend(network_questions.into_iter().map(|q| Dialog::Network(Box::new(q))));
         self.dialogs.retain(|d| !matches!(d, Dialog::Network(q) if q.reply.is_closed()));
@@ -1407,6 +1752,12 @@ impl SnekkieApp {
         let mut notices = Vec::new();
         for tab in &mut self.explorers {
             tab.poll(ctx);
+        }
+        self.poll_remote_events(ctx);
+        self.poll_waiting(ctx);
+        let checks: Vec<String> = self.port_checks.lock().drain(..).collect();
+        for check in checks {
+            self.flash(ctx, check);
         }
         for tab in &self.tabs {
             if tab.session.poll_transfer() {
@@ -1496,10 +1847,13 @@ impl SnekkieApp {
                 }
             }
         }
+        self.handle_agent_reconnects(ctx);
+        let asking = self.sessions_asking_user();
         let Some(agents) = &self.agents else {
             self.agent_activity = Default::default();
             return;
         };
+        agents.sync_asking(asking);
         let sessions: Vec<&Session> = self.tabs.iter().map(|tab| &tab.session).collect();
         agents.sync_files(self.settings.agent_file_access, self.explorers.iter().map(ExplorerTab::agent_entry));
         agents.sync(self.active_index().map(|index| self.tabs[index].session.id), &sessions);
@@ -1654,6 +2008,8 @@ impl SnekkieApp {
             egui::Popup::menu(&view).show(|ui| {
                 let label = if self.settings.show_sidebar { "✔ Sidebar" } else { "   Sidebar" };
                 item(ui, label, "Ctrl+B", Command::ToggleSidebar);
+                let label = if self.settings.button_bar { "✔ Button bar" } else { "   Button bar" };
+                item(ui, label, "", Command::ToggleButtonBar);
                 ui.separator();
                 item(ui, "Next tab", "Ctrl+Tab", Command::NextTab);
                 item(ui, "Previous tab", "Ctrl+Shift+Tab", Command::PreviousTab);
@@ -1664,6 +2020,7 @@ impl SnekkieApp {
                 ui.menu_button("Import", |ui| {
                     item(ui, "Snekkie profiles (.json)…", "", Command::ImportProfiles);
                     item(ui, "PuTTY sessions…", "", Command::ImportPutty);
+                    item(ui, "OpenSSH config (~/.ssh/config)…", "", Command::ImportOpenSsh);
                 });
                 item(ui, "Export profiles…", "", Command::ExportProfiles);
             });
@@ -1736,12 +2093,42 @@ impl SnekkieApp {
                 ui.separator();
             }
             ui.label(RichText::new(text).color(style::secondary(ui)));
+            let mut stop_waiting = None;
+            let mut show_tunnels = None;
             if let Some(tab) = self.current() {
                 if let Some((direction, local, progress)) = tab.session.transfer_progress() {
                     ui.separator();
                     ui.label(transfer_status(direction, &local, progress.bytes()));
                     if ui.button("Cancel transfer").clicked() {
                         progress.cancel();
+                    }
+                }
+                let tunnels = tab.session.tunnels();
+                if !tunnels.is_empty() {
+                    ui.separator();
+                    let up = tunnels.iter().filter(|t| t.state == TunnelState::Listening).count();
+                    let text = RichText::new(format!("Tunnels {up}/{}", tunnels.len()));
+                    let failed = tunnels.iter().any(|t| matches!(t.state, TunnelState::Failed(_)));
+                    let text = if failed { text.color(ui.visuals().error_fg_color) } else { text };
+                    if ui.button(text).on_hover_text("Show this tab's SSH tunnels").clicked() {
+                        show_tunnels = Some(tab.session.id);
+                    }
+                }
+                if let Some(mode) = tab.prompt.as_ref().and_then(|p| p.mode).filter(|_| tab.session.is_connected()) {
+                    ui.separator();
+                    let label = RichText::new(mode.label());
+                    let label = if mode == CliMode::Config {
+                        label.strong().color(Color32::BLACK).background_color(ui.visuals().warn_fg_color)
+                    } else {
+                        label.color(style::secondary(ui))
+                    };
+                    ui.label(label).on_hover_text("CLI mode from the device prompt");
+                }
+                if tab.waiting.is_some() {
+                    ui.separator();
+                    ui.label("Waiting for host…").on_hover_text("Reconnects when the port accepts connections again.");
+                    if ui.button("Stop waiting").clicked() {
+                        stop_waiting = Some(tab.session.id);
                     }
                 }
                 ui.separator();
@@ -1774,6 +2161,12 @@ impl SnekkieApp {
                 {
                     self.request_open_log_folder(ui.ctx(), tab.session.log_path());
                 }
+            }
+            if let Some(index) = stop_waiting.and_then(|id| self.tab_index(id)) {
+                self.tabs[index].waiting = None;
+            }
+            if show_tunnels.is_some() {
+                self.tunnels_window = show_tunnels;
             }
             if let Some((flash, _)) = &self.flash {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1852,6 +2245,7 @@ impl SnekkieApp {
                         self.save_profile_metadata(profile);
                     }
                 }
+                sidebar::Action::CheckPort(profile) => self.check_port(&ctx, &profile),
                 sidebar::Action::ProfileColor(name) => {
                     if let Some(profile) = self.store.get(&name) {
                         self.dialogs.push(Dialog::ProfileColor {
@@ -1947,6 +2341,12 @@ impl SnekkieApp {
     }
 
     fn tab_strip(&mut self, ui: &mut Ui) -> Option<(WorkspaceTabId, TabAction)> {
+        // Once its session closes, an explorer keeps the color it last had.
+        for explorer in &mut self.explorers {
+            if let Some(tab) = self.tabs.iter().find(|tab| Some(tab.session.id) == explorer.session) {
+                explorer.color = tab.color;
+            }
+        }
         let mut action = None;
         let order = self.workspace_order();
         let mut rects = Vec::with_capacity(order.len());
@@ -1966,7 +2366,7 @@ impl SnekkieApp {
                     if let WorkspaceTabId::Explorer(explorer_id) = entry {
                         let Some(tab) = self.explorers.iter().find(|e| e.id == explorer_id) else { continue };
                         let color = if selected { style::primary(ui) } else { style::secondary(ui) };
-                        let tint = crate::settings::parse_hex(&tab.profile.tab_color);
+                        let tint = tab.color;
                         let (connected, connecting) = tab.status();
                         let status = match (connected, connecting) {
                             (true, _) => "Connected",
@@ -2011,6 +2411,13 @@ impl SnekkieApp {
                             tab.profile.host
                         ));
                         let rect = response.rect;
+                        if let Some(color) = tint {
+                            let strip = egui::Rect::from_x_y_ranges(
+                                rect.left()..=rect.left() + 3.0,
+                                rect.top() + 2.0..=rect.bottom() - 2.0,
+                            );
+                            ui.painter().rect_filled(strip, 1.0, color);
+                        }
                         if let Some(cue) = self.agent_cue(explorer_id) {
                             let motion = self.agent_motion(ui.ctx());
                             ui.painter()
@@ -2129,6 +2536,7 @@ impl SnekkieApp {
                     let status = match state {
                         State::Connected => "Connected",
                         State::Connecting => "Connecting",
+                        State::Closed(_) if tab.waiting.is_some() => "Disconnected, waiting for host…",
                         State::Closed(_) => "Disconnected",
                     };
                     let id = tab.session.id;
@@ -2173,9 +2581,13 @@ impl SnekkieApp {
                                             egui::WidgetInfo::labeled(egui::WidgetType::Label, true, status)
                                         });
                                         ui.add(
-                                            egui::Label::new(RichText::new(tab.session.title()).color(color))
+                                            egui::Label::new(RichText::new(self.tab_label(tab)).color(color))
                                                 .selectable(false),
                                         );
+                                        if tab.bell {
+                                            ui.label(RichText::new("🔔").color(self.accent))
+                                                .on_hover_text("The bell rang in this tab");
+                                        }
                                         let close = ui.add(
                                             egui::Button::new(RichText::new("×").color(style::secondary(ui)))
                                                 .frame(false)
@@ -2188,8 +2600,9 @@ impl SnekkieApp {
                                 });
                         },
                     );
+                    let host = tab.prompt.as_ref().map_or_else(String::new, |p| format!("\nDevice: {}", p.host));
                     let response = inner.response.on_hover_text(format!(
-                        "{}\n{} — {status}",
+                        "{}\n{} — {status}{host}",
                         tab.session.title(),
                         tab.session.description()
                     ));
@@ -2235,6 +2648,21 @@ impl SnekkieApp {
                     response.context_menu(|ui| {
                         if ui.button("Reconnect").clicked() {
                             action = Some((entry, TabAction::Reconnect));
+                        }
+                        if matches!(tab.session.profile.kind(), Kind::Ssh | Kind::Telnet | Kind::Raw) {
+                            if tab.waiting.is_some() {
+                                if ui.button("Stop waiting for host").clicked() {
+                                    action = Some((entry, TabAction::StopWaiting));
+                                }
+                            } else if ui
+                                .add_enabled(matches!(state, State::Closed(_)), egui::Button::new("Reconnect when back"))
+                                .on_hover_text(
+                                    "Check the port until the host accepts connections (up to 30 minutes), then reconnect.",
+                                )
+                                .clicked()
+                            {
+                                action = Some((entry, TabAction::WaitForHost));
+                            }
                         }
                         if ui.button("Duplicate").clicked() {
                             action = Some((entry, TabAction::Duplicate));
@@ -2287,6 +2715,9 @@ impl SnekkieApp {
                             }
                             if ui.add_enabled(connected, egui::Button::new("Open file explorer beside")).clicked() {
                                 action = Some((entry, TabAction::OpenExplorerBeside));
+                            }
+                            if ui.button("Tunnels…").clicked() {
+                                action = Some((entry, TabAction::Tunnels));
                             }
                         }
                         split_menu(ui, entry, in_split, columns, &candidates, &mut action);
@@ -2384,6 +2815,13 @@ impl SnekkieApp {
                     remote: String::new(),
                     replace: false,
                 });
+            }
+            TabAction::WaitForHost => self.wait_for_host(ctx, id),
+            TabAction::Tunnels => self.tunnels_window = Some(id),
+            TabAction::StopWaiting => {
+                if let Some(index) = self.tab_index(id) {
+                    self.tabs[index].waiting = None;
+                }
             }
             TabAction::Reconnect | TabAction::Duplicate => {
                 if let Some(index) = self.tab_index(id) {
@@ -2502,11 +2940,49 @@ impl SnekkieApp {
         }
         // Keys still held after this frame remain quarantined until release.
         self.suppress_held_game_keys(&ctx);
+        if self.settings.button_bar && self.current().is_some() {
+            self.button_bar_ui(ui);
+        }
         if let Some(split) = self.visible_split().cloned() {
             self.split_ui(ui, &split);
         } else if let Some(active) = self.active {
             self.pane_ui(ui, active, true, true);
         }
+    }
+
+    /// Pinned snippets as buttons. A click opens the snippet's review page
+    /// for the current tab; nothing is sent from here.
+    fn button_bar_ui(&mut self, ui: &mut Ui) {
+        let mut clicked = None;
+        egui::ScrollArea::horizontal().id_salt("button_bar").auto_shrink([false, true]).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let pinned: Vec<_> = self.snippet_store.snippets.iter().filter(|s| s.pinned).collect();
+                if pinned.is_empty() {
+                    ui.label(
+                        RichText::new("No buttons yet. Edit a command snippet and tick “Show on button bar”.")
+                            .color(style::secondary(ui)),
+                    );
+                }
+                for snippet in pinned {
+                    if ui.button(&snippet.name).on_hover_text(snippet.group_label()).clicked() {
+                        clicked = Some(snippet.clone());
+                    }
+                }
+            });
+        });
+        ui.add_space(4.0);
+        if let Some(snippet) = clicked {
+            self.snippets = Some(SnippetWindow::review(self.snippet_target(), &snippet));
+        }
+    }
+
+    /// Where snippets opened now would go: the current tab, if connected.
+    fn snippet_target(&self) -> Option<SnippetTarget> {
+        self.current().filter(|t| t.session.is_connected()).map(|t| SnippetTarget {
+            id: t.session.id,
+            generation: t.session.connection_generation(),
+            description: format!("{} — {}", t.session.title(), t.session.description()),
+        })
     }
 
     /// What a tab picked up now would go beside: the other tab of its pair,
@@ -2759,6 +3235,7 @@ impl SnekkieApp {
             theme,
             syntax: &syntax,
             highlighting_intensity: self.settings.highlighting_intensity,
+            user_rules: &self.user_rules,
             regular,
             bold,
             keyboard,
@@ -2772,11 +3249,24 @@ impl SnekkieApp {
         } else {
             tab.view.show(ui, &tab.session, &options)
         };
+        if let Some((at, cells)) = out.fresh_text
+            && theme.effects.appearance() == crate::settings::AppAppearance::Space
+        {
+            self.space.text_landed(&ctx, at, cells);
+        }
         if let Some(cue) = agent_cue {
             agents::terminal(&ui.painter().with_clip_rect(area.expand(8.0)), area, cue, agent_motion);
         }
         if let Some(text) = out.copy {
             ctx.copy_text(text);
+        }
+        match out.open_link {
+            Some(Link::Url(_)) if self.settings.offline_mode => {
+                self.flash(&ctx, "Offline mode is on: links don't open in the browser.");
+            }
+            Some(Link::Url(url)) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+            Some(Link::Host(host)) => self.new_session_to(&ctx, host),
+            None => {}
         }
         // Pasting goes to the active tab, so nothing else may ask for it.
         if !focused {
@@ -3019,6 +3509,30 @@ impl SnekkieApp {
                         }
                     });
                 }
+                Dialog::Prompts(question, answers, focus) => {
+                    ui.heading(if question.name.trim().is_empty() { "Login" } else { question.name.trim() });
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&question.host).color(style::secondary(ui)));
+                    if !question.instructions.trim().is_empty() {
+                        ui.add(egui::Label::new(question.instructions.trim()).wrap());
+                    }
+                    for (index, ((prompt, echo), answer)) in question.prompts.iter().zip(answers).enumerate() {
+                        ui.label(prompt.trim());
+                        let edit = ui.add(TextEdit::singleline(answer).password(!echo).desired_width(f32::INFINITY));
+                        if index == 0 && std::mem::take(focus) {
+                            edit.request_focus();
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() || enter {
+                            result = Some(DialogResult::Yes);
+                        }
+                        if ui.button("Cancel").clicked() || escape {
+                            close = true;
+                        }
+                    });
+                }
                 Dialog::HostKey(question) => {
                     ui.heading("Unknown host key");
                     ui.add_space(6.0);
@@ -3029,7 +3543,11 @@ impl SnekkieApp {
                     };
                     ui.add(
                         egui::Label::new(format!(
-                            "The server at {host} presented a host key that is not in known_hosts."
+                            "{} {host} presented a host key that is not in known_hosts.",
+                            match &question.jump_host {
+                                Some(name) => format!("Jump host {name} at"),
+                                None => "The server at".into(),
+                            }
                         ))
                         .wrap(),
                     );
@@ -3087,7 +3605,8 @@ impl SnekkieApp {
                 }
             }
         });
-        if modal.should_close() && !matches!(self.dialogs.last(), Some(Dialog::HostKey(_))) {
+        // A stray click outside shouldn't reject a key or cancel a login.
+        if modal.should_close() && !matches!(self.dialogs.last(), Some(Dialog::HostKey(_) | Dialog::Prompts(..))) {
             close = true;
         }
 
@@ -3135,10 +3654,17 @@ impl SnekkieApp {
                 let selected = import.profiles();
                 let count = selected.len();
                 let original = self.store.profiles.clone();
-                self.store.profiles = crate::putty::merge(&original, selected);
+                if import.is_openssh() {
+                    self.store.profiles = crate::profiles::merge_import(&original, selected);
+                    self.store.profiles.sort_by_key(|p| p.name.to_lowercase());
+                } else {
+                    self.store.profiles = crate::putty::merge(&original, selected);
+                }
                 if let Err(e) = self.store.save() {
                     self.store.profiles = original;
-                    self.message("Import PuTTY sessions", format!("Could not save imported sessions: {e}"));
+                    self.message(import.title(), format!("Could not save imported sessions: {e}"));
+                } else if import.is_openssh() {
+                    self.flash(ctx, format!("Imported {count} OpenSSH host(s)."));
                 } else {
                     self.flash(ctx, format!("Imported {count} PuTTY session(s)."));
                 }
@@ -3156,6 +3682,9 @@ impl SnekkieApp {
             }
             (Dialog::HostKey(question), result) => {
                 let _ = question.reply.send(result == DialogResult::Yes);
+            }
+            (Dialog::Prompts(question, answers, _), result) => {
+                let _ = question.reply.send((result == DialogResult::Yes).then_some(answers));
             }
             (Dialog::Network(question), result) => {
                 let _ = question.reply.send(result == DialogResult::Yes);
@@ -3292,7 +3821,11 @@ impl SnekkieApp {
             preferences::Outcome::Cancel => self.preferences = None,
             preferences::Outcome::Save(settings) => {
                 let enabling_offline = settings.offline_mode && !self.settings.offline_mode;
-                self.settings = AppSettings { show_sidebar: self.settings.show_sidebar, ..*settings };
+                self.settings = AppSettings {
+                    show_sidebar: self.settings.show_sidebar,
+                    button_bar: self.settings.button_bar,
+                    ..*settings
+                };
                 self.network.set_offline(self.settings.offline_mode);
                 self.updater.set_offline(self.settings.offline_mode);
                 self.explorer_editor.lock().clone_from(&self.settings.explorer_editor);
@@ -3353,17 +3886,22 @@ impl SnekkieApp {
         };
         if self.settings.preview_multiline_paste && crate::paste::multiline(text) {
             self.paste_preview = Some(PastePreview::new(target, text, self.settings.paste_delay_ms));
-        } else if let Err(error) = self.start_paste(ctx, target, text, 0) {
+        } else if let Err(error) = self.start_paste(ctx, target, text, 0, true) {
             self.message("Paste", error);
         }
     }
 
+    /// `bracketable` is for clipboard pastes: when the far end has bracketed
+    /// paste on, the whole text goes as one wrapped block with no line delay,
+    /// since the shell or editor takes it in at once. Snippets are commands
+    /// meant to run line by line, so they are never bracketed.
     fn start_paste(
         &mut self,
         ctx: &egui::Context,
         target: PasteTarget,
         text: &str,
         delay_ms: u64,
+        bracketable: bool,
     ) -> Result<(), String> {
         if self.paste_queue.is_some() {
             return Err("A paste is already running. Stop it before starting another.".into());
@@ -3372,9 +3910,11 @@ impl SnekkieApp {
             return Err("The reviewed connection changed or closed. Review the commands again.".into());
         }
         let queue = PasteQueue::new(target, text, delay_ms, std::time::Instant::now());
-        if queue.total <= 1 || delay_ms == 0 {
-            let index = self.tab_index(queue.target.id).ok_or("The destination tab closed.")?;
-            if !self.tabs[index].session.write_reviewed(queue.target.generation, keys::encode_paste(text)) {
+        let index = self.tab_index(queue.target.id).ok_or("The destination tab closed.")?;
+        let bracketed = bracketable && self.tabs[index].session.shared.emulator.lock().bracketed_paste();
+        if bracketed || queue.total <= 1 || delay_ms == 0 {
+            let bytes = if bracketed { keys::encode_bracketed_paste(text) } else { keys::encode_paste(text) };
+            if !self.tabs[index].session.write_reviewed(queue.target.generation, bytes) {
                 return Err("The destination disconnected before the paste could be submitted.".into());
             }
             self.flash(ctx, format!("Paste submitted to {}", queue.target.description));
@@ -3429,7 +3969,8 @@ impl SnekkieApp {
         }
         match action {
             Some(PasteAction::Send) => {
-                if let Err(error) = self.start_paste(ctx, preview.target.clone(), &preview.text, preview.delay_ms) {
+                if let Err(error) = self.start_paste(ctx, preview.target.clone(), &preview.text, preview.delay_ms, true)
+                {
                     self.paste_preview = Some(preview);
                     self.message("Paste", error);
                 }
@@ -3449,9 +3990,54 @@ impl SnekkieApp {
         if !text.ends_with(['\r', '\n']) {
             text.push('\n');
         }
-        self.start_paste(ctx, target.clone(), &text, self.settings.paste_delay_ms)?;
+        self.start_paste(ctx, target.clone(), &text, self.settings.paste_delay_ms, false)?;
         self.select_workspace_tab(WorkspaceTabId::Session(target.id));
         Ok(())
+    }
+
+    /// A tab's SSH tunnels and what each is doing.
+    fn tunnels_window_ui(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.tunnels_window.and_then(|id| self.tab_index(id)) else {
+            self.tunnels_window = None;
+            return;
+        };
+        let session = &self.tabs[index].session;
+        let rows = session.tunnels();
+        let mut open = true;
+        egui::Window::new(format!("Tunnels — {}", session.profile.name))
+            .id(Id::new("tunnels_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if rows.is_empty() {
+                    ui.label(if session.profile.tunnels.is_empty() {
+                        "This session has no tunnels. Add them under Tunnels on its Advanced page."
+                    } else {
+                        "Tunnels start once the session is connected."
+                    });
+                }
+                egui::Grid::new("tunnel_rows").striped(true).num_columns(3).show(ui, |ui| {
+                    for row in &rows {
+                        let label = ui.label(&row.label);
+                        if !row.last_error.is_empty() {
+                            label.on_hover_text(format!("Last connection failed: {}", row.last_error));
+                        }
+                        match &row.state {
+                            TunnelState::Starting => ui.label("starting"),
+                            TunnelState::Listening => ui.label("listening"),
+                            TunnelState::Failed(reason) => {
+                                ui.label(RichText::new(format!("error: {reason}")).color(ui.visuals().error_fg_color))
+                            }
+                        };
+                        ui.label(format!("{} connection(s)", row.connections));
+                        ui.end_row();
+                    }
+                });
+            });
+        if !open {
+            self.tunnels_window = None;
+        }
     }
 
     fn snippets_ui(&mut self, ctx: &egui::Context, blocked: bool) {
@@ -3581,6 +4167,11 @@ impl SnekkieApp {
         self.suppress_held_game_keys(&ctx);
         let mut commands = if modal_open { Vec::new() } else { self.shortcuts(&ctx) };
 
+        let theme = self.settings.colors();
+        if theme.effects.appearance() == crate::settings::AppAppearance::Space {
+            // First, so every panel draws over it.
+            self.space.ui(ui, &theme, &self.settings.animations);
+        }
         egui::Panel::top("menu")
             .frame(Frame::new().fill(ui.visuals().panel_fill).inner_margin(Margin::symmetric(10, 5)))
             .show(ui, |ui| commands.extend(self.menu_bar(ui)));
@@ -3629,6 +4220,7 @@ impl SnekkieApp {
         let dialog_open = !self.dialogs.is_empty();
         self.preferences_ui(&ctx, dialog_open);
         self.snippets_ui(&ctx, dialog_open);
+        self.tunnels_window_ui(&ctx);
         self.paste_ui(&ctx, dialog_open);
         self.dialogs_ui(&ctx);
         // Process Stop, close and reconnect before considering the next line.
@@ -3672,6 +4264,11 @@ impl SnekkieApp {
 
     /// Every tab's title in strip order; the game's is "Invade".
     #[doc(hidden)]
+    #[doc(hidden)]
+    pub fn explorer_colors(&self) -> Vec<Option<Color32>> {
+        self.explorers.iter().map(|tab| tab.color).collect()
+    }
+
     /// The titles of the tabs showing together, by column and then from the top.
     #[doc(hidden)]
     pub fn split_titles(&self) -> Option<Vec<Vec<String>>> {
@@ -3760,9 +4357,10 @@ impl SnekkieApp {
                 }
                 Dialog::Input { label, .. } => label.clone(),
                 Dialog::HostKey(q) => q.fingerprint.clone(),
+                Dialog::Prompts(q, ..) => q.prompts.iter().map(|(p, _)| p.trim()).collect::<Vec<_>>().join(" "),
                 Dialog::Network(q) => q.text(),
                 Dialog::Update { release, .. } => update_summary(release),
-                Dialog::Import(_) => "Import PuTTY sessions".into(),
+                Dialog::Import(import) => import.title().into(),
                 Dialog::ProfileTransfer(transfer) => {
                     if transfer.is_export() {
                         "Export profiles".into()
@@ -3800,6 +4398,13 @@ impl SnekkieApp {
         let mut import = PuttyImport::new(&self.settings);
         import.set_batch(batch);
         self.dialogs.push(Dialog::Import(Box::new(import)));
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn preview_openssh_config(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let batch = crate::ssh_config::read(path, &self.settings)?;
+        self.dialogs.push(Dialog::Import(Box::new(PuttyImport::openssh_batch(&self.settings, batch))));
         Ok(())
     }
 
@@ -3878,6 +4483,9 @@ enum TabAction {
     Pause,
     Build,
     Reconnect,
+    /// Wait for the host to accept connections again, then reconnect.
+    WaitForHost,
+    StopWaiting,
     Duplicate,
     Color(Option<Color32>),
     CustomColor,
@@ -3886,6 +4494,7 @@ enum TabAction {
     Transfer(Direction),
     OpenExplorer,
     OpenExplorerBeside,
+    Tunnels,
     /// Show this tab on the left and the named tab on the right.
     ShowBeside(WorkspaceTabId),
     EndSplit,
@@ -4040,6 +4649,7 @@ impl eframe::App for SnekkieApp {
             }
         }
         self.agents = None;
+        self.remember_tabs();
         self.shutdown();
         for tab in &self.tabs {
             tab.session.finish_logs();
@@ -4129,7 +4739,15 @@ mod tests {
         app.sidebar.load(profile.clone());
         for (host, color_override) in [("192.0.2.1", false), ("192.0.2.1", true), ("192.0.2.2", false)] {
             let session = Session::new(Profile { host: host.into(), ..profile.clone() }, app.settings.colors(), || {});
-            app.tabs.push(Tab { session, view: TerminalView::default(), color: None, color_override });
+            app.tabs.push(Tab {
+                session,
+                view: TerminalView::default(),
+                color: None,
+                color_override,
+                bell: false,
+                waiting: None,
+                prompt: None,
+            });
         }
         let updated = Profile { favorite: true, tab_color: "#abcdef".into(), ..profile };
         app.save_profile_metadata(updated.clone());
@@ -4280,6 +4898,109 @@ mod tests {
     }
 
     #[test]
+    fn device_prompt_names_serial_and_unsaved_tabs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = SnekkieApp::with_port_lister(paths, Vec::new);
+        let ctx = egui::Context::default();
+        let saved = Profile { name: "Saved".into(), host: "192.0.2.1".into(), ..Default::default() };
+        app.store.put(saved.clone()).unwrap();
+        let serial = Profile { name: "Console".into(), kind: "serial".into(), device: "COM9".into(), ..saved.clone() };
+        let adhoc = Profile { name: "192.0.2.9".into(), host: "192.0.2.9".into(), ..saved.clone() };
+        for profile in [saved, serial, adhoc] {
+            app.tabs.push(Tab {
+                session: Session::new(profile, app.settings.colors(), || {}),
+                view: TerminalView::default(),
+                color: None,
+                color_override: false,
+                bell: false,
+                waiting: None,
+                prompt: None,
+            });
+        }
+        for tab in &app.tabs {
+            tab.session.shared.emulator.lock().feed(b"banner\r\nSW1(config-if)#");
+        }
+        app.poll_remote_events(&ctx);
+        let labels: Vec<_> = app.tabs.iter().map(|tab| app.tab_label(tab)).collect();
+        assert_eq!(labels, ["Saved", "SW1", "SW1"]);
+        assert_eq!(app.tabs[0].prompt.as_ref().unwrap().mode, Some(CliMode::Config));
+        // Typing after the prompt keeps the last one seen.
+        app.tabs[1].session.shared.emulator.lock().feed(b"end");
+        app.poll_remote_events(&ctx);
+        assert_eq!(app.tabs[1].prompt.as_ref().unwrap().host, "SW1");
+    }
+
+    #[test]
+    fn saved_tabs_and_their_split_come_back_disconnected() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = || Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = SnekkieApp::with_port_lister(paths(), Vec::new);
+        let ctx = egui::Context::default();
+        let profile = |name: &str| Profile { name: name.into(), host: "192.0.2.1".into(), ..Default::default() };
+        for name in ["A", "B"] {
+            app.store.put(profile(name)).unwrap();
+        }
+        app.store.put(Profile { kind: "sftp".into(), ..profile("Files") }).unwrap();
+        for p in [profile("A"), profile("Ad hoc"), profile("B")] {
+            app.tabs.push(Tab {
+                session: Session::new(p, app.settings.colors(), || {}),
+                view: TerminalView::default(),
+                color: None,
+                color_override: false,
+                bell: false,
+                waiting: None,
+                prompt: None,
+            });
+        }
+        let (_, connection) = tokio::sync::oneshot::channel();
+        let files = app.store.get("Files").cloned().unwrap();
+        let mut explorer = ExplorerTab::new(99, files, connection, None, app.explorer_context(&ctx));
+        explorer.slot = 3;
+        app.explorers.push(explorer);
+        let a = WorkspaceTabId::Session(app.tabs[0].session.id);
+        app.split = Some(TabLayout::pair(a, WorkspaceTabId::Explorer(99)));
+        app.active = Some(WorkspaceTabId::Explorer(99));
+
+        // Off: nothing is kept.
+        app.remember_tabs();
+        assert_eq!(app.settings.last_tabs, LastTabs::default());
+        app.settings.restore_tabs = true;
+        app.remember_tabs();
+        let names: Vec<_> = app.settings.last_tabs.tabs.iter().map(|t| (t.profile.as_str(), t.explorer)).collect();
+        assert_eq!(names, [("A", false), ("B", false), ("Files", true)]);
+        assert_eq!(app.settings.last_tabs.split, [[0], [2]]);
+        assert_eq!(app.settings.last_tabs.active, Some(2));
+        app.shutdown();
+
+        let mut next = SnekkieApp::with_port_lister(paths(), Vec::new);
+        next.store.remove("B").unwrap();
+        next.restore_tabs(&ctx);
+        let titles: Vec<_> = next.tabs.iter().map(|t| t.session.title()).collect();
+        assert_eq!(titles, ["A (closed)"]);
+        assert_eq!(next.tabs[0].session.state(), State::Closed(None));
+        assert_eq!(next.explorers.len(), 1);
+        assert_eq!(next.explorers[0].status(), (false, false), "the explorer waits for Reconnect");
+        let explorer = WorkspaceTabId::Explorer(next.explorers[0].id);
+        assert_eq!(next.workspace_order(), [WorkspaceTabId::Session(next.tabs[0].session.id), explorer]);
+        assert_eq!(next.split.as_ref().map(|s| s.tabs().len()), Some(2));
+        assert_eq!(next.active, Some(explorer));
+    }
+
+    #[test]
+    fn button_bar_opens_the_review_page_without_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = SnekkieApp::with_port_lister(paths, Vec::new);
+        let snippet =
+            Snippet { name: "Version".into(), template: "show {{what}}".into(), pinned: true, ..Default::default() };
+        let id = app.snippet_store.put(snippet).unwrap();
+        let window = SnippetWindow::review(None, app.snippet_store.get(id).unwrap());
+        assert!(window.target.is_none(), "no connected tab, so nothing can be sent");
+        assert!(window.reviewing(), "it opens on the review page");
+    }
+
+    #[test]
     fn reviewed_snippet_target_survives_focus_changes_but_not_reconnect_or_close() {
         use std::time::{Duration, Instant};
         let dir = tempfile::tempdir().unwrap();
@@ -4311,6 +5032,9 @@ mod tests {
             view: TerminalView::default(),
             color: None,
             color_override: false,
+            bell: false,
+            waiting: None,
+            prompt: None,
         });
         app.active = Some(WorkspaceTabId::Session(app.tabs[1].session.id));
         for (commands, expected) in [("show a\r\nshow b\nshow c\r", "show a\rshow b\rshow c\r"), ("show d", "show d\r")]
@@ -4327,7 +5051,7 @@ mod tests {
             assert_eq!(bytes, expected.as_bytes());
             assert_eq!(app.active_index(), Some(0));
         }
-        app.start_paste(&ctx, target.clone(), "first\nnever replay\n", 5000).unwrap();
+        app.start_paste(&ctx, target.clone(), "first\nnever replay\n", 5000, false).unwrap();
         app.advance_paste(&ctx);
         let mut first_line = [0; 6];
         first.read_exact(&mut first_line).unwrap();
@@ -4344,12 +5068,150 @@ mod tests {
         replacement.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
         assert!(replacement.read(&mut [0; 64]).is_err());
         let new_target = PasteTarget { generation: app.tabs[0].session.connection_generation(), ..target.clone() };
-        app.start_paste(&ctx, new_target, "must not send\nsecond\n", 5000).unwrap();
+        app.start_paste(&ctx, new_target, "must not send\nsecond\n", 5000, false).unwrap();
         assert!(app.paste_queue.is_some());
         app.close_tab(target.id, true);
         assert!(app.paste_queue.is_none());
         assert_eq!(replacement.read(&mut [0; 64]).unwrap_or(0), 0);
         assert!(app.send_snippet(&ctx, &target, "closed command").is_err());
+    }
+
+    #[test]
+    fn bracketed_paste_bells_titles_clipboard_and_host_links() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = SnekkieApp::with_port_lister(paths, Vec::new);
+        let ctx = egui::Context::default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        app.open_session(
+            &ctx,
+            Profile { name: "Lab".into(), kind: "raw".into(), host: "127.0.0.1".into(), port, ..Default::default() },
+        );
+        let (mut remote, _) = listener.accept().unwrap();
+        remote.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.tabs[0].session.is_connected() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let target = PasteTarget {
+            id: app.tabs[0].session.id,
+            generation: app.tabs[0].session.connection_generation(),
+            description: "Lab".into(),
+        };
+        app.tabs[0].session.shared.emulator.lock().feed(b"\x1b[?2004h");
+        // One wrapped block, not paced lines, and an embedded end marker is gone.
+        app.start_paste(&ctx, target.clone(), "a\n\x1b[201~b\n", 5000, true).unwrap();
+        assert!(app.paste_queue.is_none());
+        let expected = b"\x1b[200~a\rb\r\x1b[201~";
+        let mut bytes = vec![0; expected.len()];
+        remote.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, expected);
+
+        // Bell on a background tab marks it until the tab is shown.
+        app.tabs[0].session.shared.emulator.lock().feed(b"\x07\x1b]2;core-sw1\x07\x1b]52;c;aGk=\x07");
+        app.active = None;
+        app.poll_remote_events(&ctx);
+        assert!(app.tabs[0].bell);
+        app.active = Some(WorkspaceTabId::Session(target.id));
+        app.poll_remote_events(&ctx);
+        assert!(!app.tabs[0].bell);
+
+        // Remote title only when chosen; the clipboard request was dropped
+        // because OSC 52 is off by default.
+        assert_eq!(app.tab_label(&app.tabs[0]), "Lab");
+        app.settings.remote_titles = true;
+        assert_eq!(app.tab_label(&app.tabs[0]), "core-sw1");
+        assert_eq!(app.tabs[0].session.shared.emulator.lock().take_clipboard(), None);
+
+        app.new_session_to(&ctx, "2001:db8::1".into());
+        assert_eq!(app.sidebar.draft.host, "2001:db8::1");
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn reconnect_when_back_and_port_checks() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = SnekkieApp::with_port_lister(paths, Vec::new);
+        let ctx = egui::Context::default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let profile = Profile {
+            name: "Device".into(),
+            kind: "raw".into(),
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            ..Default::default()
+        };
+        app.open_session(&ctx, profile.clone());
+        drop(listener.accept().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(app.tabs[0].session.state(), State::Closed(_)) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let id = app.tabs[0].session.id;
+
+        // Offline mode: only local addresses can be waited for without asking each time.
+        app.settings.offline_mode = true;
+        app.tabs[0].session.profile.host = "192.0.2.1".into();
+        app.wait_for_host(&ctx, id);
+        assert!(app.tabs[0].waiting.is_none());
+        assert!(app.dialog_texts().iter().any(|t| t.contains("Offline mode is on")), "{:?}", app.dialog_texts());
+        app.dialogs.clear();
+        app.tabs[0].session.profile.host = "127.0.0.1".into();
+
+        // The port already accepts, so the first check succeeds and it reconnects.
+        app.wait_for_host(&ctx, id);
+        assert!(app.tabs[0].waiting.is_some());
+        while app.tabs[0].waiting.is_some() {
+            assert!(Instant::now() < deadline);
+            app.poll_waiting(&ctx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _second = listener.accept().unwrap();
+        while !app.tabs[0].session.is_connected() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Stopping drops the wait, which ends the background checks.
+        app.wait_for_host(&ctx, id);
+        app.session_tab_action(&ctx, id, TabAction::StopWaiting);
+        assert!(app.tabs[0].waiting.is_none());
+
+        app.check_port(&ctx, &profile);
+        while app.port_checks.lock().is_empty() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let result = app.port_checks.lock()[0].clone();
+        assert!(result.starts_with(&format!("127.0.0.1:{} is open (", profile.port)), "{result}");
+    }
+
+    #[test]
+    fn login_prompts_become_a_dialog_that_answers_or_cancels() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { sessions: dir.path().join("sessions.json"), settings: dir.path().join("settings.json") };
+        let mut app = SnekkieApp::with_port_lister(paths, Vec::new);
+        let ctx = egui::Context::default();
+        let ask = app.prompt_asker(&ctx);
+        for accept in [true, false] {
+            let (reply, mut answer) = tokio::sync::oneshot::channel();
+            let prompts = vec![("Verification code: ".to_string(), false)];
+            ask(PromptQuestion { host: "r1".into(), name: String::new(), instructions: String::new(), prompts, reply });
+            app.poll_background(&ctx);
+            assert_eq!(app.dialog_texts(), ["Verification code:"]);
+            let Some(Dialog::Prompts(_, answers, _)) = app.dialogs.last_mut() else { panic!("no prompt dialog") };
+            answers[0] = "123456".into();
+            let dialog = app.dialogs.pop().unwrap();
+            app.finish_dialog(&ctx, dialog, if accept { DialogResult::Yes } else { DialogResult::No });
+            let expected = accept.then(|| vec!["123456".to_string()]);
+            assert_eq!(answer.try_recv().unwrap(), expected);
+        }
     }
 
     #[test]

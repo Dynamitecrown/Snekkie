@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::terminal::keys::Backspace;
+use crate::terminal::keys::{Backspace, EnterSends};
 use crate::{config, settings};
 
 /// Deserialize a field, falling back to its default if the value has the
@@ -214,6 +214,13 @@ pub struct Profile {
     pub auth: String,
     #[serde(deserialize_with = "lenient")]
     pub key_file: String,
+    /// The saved SSH session to log in to first and connect through
+    /// (OpenSSH's ProxyJump), by name. Empty = connect directly.
+    #[serde(deserialize_with = "lenient")]
+    pub jump_host: String,
+    /// Port forwards started with the shell; see [`Tunnel`].
+    #[serde(deserialize_with = "lenient")]
+    pub tunnels: Vec<Tunnel>,
 
     // Serial
     #[serde(deserialize_with = "lenient")]
@@ -230,6 +237,12 @@ pub struct Profile {
     pub rtscts: bool,
     #[serde(deserialize_with = "lenient")]
     pub xonxoff: bool,
+    /// "cr", "lf" or "crlf"; see [`EnterSends`].
+    #[serde(deserialize_with = "lenient")]
+    pub enter_sends: String,
+    /// Show each received bare LF as CR+LF, for devices that send only LF.
+    #[serde(deserialize_with = "lenient")]
+    pub lf_to_crlf: bool,
 
     // Terminal
     #[serde(deserialize_with = "lenient")]
@@ -279,6 +292,8 @@ impl Default for Profile {
             username: String::new(),
             auth: "password".into(),
             key_file: String::new(),
+            jump_host: String::new(),
+            tunnels: Vec::new(),
             device: String::new(),
             baud: 9600,
             bytesize: 8,
@@ -286,6 +301,8 @@ impl Default for Profile {
             stopbits: 1.0,
             rtscts: false,
             xonxoff: false,
+            enter_sends: "cr".into(),
+            lf_to_crlf: false,
             scrollback: 5000,
             font_family: String::new(),
             font_size: 11,
@@ -299,6 +316,154 @@ impl Default for Profile {
             device_syntax: "none".into(),
         }
     }
+}
+
+/// Which way an SSH port forward goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TunnelKind {
+    /// `-L`: a port on this computer reaches host:port as the server sees it.
+    #[default]
+    Local,
+    /// `-R`: a port on the server reaches host:port as this computer sees it.
+    Remote,
+    /// `-D`: a SOCKS5 proxy on this computer, connecting from the server.
+    Dynamic,
+}
+
+impl TunnelKind {
+    pub const ALL: [TunnelKind; 3] = [TunnelKind::Local, TunnelKind::Remote, TunnelKind::Dynamic];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TunnelKind::Local => "Local",
+            TunnelKind::Remote => "Remote",
+            TunnelKind::Dynamic => "Dynamic (SOCKS)",
+        }
+    }
+}
+
+/// One SSH port forward rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tunnel {
+    #[serde(deserialize_with = "lenient")]
+    pub kind: TunnelKind,
+    #[serde(deserialize_with = "lenient")]
+    pub enabled: bool,
+    #[serde(deserialize_with = "lenient")]
+    pub listen_port: u16,
+    /// Unused for dynamic forwards.
+    #[serde(deserialize_with = "lenient")]
+    pub host: String,
+    #[serde(deserialize_with = "lenient")]
+    pub port: u16,
+    /// Listen on every interface instead of loopback only.
+    #[serde(deserialize_with = "lenient")]
+    pub allow_others: bool,
+}
+
+impl Default for Tunnel {
+    fn default() -> Self {
+        Tunnel {
+            kind: TunnelKind::Local,
+            enabled: true,
+            listen_port: 0,
+            host: "127.0.0.1".into(),
+            port: 0,
+            allow_others: false,
+        }
+    }
+}
+
+impl Tunnel {
+    /// Like OpenSSH's arguments: "L 8080 → 10.0.0.1:80".
+    pub fn label(&self) -> String {
+        let letter = match self.kind {
+            TunnelKind::Local => "L",
+            TunnelKind::Remote => "R",
+            TunnelKind::Dynamic => return format!("D {} (SOCKS)", self.listen_port),
+        };
+        if self.host.contains(':') {
+            return format!("{letter} {} → [{}]:{}", self.listen_port, self.host, self.port);
+        }
+        format!("{letter} {} → {}:{}", self.listen_port, self.host, self.port)
+    }
+
+    /// Why the rule can't start, if it can't.
+    pub fn problem(&self) -> Option<&'static str> {
+        if self.listen_port == 0 {
+            return Some("choose a listen port");
+        }
+        if self.kind != TunnelKind::Dynamic {
+            let host = self.host.trim();
+            if host.is_empty() || host.len() > 255 || host.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return Some("enter a destination host");
+            }
+            if self.port == 0 {
+                return Some("choose a destination port");
+            }
+        }
+        None
+    }
+}
+
+/// "host:port", "[v6]:port" or OpenSSH's "host/port", as used by forwarding
+/// settings in OpenSSH and PuTTY.
+pub fn parse_destination(text: &str) -> Option<(String, u16)> {
+    let (host, port) = text.rsplit_once(':').or_else(|| text.rsplit_once('/'))?;
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    let port = port.parse::<u16>().ok().filter(|p| *p > 0)?;
+    (!host.is_empty() && !host.contains(char::is_whitespace)).then(|| (host.to_string(), port))
+}
+
+/// "port" or "bind:port" as a listen port and whether it listens beyond
+/// loopback. Other bind addresses are not supported.
+pub fn parse_listen(text: &str) -> Option<(u16, bool)> {
+    let (bind, port) = match text.rsplit_once(':') {
+        Some((bind, port)) => (bind.trim_start_matches('[').trim_end_matches(']'), port),
+        None => ("localhost", text),
+    };
+    let port = port.parse::<u16>().ok().filter(|p| *p > 0)?;
+    match bind.to_ascii_lowercase().as_str() {
+        "localhost" | "127.0.0.1" | "::1" => Some((port, false)),
+        "" | "*" | "0.0.0.0" | "::" => Some((port, true)),
+        _ => None,
+    }
+}
+
+/// Tunnels from an import, keeping only well-formed rules. Listening beyond
+/// loopback is never switched on by an import.
+fn imported_tunnels(value: Option<&serde_json::Value>, notes: &mut Vec<String>) -> Result<Vec<Tunnel>, String> {
+    let Some(value) = value else { return Ok(Vec::new()) };
+    let rules = value.as_array().ok_or("tunnels must be a list")?;
+    let mut tunnels = Vec::new();
+    for (index, rule) in rules.iter().enumerate().take(64) {
+        let valid = rule.as_object().filter(|fields| {
+            fields.get("kind").and_then(|v| v.as_str()).is_some_and(|k| ["local", "remote", "dynamic"].contains(&k))
+                && ["listen_port", "port"]
+                    .iter()
+                    .all(|f| fields.get(*f).is_none_or(|v| v.as_u64().is_some_and(|n| n <= 65535)))
+                && ["enabled", "allow_others"].iter().all(|f| fields.get(*f).is_none_or(serde_json::Value::is_boolean))
+                && fields.get("host").is_none_or(serde_json::Value::is_string)
+        });
+        let tunnel =
+            valid.and_then(|_| serde_json::from_value::<Tunnel>(rule.clone()).ok()).filter(|t| t.problem().is_none());
+        let Some(mut tunnel) = tunnel else {
+            notes.push(format!("tunnel {} skipped: invalid rule", index + 1));
+            continue;
+        };
+        tunnel.host = tunnel.host.trim().into();
+        if tunnel.allow_others {
+            tunnel.allow_others = false;
+            notes.push(format!("tunnel {}: listening for other computers switched off on import", tunnel.label()));
+        }
+        tunnels.push(tunnel);
+    }
+    if rules.len() > 64 {
+        notes.push("only the first 64 tunnels imported".into());
+    }
+    Ok(tunnels)
 }
 
 fn legacy_log_format() -> String {
@@ -333,6 +498,11 @@ impl Profile {
 
     pub fn backspace(&self) -> Backspace {
         Backspace::parse(&self.backspace)
+    }
+
+    /// Only serial lines use the Enter choice; network sessions always send CR.
+    pub fn enter_sends(&self) -> EnterSends {
+        if self.kind() == Kind::Serial { EnterSends::parse(&self.enter_sends) } else { EnterSends::Cr }
     }
 
     /// Replace values a hand-edited file could have made unusable.
@@ -372,6 +542,9 @@ impl Profile {
         if self.backspace.is_empty() {
             self.backspace = defaults.backspace;
         }
+        if self.enter_sends.is_empty() {
+            self.enter_sends = defaults.enter_sends;
+        }
         self.tab_color = settings::parse_hex(&self.tab_color).map(settings::to_hex).unwrap_or_default();
         self
     }
@@ -399,6 +572,8 @@ struct ExportProfile<'a> {
     username: &'a str,
     auth: &'a str,
     key_file: &'a str,
+    jump_host: &'a str,
+    tunnels: &'a [Tunnel],
     device: &'a str,
     baud: u32,
     bytesize: u8,
@@ -406,6 +581,8 @@ struct ExportProfile<'a> {
     stopbits: f32,
     rtscts: bool,
     xonxoff: bool,
+    enter_sends: &'a str,
+    lf_to_crlf: bool,
     scrollback: u32,
     font_family: &'a str,
     font_size: u32,
@@ -433,6 +610,8 @@ impl<'a> From<&'a Profile> for ExportProfile<'a> {
             username: &profile.username,
             auth: &profile.auth,
             key_file: &profile.key_file,
+            jump_host: &profile.jump_host,
+            tunnels: &profile.tunnels,
             device: &profile.device,
             baud: profile.baud,
             bytesize: profile.bytesize,
@@ -440,6 +619,8 @@ impl<'a> From<&'a Profile> for ExportProfile<'a> {
             stopbits: profile.stopbits,
             rtscts: profile.rtscts,
             xonxoff: profile.xonxoff,
+            enter_sends: &profile.enter_sends,
+            lf_to_crlf: profile.lf_to_crlf,
             scrollback: profile.scrollback,
             font_family: &profile.font_family,
             font_size: profile.font_size,
@@ -519,6 +700,7 @@ fn imported_profile(value: &serde_json::Value) -> Result<(Profile, Vec<String>),
         "username",
         "auth",
         "key_file",
+        "jump_host",
         "device",
         "parity",
         "font_family",
@@ -527,9 +709,10 @@ fn imported_profile(value: &serde_json::Value) -> Result<(Profile, Vec<String>),
         "local_echo",
         "backspace",
         "device_syntax",
+        "enter_sends",
     ];
     let integer_fields = ["port", "keepalive", "baud", "bytesize", "scrollback", "font_size", "log_rotate_mb"];
-    let boolean_fields = ["favorite", "rtscts", "xonxoff", "log_passwords", "log_rotate_daily"];
+    let boolean_fields = ["favorite", "rtscts", "xonxoff", "lf_to_crlf", "log_passwords", "log_rotate_daily"];
     for field in string_fields {
         if fields.get(field).is_some_and(|value| !value.is_string()) {
             return Err(format!("{name}: {field} must be text"));
@@ -585,6 +768,7 @@ fn imported_profile(value: &serde_json::Value) -> Result<(Profile, Vec<String>),
     if profile.font_size == 0
         || !["auto", "on", "off"].contains(&profile.local_echo.as_str())
         || !["del", "ctrl-h"].contains(&profile.backspace.as_str())
+        || !["cr", "lf", "crlf"].contains(&profile.enter_sends.as_str())
     {
         return Err(format!("{name}: unsupported terminal settings"));
     }
@@ -603,13 +787,19 @@ fn imported_profile(value: &serde_json::Value) -> Result<(Profile, Vec<String>),
     if !profile.tab_color.is_empty() && settings::parse_hex(&profile.tab_color).is_none() {
         notes.push("invalid tab color cleared".into());
     }
+    profile.jump_host = profile.jump_host.trim().into();
+    if profile.jump_host.len() > 256 || profile.jump_host.chars().any(char::is_control) {
+        profile.jump_host.clear();
+        notes.push("invalid jump host cleared".into());
+    }
+    profile.tunnels = imported_tunnels(fields.get("tunnels"), &mut notes).map_err(|e| format!("{name}: {e}"))?;
     let unsupported: Vec<_> = fields
         .keys()
         .filter(|field| {
             !string_fields.contains(&field.as_str())
                 && !integer_fields.contains(&field.as_str())
                 && !boolean_fields.contains(&field.as_str())
-                && field.as_str() != "stopbits"
+                && !["stopbits", "tunnels"].contains(&field.as_str())
         })
         .collect();
     if !unsupported.is_empty() {
@@ -621,11 +811,41 @@ fn imported_profile(value: &serde_json::Value) -> Result<(Profile, Vec<String>),
     Ok((profile.sanitize(), notes))
 }
 
+/// Most jump hosts one connection may go through.
+pub const MAX_JUMP_HOSTS: usize = 5;
+
+/// The saved SSH sessions `profile` connects through, first hop first.
+pub fn jump_chain(profile: &Profile, saved: &[Profile]) -> Result<Vec<Profile>, String> {
+    let mut chain: Vec<Profile> = Vec::new();
+    let mut next = profile.jump_host.trim().to_string();
+    while !next.is_empty() {
+        let hop = saved
+            .iter()
+            .find(|p| p.name == next && p.kind().is_ssh())
+            .ok_or_else(|| format!("Jump host \"{next}\" is not a saved SSH session."))?;
+        if hop.name == profile.name || chain.iter().any(|p| p.name == hop.name) {
+            return Err(format!(
+                "The jump hosts of {} loop back to \"{}\". Check each session's Jump host setting.",
+                profile.name, hop.name
+            ));
+        }
+        if chain.len() == MAX_JUMP_HOSTS {
+            return Err(format!("{} goes through more than {MAX_JUMP_HOSTS} jump hosts.", profile.name));
+        }
+        next = hop.jump_host.trim().to_string();
+        chain.push(hop.clone());
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
 /// Keep existing profiles unchanged and give imports unique, case-insensitive
 /// names. Order remains stable so a preview can show exactly what will be added.
 pub fn merge_import(existing: &[Profile], incoming: impl IntoIterator<Item = Profile>) -> Vec<Profile> {
     let mut merged = existing.to_vec();
     let mut names: HashSet<_> = existing.iter().map(|profile| profile.name.to_lowercase()).collect();
+    let mut renamed = std::collections::HashMap::new();
+    let mut seen = HashSet::new();
     for mut profile in incoming {
         let original = profile.name.clone();
         let mut suffix = 1;
@@ -633,7 +853,18 @@ pub fn merge_import(existing: &[Profile], incoming: impl IntoIterator<Item = Pro
             profile.name = format!("{original} (Imported {suffix})");
             suffix += 1;
         }
+        // A jump host name means the first imported session of that name.
+        if seen.insert(original.clone()) && profile.name != original {
+            renamed.insert(original, profile.name.clone());
+        }
         merged.push(profile);
+    }
+    // An imported jump host keeps pointing at the imported session, not at an
+    // existing one that happens to share its name.
+    for profile in &mut merged[existing.len()..] {
+        if let Some(name) = renamed.get(&profile.jump_host) {
+            profile.jump_host = name.clone();
+        }
     }
     merged
 }
@@ -1093,6 +1324,11 @@ mod tests {
             username: "operator".into(),
             auth: "key".into(),
             key_file: "C:/example/id_ed25519".into(),
+            jump_host: "bastion".into(),
+            tunnels: vec![
+                Tunnel { listen_port: 8080, host: "10.0.0.1".into(), port: 80, ..Tunnel::default() },
+                Tunnel { kind: TunnelKind::Dynamic, listen_port: 1080, enabled: false, ..Tunnel::default() },
+            ],
             device: "COM4".into(),
             baud: 115200,
             favorite: true,
@@ -1102,6 +1338,8 @@ mod tests {
             local_echo: "off".into(),
             backspace: "ctrl-h".into(),
             device_syntax: "cisco_ios".into(),
+            enter_sends: "crlf".into(),
+            lf_to_crlf: true,
             ..Profile::default()
         });
         let text = export_profiles(&profiles).unwrap();
@@ -1210,6 +1448,7 @@ mod tests {
             {"name":"No serial device","kind":"serial"},
             {"name":"Bad bool","kind":"ssh","host":"192.0.2.3","favorite":"yes"},
             {"name":"Bad font","kind":"ssh","host":"192.0.2.3","font_size":-1},
+            {"name":"Bad enter","kind":"serial","device":"COM4","enter_sends":"nl"},
             {"name":"Valid serial","kind":"serial","device":"COM4"},
             false
         ]}"#;
@@ -1220,7 +1459,8 @@ mod tests {
         );
         assert_eq!(imported.profiles[0].port, 22);
         assert_eq!(imported.profiles[1].port, 23);
-        assert_eq!(imported.warnings.len(), 12);
+        assert_eq!(imported.warnings.len(), 13);
+        assert_eq!((imported.profiles[2].enter_sends.as_str(), imported.profiles[2].lf_to_crlf), ("cr", false));
     }
 
     #[test]
@@ -1256,6 +1496,107 @@ mod tests {
         for option in LocalEcho::ALL {
             assert_eq!(LocalEcho::parse(option.as_str()), option);
         }
+    }
+
+    #[test]
+    fn jump_chains_resolve_first_hop_first_and_refuse_loops_and_long_chains() {
+        let hop = |name: &str, jump: &str| Profile { name: name.into(), jump_host: jump.into(), ..Profile::default() };
+        let saved = vec![hop("edge", ""), hop("core", "edge"), hop("a", "b"), hop("b", "a")];
+        let names = |chain: Vec<Profile>| chain.into_iter().map(|p| p.name).collect::<Vec<_>>();
+        assert_eq!(names(jump_chain(&hop("router", "core"), &saved).unwrap()), ["edge", "core"]);
+        assert!(jump_chain(&hop("router", ""), &saved).unwrap().is_empty());
+        assert!(jump_chain(&hop("router", "a"), &saved).unwrap_err().contains("loop back"));
+        assert!(jump_chain(&hop("edge", "edge"), &saved).unwrap_err().contains("loop back"));
+        assert!(jump_chain(&hop("router", "gone"), &saved).unwrap_err().contains("not a saved SSH session"));
+        let serial = vec![Profile { name: "console".into(), kind: "serial".into(), ..Profile::default() }];
+        assert!(jump_chain(&hop("router", "console"), &serial).is_err());
+
+        // h0 -> h1 -> ... -> h6, which connects directly.
+        let long: Vec<_> =
+            (0..7).map(|i| hop(&format!("h{i}"), &if i < 6 { format!("h{}", i + 1) } else { String::new() })).collect();
+        assert_eq!(jump_chain(&hop("router", "h2"), &long).unwrap().len(), MAX_JUMP_HOSTS);
+        assert!(jump_chain(&hop("router", "h1"), &long).unwrap_err().contains("more than 5"));
+    }
+
+    #[test]
+    fn imported_tunnels_keep_valid_rules_and_never_listen_beyond_loopback() {
+        // Older files have no tunnels; a bad list loads as none rather than losing the session.
+        let old: Profile = serde_json::from_str(r#"{"name":"a","host":"h"}"#).unwrap();
+        assert!(old.tunnels.is_empty());
+        let bad: Profile = serde_json::from_str(r#"{"name":"a","tunnels":"nope"}"#).unwrap();
+        assert!(bad.tunnels.is_empty());
+
+        let text = r#"{"version":1,"sessions":[
+            {"name":"r","kind":"ssh","host":"h","tunnels":[
+                {"kind":"local","listen_port":8080,"host":" 10.0.0.1 ","port":80,"allow_others":true},
+                {"kind":"remote","listen_port":2222,"host":"localhost","port":22,"enabled":false},
+                {"kind":"dynamic","listen_port":1080},
+                {"kind":"sideways","listen_port":1,"host":"h","port":1},
+                {"kind":"local","listen_port":70000,"host":"h","port":1},
+                {"kind":"local","listen_port":1,"host":"","port":1},
+                {"kind":"local","listen_port":1,"host":"h","port":1,"allow_others":"yes"},
+                "L8080"
+            ]},
+            {"name":"s","kind":"ssh","host":"h","tunnels":{"kind":"local"}}
+        ]}"#;
+        let batch = parse_import(text.as_bytes()).unwrap();
+        assert_eq!(batch.profiles.len(), 1, "{:?}", batch.warnings);
+        let tunnels = &batch.profiles[0].tunnels;
+        let labels: Vec<String> = tunnels.iter().map(Tunnel::label).collect();
+        assert_eq!(labels, ["L 8080 → 10.0.0.1:80", "R 2222 → localhost:22", "D 1080 (SOCKS)"]);
+        assert!(tunnels.iter().all(|t| !t.allow_others));
+        assert_eq!(tunnels.iter().map(|t| t.enabled).collect::<Vec<_>>(), [true, false, true]);
+        let notes = batch.warnings.join("\n");
+        assert!(notes.contains("listening for other computers switched off"), "{notes}");
+        for skipped in 4..=8 {
+            assert!(notes.contains(&format!("tunnel {skipped} skipped")), "{notes}");
+        }
+        assert!(notes.contains("s: tunnels must be a list"), "{notes}");
+        assert!(!notes.contains("unsupported field"), "{notes}");
+    }
+
+    #[test]
+    fn forward_settings_parse_simple_listen_and_destination_forms() {
+        assert_eq!(parse_listen("8080"), Some((8080, false)));
+        assert_eq!(parse_listen("localhost:8080"), Some((8080, false)));
+        assert_eq!(parse_listen("[::1]:8080"), Some((8080, false)));
+        assert_eq!(parse_listen("*:8080"), Some((8080, true)));
+        assert_eq!(parse_listen(":8080"), Some((8080, true)));
+        assert_eq!(parse_listen("192.0.2.5:8080"), None);
+        assert_eq!(parse_listen("0"), None);
+        assert_eq!(parse_listen("/tmp/sock"), None);
+        assert_eq!(parse_destination("host:80"), Some(("host".into(), 80)));
+        assert_eq!(parse_destination("[fd00::1]:443"), Some(("fd00::1".into(), 443)));
+        assert_eq!(parse_destination("host/22"), Some(("host".into(), 22)));
+        assert_eq!(parse_destination("host"), None);
+        assert_eq!(parse_destination(":80"), None);
+        assert_eq!(parse_destination("host:0"), None);
+    }
+
+    #[test]
+    fn imports_keep_jump_hosts_pointing_at_the_imported_session() {
+        let existing = vec![Profile { name: "bastion".into(), ..Profile::default() }];
+        let incoming = vec![
+            Profile { name: "bastion".into(), host: "192.0.2.1".into(), ..Profile::default() },
+            Profile { name: "router".into(), jump_host: "bastion".into(), ..Profile::default() },
+        ];
+        let merged = merge_import(&existing, incoming);
+        assert_eq!(merged[2].jump_host, "bastion (Imported 1)");
+        assert_eq!(merged[0].jump_host, "");
+        // A duplicate inside the import doesn't capture the first one's name.
+        let twins = vec![
+            Profile { name: "edge".into(), ..Profile::default() },
+            Profile { name: "edge".into(), ..Profile::default() },
+            Profile { name: "router".into(), jump_host: "edge".into(), ..Profile::default() },
+        ];
+        assert_eq!(merge_import(&[], twins)[2].jump_host, "edge");
+
+        let text = r#"{"version":1,"sessions":[{"name":"r","kind":"ssh","host":"h","jump_host":"bad\u0007"},{"name":"s","kind":"ssh","host":"h","jump_host":5}]}"#;
+        let batch = parse_import(text.as_bytes()).unwrap();
+        assert_eq!(batch.profiles.len(), 1);
+        assert_eq!(batch.profiles[0].jump_host, "");
+        assert!(batch.warnings.iter().any(|w| w.contains("invalid jump host cleared")), "{:?}", batch.warnings);
+        assert!(batch.warnings.iter().any(|w| w.contains("jump_host must be text")), "{:?}", batch.warnings);
     }
 
     #[test]

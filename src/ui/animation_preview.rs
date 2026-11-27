@@ -101,6 +101,7 @@ fn draw(ui: &mut Ui, view: &mut TerminalView, emulator: &Mutex<Emulator>, theme:
         theme,
         syntax: "none",
         highlighting_intensity: crate::terminal::highlight::DEFAULT_INTENSITY,
+        user_rules: &crate::terminal::highlight::NO_USER_RULES,
         regular: font.clone(),
         bold: font,
         keyboard: false,
@@ -368,6 +369,10 @@ mod tests {
             ("hidden", Animations { reveal: Reveal::Typewriter, ..quiet() }),
             ("scaled", Animations { new_text: NewText::Zoom, ..quiet() }),
             ("tinted", Animations { new_text: NewText::Heat, ..quiet() }),
+            ("flickering", Animations { new_text: NewText::Flicker, ..quiet() }),
+            ("glitching", Animations { new_text: NewText::Glitch, ..quiet() }),
+            ("jelly", Animations { typed_text: TypedText::Jelly, ..quiet() }),
+            ("neon", Animations { typed_text: TypedText::Neon, ..quiet() }),
         ] {
             assert!(drawn_other_than_plain(animations), "no cell {what} on any frame");
         }

@@ -271,6 +271,15 @@ impl Preferences {
                 colors.effects.appearance = appearance;
                 colors_changed = true;
             }
+            if appearance == crate::settings::AppAppearance::Space {
+                ui.label(
+                    RichText::new(
+                        "With animations on, stars and planets react to new text and the pointer. Hold Ctrl+Shift and drag to move a planet. With animations off they stay still.",
+                    )
+                    .color(style::secondary(ui))
+                    .small(),
+                );
+            }
             ui.label(
                 RichText::new("Adjust these colors, then use Save as… to name your theme.")
                     .color(style::secondary(ui))
@@ -307,6 +316,12 @@ impl Preferences {
             ui.end_row();
         });
         self.font_preview(ui, fonts);
+        ui.add_space(12.0);
+        style::section_heading(ui, "Startup");
+        ui.checkbox(&mut self.settings.restore_tabs, "Reopen tabs from last time").on_hover_text(
+            "Saved-session tabs and their split view come back disconnected. Nothing connects until you choose \
+             Reconnect.",
+        );
     }
 
     fn font_preview(&mut self, ui: &mut Ui, fonts: &mut Fonts) {
@@ -338,6 +353,11 @@ impl Preferences {
         ui.checkbox(&mut self.settings.auto_paging, "Automatically page through show commands").on_hover_text(
             "Press Space at Cisco More prompts during show commands. Off by default. q or Ctrl+C stops it.",
         );
+        style::section_heading(ui, "Remote host");
+        ui.checkbox(&mut self.settings.remote_clipboard, "Allow remote apps to set the clipboard (OSC 52)")
+            .on_hover_text("Off by default. Programs on the far end, such as tmux or vim, can replace what you copied. They can never read the clipboard.");
+        ui.checkbox(&mut self.settings.remote_titles, "Use title set by remote host for tabs")
+            .on_hover_text("Off by default. The profile name stays in the tab's tooltip.");
     }
 
     fn files_page(&mut self, ui: &mut Ui) {
@@ -489,6 +509,62 @@ impl Preferences {
             );
         }
         self.syntax_preview.ui(ui, theme, &self.preview_syntax, self.settings.highlighting_intensity);
+        ui.add_space(10.0);
+        self.highlight_rules_ui(ui);
+    }
+
+    /// The user's own highlights, drawn over device highlighting everywhere.
+    fn highlight_rules_ui(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("Highlight rules").strong());
+        ui.label("Color matching text in every session, on top of device highlighting. The first matching rule wins. Display only: copied text, logs and what is sent are unchanged.");
+        let rules = &mut self.settings.highlight_rules;
+        let mut remove = None;
+        for (index, rule) in rules.iter_mut().enumerate() {
+            ui.push_id(("highlight_rule", index), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut rule.text).hint_text("Text to match").desired_width(180.0));
+                    ui.checkbox(&mut rule.regex, "Regular expression");
+                    ui.checkbox(&mut rule.match_case, "Match case");
+                    let mut color = settings::parse_hex(&rule.color).unwrap_or(Color32::YELLOW);
+                    let mut rgb = [color.r(), color.g(), color.b()];
+                    if ui.color_edit_button_srgb(&mut rgb).on_hover_text("Text color").changed() {
+                        color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                    }
+                    rule.color = settings::to_hex(color);
+                    ui.checkbox(&mut rule.bold, "Bold");
+                    if ui.button("Remove").clicked() {
+                        remove = Some(index);
+                    }
+                });
+                // Compile only when the pattern changes, not on every frame.
+                let key = (rule.text.clone(), rule.regex, rule.match_case);
+                let id = ui.id().with("compile_error");
+                let error = match ui.data(|d| d.get_temp::<((String, bool, bool), Option<String>)>(id)) {
+                    Some((seen, error)) if seen == key => error,
+                    _ => {
+                        let error = highlight::compile_rule(rule).err();
+                        ui.data_mut(|d| d.insert_temp(id, (key, error.clone())));
+                        error
+                    }
+                };
+                if !rule.text.is_empty()
+                    && let Some(error) = error
+                {
+                    ui.label(RichText::new(format!("Skipped: {error}")).color(ui.visuals().error_fg_color));
+                }
+            });
+        }
+        if let Some(index) = remove {
+            rules.remove(index);
+        }
+        let full = rules.len() >= highlight::MAX_USER_RULES;
+        if ui
+            .add_enabled(!full, egui::Button::new("Add rule"))
+            .on_disabled_hover_text(format!("At most {} rules", highlight::MAX_USER_RULES))
+            .clicked()
+        {
+            rules.push(settings::HighlightRule::default());
+        }
     }
 
     fn animations_page(&mut self, ui: &mut Ui) {

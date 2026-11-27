@@ -22,6 +22,9 @@ pub struct Snippet {
     #[serde(default)]
     pub group: String,
     pub template: String,
+    /// Shown as a button above the terminal.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl Snippet {
@@ -389,6 +392,7 @@ mod tests {
         let mut changed = store.get(first).unwrap().clone();
         changed.name = "Platform".into();
         changed.group = "Cisco IOS".into();
+        changed.pinned = true;
         store.put(changed.clone()).unwrap();
         let mut restarted = SnippetStore::open(path);
         assert_eq!(restarted.get(first), Some(&changed));
@@ -415,6 +419,7 @@ mod tests {
         let batch = parse_import(br#"{"version":1,"snippets":[{"name":"Bad"},{"name":"Good","template":"show ver"}]}"#)
             .unwrap();
         assert_eq!(batch.snippets.len(), 1);
+        assert!(!batch.snippets[0].pinned, "older files load unpinned");
         assert_eq!(batch.notes.len(), 1);
     }
 

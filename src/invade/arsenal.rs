@@ -1,7 +1,7 @@
 //! Starting loadouts and independently ranked weapons. Execution,
 //! collision ownership and runtime cooldowns belong to the run model.
 
-use super::content::Rig;
+use super::content::{Rig, Unlock};
 use super::upgrades::{Build, Stats, UpgradeId};
 
 pub use super::upgrades::{LevelChoice, describe_level, level_offers};
@@ -19,10 +19,12 @@ pub enum WeaponKind {
     Pulse,
     Flamethrower,
     Shield,
+    Worm,
+    Mine,
 }
 
 impl WeaponKind {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::Packet,
         Self::Scatter,
         Self::Rail,
@@ -31,6 +33,8 @@ impl WeaponKind {
         Self::Pulse,
         Self::Flamethrower,
         Self::Shield,
+        Self::Worm,
+        Self::Mine,
     ];
     pub const STARTERS: [Self; 3] = [Self::Packet, Self::Scatter, Self::Rail];
 
@@ -44,6 +48,8 @@ impl WeaponKind {
             Self::Pulse => "pulse",
             Self::Flamethrower => "flamethrower",
             Self::Shield => "shield",
+            Self::Worm => "worm",
+            Self::Mine => "logic_bomb",
         }
     }
 
@@ -61,6 +67,8 @@ impl WeaponKind {
             Self::Pulse => "Pulse",
             Self::Flamethrower => "Flamethrower",
             Self::Shield => "Shield",
+            Self::Worm => "Worm",
+            Self::Mine => "Logic Bomb",
         }
     }
 
@@ -69,11 +77,21 @@ impl WeaponKind {
             Self::Packet => "Fast bolts at the nearest device. A balanced starting weapon.",
             Self::Scatter => "A wide fan of weaker packets. More coverage, less damage per packet.",
             Self::Rail => "Slow, heavy packets that pierce several devices with diminishing damage.",
-            Self::Arc => "An electrical chain that damages up to three distinct nearby devices.",
+            Self::Arc => "An electrical chain that damages up to three distinct nearby devices (five once evolved).",
             Self::Orbit => "Rotating packets circle the rig to intercept nearby devices.",
             Self::Pulse => "Periodic damage to every device inside a short radius around the rig.",
             Self::Flamethrower => "A short, piercing fan of firewall flames aimed at the nearest device.",
             Self::Shield => "Rotating shields damage devices and reflect ordinary packets. Boss attacks pass through.",
+            Self::Worm => "A homing packet that hunts a visible device, then burrows on to the next.",
+            Self::Mine => "Drops a stationary bomb that explodes when a device touches it or its timer runs out.",
+        }
+    }
+
+    pub fn unlock(self) -> Option<Unlock> {
+        match self {
+            Self::Worm => Some(Unlock::Worm),
+            Self::Mine => Some(Unlock::LogicBomb),
+            _ => None,
         }
     }
 
@@ -168,8 +186,81 @@ impl WeaponKind {
                 spec.range = 60.0;
                 spec.radius = 5.0 + 0.5 * r;
             }
+            Self::Worm => {
+                spec.damage = damage(1.6, 0.20);
+                spec.cooldown = cooldown(5.0, 0.95);
+                spec.pierce = stats.pierce.saturating_add(1 + ranks / 2);
+                spec.speed = 40.0;
+                spec.range = 70.0;
+            }
+            Self::Mine => {
+                spec.damage = damage(3.5, 0.22);
+                spec.cooldown = cooldown(9.0, 0.95);
+                spec.pierce = 0;
+                spec.speed = 0.0;
+                spec.range = 6.0;
+                spec.radius = 6.0 + 0.5 * r;
+            }
+        }
+        if rank >= WEAPON_RANK_CAP {
+            match self {
+                Self::Packet => {
+                    spec.projectiles = 2;
+                    spec.spread = 6.0f32.to_radians();
+                }
+                Self::Scatter => {
+                    spec.projectiles += 2;
+                    spec.pierce = spec.pierce.saturating_add(1);
+                }
+                Self::Rail => {
+                    spec.pierce = spec.pierce.saturating_add(3);
+                    spec.damage *= 1.25;
+                }
+                Self::Arc => {
+                    spec.chain_targets = 5;
+                    spec.range += 4.0;
+                }
+                Self::Orbit => spec.projectiles += 2,
+                Self::Pulse => {
+                    spec.radius += 4.0;
+                    spec.damage *= 1.2;
+                }
+                Self::Flamethrower => {
+                    spec.projectiles = 5;
+                    spec.spread = 40.0f32.to_radians();
+                }
+                Self::Shield => {
+                    spec.projectiles += 1;
+                    spec.radius += 1.0;
+                }
+                Self::Worm => {
+                    spec.projectiles = 2;
+                    spec.spread = 6.0f32.to_radians();
+                    spec.pierce = spec.pierce.saturating_add(1);
+                }
+                Self::Mine => {
+                    spec.damage *= 1.4;
+                    spec.radius += 3.0;
+                }
+            }
         }
         spec
+    }
+
+    /// The name a weapon takes once it evolves at the rank cap.
+    pub fn evolved_name(self) -> &'static str {
+        match self {
+            Self::Packet => "Burst Packet",
+            Self::Scatter => "Shrapnel Storm",
+            Self::Rail => "Railgun",
+            Self::Arc => "Storm Arc",
+            Self::Orbit => "Ring Network",
+            Self::Pulse => "Shockwave",
+            Self::Flamethrower => "Inferno",
+            Self::Shield => "Aegis",
+            Self::Worm => "Botnet",
+            Self::Mine => "Cluster Bomb",
+        }
     }
 }
 
@@ -184,9 +275,10 @@ pub struct WeaponSpec {
     /// The total fan angle in radians.
     pub spread: f32,
     pub speed: f32,
-    /// Projectile travel distance, or Arc's maximum jump distance.
+    /// Projectile travel distance, Arc's maximum jump distance, or the
+    /// seconds a Logic Bomb stays armed.
     pub range: f32,
-    /// Orbit distance from the rig, or Pulse's area radius.
+    /// Orbit distance from the rig, or Pulse's or Logic Bomb's area radius.
     pub radius: f32,
     /// Total distinct devices hit by one Arc activation.
     pub chain_targets: u8,
@@ -213,6 +305,14 @@ impl WeaponState {
 
     pub fn spec(self, rig: Rig, stats: &Stats) -> WeaponSpec {
         self.kind.spec(self.rank, rig, stats)
+    }
+
+    pub fn evolved(self) -> bool {
+        self.rank >= WEAPON_RANK_CAP
+    }
+
+    pub fn display_name(self) -> &'static str {
+        if self.evolved() { self.kind.evolved_name() } else { self.kind.name() }
     }
 }
 
@@ -357,6 +457,65 @@ mod tests {
             }
         }
         assert_eq!(initial_weapons(Loadout::default()), [WeaponState::new(WeaponKind::Packet)]);
+    }
+
+    #[test]
+    fn weapons_evolve_only_at_the_rank_cap_with_their_declared_bonus() {
+        let stats = stats(Rig::Probe, &Build::default());
+        let unevolved = |kind: WeaponKind| {
+            let state = WeaponState { kind, rank: WEAPON_RANK_CAP - 1 };
+            assert!(!state.evolved());
+            assert_eq!(state.display_name(), kind.name());
+            state.spec(Rig::Probe, &stats)
+        };
+        for kind in WeaponKind::ALL {
+            let four = unevolved(kind);
+            let state = WeaponState { kind, rank: WEAPON_RANK_CAP };
+            assert!(state.evolved());
+            assert_eq!(state.display_name(), kind.evolved_name());
+            assert_ne!(kind.evolved_name(), kind.name());
+            let five = state.spec(Rig::Probe, &stats);
+            let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+            match kind {
+                WeaponKind::Packet => {
+                    assert_eq!((four.projectiles, five.projectiles), (1, 2));
+                    assert!(close(five.spread, 6.0f32.to_radians()));
+                }
+                WeaponKind::Scatter => {
+                    assert_eq!(five.projectiles, 7 + 2);
+                    assert_eq!(five.pierce, four.pierce + 1);
+                }
+                WeaponKind::Rail => {
+                    assert_eq!(five.pierce, stats.pierce + 2 + 2 + 3);
+                    assert!(close(five.damage / four.damage, 1.88 * 1.25 / 1.66));
+                }
+                WeaponKind::Arc => {
+                    assert_eq!((four.chain_targets, five.chain_targets), (3, 5));
+                    assert!(close(five.range, 18.0 + 8.0 + 4.0));
+                }
+                WeaponKind::Orbit => assert_eq!(five.projectiles, 2 + 2 + 2),
+                WeaponKind::Pulse => {
+                    assert!(close(five.radius, 9.0 + 4.0 + 4.0));
+                    assert!(close(five.damage / four.damage, 1.8 * 1.2 / 1.6));
+                }
+                WeaponKind::Flamethrower => {
+                    assert_eq!(five.projectiles, 5);
+                    assert!(close(five.spread, 40.0f32.to_radians()));
+                }
+                WeaponKind::Shield => {
+                    assert_eq!(five.projectiles, 1 + 2 + 1);
+                    assert!(close(five.radius, 5.0 + 2.0 + 1.0));
+                }
+                WeaponKind::Worm => {
+                    assert_eq!((four.projectiles, five.projectiles), (1, 2));
+                    assert_eq!(five.pierce, stats.pierce + 1 + 2 + 1);
+                }
+                WeaponKind::Mine => {
+                    assert!(close(five.radius, 6.0 + 2.0 + 3.0));
+                    assert!(close(five.damage / four.damage, 1.88 * 1.4 / 1.66));
+                }
+            }
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ use russh::{ChannelMsg, Disconnect, MethodKind, Preferred, cipher, kex, mac};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot;
 
-use super::{CONNECT_TIMEOUT, Command, Link, Sink, TERM, connect_tcp, keepalive_interval, transfer};
+use super::{CONNECT_TIMEOUT, Command, Link, Sink, TERM, connect_tcp, keepalive_interval, transfer, tunnel};
 use crate::profiles::{Auth, Profile};
 
 /// Default key files tried in "SSH agent / default keys" mode, like
@@ -29,11 +29,28 @@ pub struct HostKeyQuestion {
     pub port: u16,
     pub key_type: String,
     pub fingerprint: String,
+    /// The saved session's name when this host is a jump host on the way.
+    pub jump_host: Option<String>,
     pub reply: oneshot::Sender<bool>,
 }
 
 /// Hands host key questions to the UI.
 pub type HostKeyAsker = Arc<dyn Fn(HostKeyQuestion) + Send + Sync>;
+
+/// A keyboard-interactive round for the user to answer, such as a one-time
+/// code. Answers go straight back to the server and are never kept.
+pub struct PromptQuestion {
+    pub host: String,
+    pub name: String,
+    pub instructions: String,
+    /// Prompt text and whether the answer may be shown while typed.
+    pub prompts: Vec<(String, bool)>,
+    /// `None` cancels the login.
+    pub reply: oneshot::Sender<Option<Vec<String>>>,
+}
+
+/// Hands keyboard-interactive prompts to the UI.
+pub type PromptAsker = Arc<dyn Fn(PromptQuestion) + Send + Sync>;
 
 /// Everything needed to connect that isn't stored in the profile.
 pub struct Credentials {
@@ -41,6 +58,13 @@ pub struct Credentials {
     pub key_passphrase: String,
     /// Where trusted host keys are recorded; normally [`known_hosts_path`].
     pub known_hosts: PathBuf,
+    /// Asks the user prompts the password can't answer. Without it, such a
+    /// login fails.
+    pub ask_prompts: Option<PromptAsker>,
+    /// Saved SSH sessions to log in to and connect through first, first hop
+    /// first (see [`crate::profiles::jump_chain`]). Each asks for its own
+    /// password or passphrase through `ask_prompts`.
+    pub jumps: Vec<Profile>,
 }
 
 static KNOWN_HOSTS_FOR_TESTS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -212,6 +236,8 @@ pub(super) struct Client {
     sink: Arc<dyn Sink>,
     /// Why the connection dropped, if it failed rather than being closed.
     lost: Arc<Mutex<Option<String>>>,
+    /// Remote forwards whose channels this connection accepts.
+    forwards: tunnel::RemoteForwards,
 }
 
 impl client::Handler for Client {
@@ -238,6 +264,7 @@ impl client::Handler for Client {
             port: self.port,
             key_type: key.algorithm().to_string(),
             fingerprint: fingerprint.clone(),
+            jump_host: None,
             reply,
         });
         let accepted = answer.await.unwrap_or(false);
@@ -258,6 +285,27 @@ impl client::Handler for Client {
         // otherwise never be seen.
         let text = banner.replace("\r\n", "\n").replace('\n', "\r\n");
         self.sink.data(text.as_bytes());
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        _connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Error> {
+        // Only ports this tab asked the server to forward; anything else is refused.
+        match tunnel::remote_target(&self.forwards, connected_port) {
+            Some(target) => {
+                reply.accept().await;
+                tokio::spawn(tunnel::deliver(channel, target));
+            }
+            None => reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await,
+        }
         Ok(())
     }
 
@@ -327,7 +375,18 @@ pub(super) type Session = Handle<Client>;
 #[derive(Clone)]
 pub struct Connection {
     handle: Arc<Session>,
+    /// Jump hosts the connection runs through, first hop first. They live as
+    /// long as the connection does.
+    hops: Arc<Vec<Hop>>,
+    /// Remote forwards the shell's tunnels registered.
+    remote: tunnel::RemoteForwards,
     users: Arc<()>,
+}
+
+struct Hop {
+    name: String,
+    handle: Session,
+    lost: Arc<Mutex<Option<String>>>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -337,8 +396,8 @@ impl std::fmt::Debug for Connection {
 }
 
 impl Connection {
-    fn new(handle: Session) -> Connection {
-        Connection { handle: Arc::new(handle), users: Arc::new(()) }
+    fn new(handle: Session, hops: Vec<Hop>, remote: tunnel::RemoteForwards) -> Connection {
+        Connection { handle: Arc::new(handle), hops: Arc::new(hops), remote, users: Arc::new(()) }
     }
 
     pub(super) fn handle(&self) -> &Session {
@@ -346,7 +405,14 @@ impl Connection {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.handle.is_closed()
+        self.handle.is_closed() || self.hops.iter().any(|hop| hop.handle.is_closed())
+    }
+
+    /// Why the connection dropped, if a jump host it runs through went first.
+    fn dropped_hop(&self) -> Option<String> {
+        let hop = self.hops.iter().find(|hop| hop.handle.is_closed())?;
+        let reason = hop.lost.lock().take().unwrap_or_else(|| "it closed the connection".into());
+        Some(format!("Connection lost at jump host {}: {reason}", hop.name))
     }
 
     /// Stop using the connection, hanging up if nobody else is.
@@ -354,39 +420,75 @@ impl Connection {
         // into_inner picks exactly one winner when two holders release together.
         if Arc::into_inner(self.users).is_some() {
             let _ = self.handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            for hop in self.hops.iter().rev() {
+                let _ = hop.handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            }
         }
     }
 }
 
-async fn try_password(handle: &mut Session, user: &str, password: &str) -> Result<bool, String> {
-    let result =
-        handle.authenticate_password(user, password).await.map_err(|e| format!("Authentication failed: {e}"))?;
+async fn try_password(handle: &mut Session, user: &str, host: &str, credentials: &Credentials) -> Result<bool, String> {
+    let result = handle
+        .authenticate_password(user, &credentials.password)
+        .await
+        .map_err(|e| format!("Authentication failed: {e}"))?;
     let remaining = match result {
         AuthResult::Success => return Ok(true),
         AuthResult::Failure { remaining_methods, .. } => remaining_methods,
     };
     // A lot of network gear (and PAM-based servers) only accept the
-    // password through keyboard-interactive. Answer its prompts with the
-    // same password, the way paramiko's fallback does.
+    // password through keyboard-interactive, often followed by an MFA code.
     if remaining.contains(&MethodKind::KeyboardInteractive) {
-        return try_keyboard_interactive(handle, user, password).await;
+        return try_keyboard_interactive(handle, user, host, credentials).await;
     }
     Ok(false)
 }
 
-async fn try_keyboard_interactive(handle: &mut Session, user: &str, password: &str) -> Result<bool, String> {
+/// The saved password answers a round that is just one hidden "password"
+/// prompt, once. Anything else (codes, tokens, questions) is for the user.
+fn password_answers(prompts: &[(String, bool)], password: &str, used: bool) -> Option<Vec<String>> {
+    match prompts {
+        [] => Some(Vec::new()),
+        [(text, false)] if !used && !password.is_empty() && text.to_lowercase().contains("password") => {
+            Some(vec![password.to_string()])
+        }
+        _ => None,
+    }
+}
+
+async fn try_keyboard_interactive(
+    handle: &mut Session,
+    user: &str,
+    host: &str,
+    credentials: &Credentials,
+) -> Result<bool, String> {
     let mut response = handle
         .authenticate_keyboard_interactive_start(user, None)
         .await
         .map_err(|e| format!("Authentication failed: {e}"))?;
+    let mut password_used = false;
     // Servers may send several rounds, including empty ones.
     for _ in 0..8 {
         match response {
             KeyboardInteractiveAuthResponse::Success => return Ok(true),
             KeyboardInteractiveAuthResponse::Failure { .. } => return Ok(false),
-            KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
-                let answers =
-                    prompts.iter().map(|p| if p.echo { String::new() } else { password.to_string() }).collect();
+            KeyboardInteractiveAuthResponse::InfoRequest { name, instructions, prompts } => {
+                let prompts: Vec<(String, bool)> = prompts.into_iter().map(|p| (p.prompt, p.echo)).collect();
+                let answers = match password_answers(&prompts, &credentials.password, password_used) {
+                    Some(answers) => {
+                        password_used |= !answers.is_empty();
+                        answers
+                    }
+                    None => {
+                        let Some(ask) = &credentials.ask_prompts else { return Ok(false) };
+                        let (reply, answer) = oneshot::channel();
+                        ask(PromptQuestion { host: host.to_string(), name, instructions, prompts, reply });
+                        match answer.await {
+                            Ok(Some(answers)) => answers,
+                            _ => return Err("Login canceled".into()),
+                        }
+                    }
+                };
                 response = handle
                     .authenticate_keyboard_interactive_respond(answers)
                     .await
@@ -420,32 +522,37 @@ async fn try_key_file(handle: &mut Session, user: &str, path: &Path, passphrase:
 
 type DynAgent = AgentClient<Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin + 'static>>;
 
-async fn connect_agent() -> Option<DynAgent> {
+async fn connect_agents() -> Vec<DynAgent> {
     #[cfg(unix)]
     {
-        AgentClient::connect_env().await.ok().map(|a| a.dynamic())
+        AgentClient::connect_env().await.ok().map(|a| a.dynamic()).into_iter().collect()
     }
     #[cfg(windows)]
     {
+        // Both are tried: connecting to Pageant "succeeds" even when it isn't
+        // running, and only fails on the first request.
+        let mut agents = Vec::new();
         if let Ok(agent) = AgentClient::connect_pageant().await {
-            return Some(agent.dynamic());
+            agents.push(agent.dynamic());
         }
-        AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await.ok().map(|a| a.dynamic())
+        if let Ok(agent) = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
+            agents.push(agent.dynamic());
+        }
+        agents
     }
 }
 
 async fn try_agent(handle: &mut Session, user: &str) -> bool {
-    let Some(mut agent) = connect_agent().await else {
-        return false;
-    };
-    let Ok(identities) = agent.request_identities().await else {
-        return false;
-    };
     let hash = handle.best_supported_rsa_hash().await.ok().flatten().flatten();
-    for identity in identities {
-        let key: PublicKey = identity.public_key().into_owned();
-        if let Ok(AuthResult::Success) = handle.authenticate_publickey_with(user, key, hash, &mut agent).await {
-            return true;
+    for mut agent in connect_agents().await {
+        let Ok(identities) = agent.request_identities().await else {
+            continue;
+        };
+        for identity in identities {
+            let key: PublicKey = identity.public_key().into_owned();
+            if let Ok(AuthResult::Success) = handle.authenticate_publickey_with(user, key, hash, &mut agent).await {
+                return true;
+            }
         }
     }
     false
@@ -468,7 +575,7 @@ async fn try_default_keys(handle: &mut Session, user: &str) -> bool {
 async fn authenticate(handle: &mut Session, profile: &Profile, credentials: &Credentials) -> Result<(), String> {
     let user = if profile.username.is_empty() { local_username() } else { profile.username.clone() };
     let ok = match profile.auth() {
-        Auth::Password => try_password(handle, &user, &credentials.password).await?,
+        Auth::Password => try_password(handle, &user, &profile.host, credentials).await?,
         Auth::Key => {
             let key_ok = if profile.key_file.is_empty() {
                 false
@@ -482,18 +589,21 @@ async fn authenticate(handle: &mut Session, profile: &Profile, credentials: &Cre
     if ok { Ok(()) } else { Err(format!("Authentication failed for {user}@{}", profile.host)) }
 }
 
-/// TCP connect, handshake (with host key check) and authentication.
-async fn establish(
+/// Handshake (with host key check) and authentication over an open stream:
+/// a TCP connection, or a channel through a jump host.
+async fn login<S>(
     profile: &Profile,
+    stream: S,
     credentials: &Credentials,
     ask: HostKeyAsker,
     sink: Arc<dyn Sink>,
     lost: Arc<Mutex<Option<String>>>,
-    access: &crate::network::NetworkAccess,
-) -> Result<Session, String> {
+    forwards: tunnel::RemoteForwards,
+) -> Result<Session, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let host = profile.host.trim().to_string();
-    let stream = connect_tcp(&host, profile.port, access).await?;
-
     // Time spent waiting for the user to answer a host key prompt doesn't
     // count towards the handshake timeout.
     let waiting = Arc::new(AtomicBool::new(false));
@@ -505,6 +615,7 @@ async fn establish(
         waiting_for_user: waiting.clone(),
         sink,
         lost,
+        forwards,
     };
     let handshake = client::connect_stream(Arc::new(client_config(profile)), stream, handler);
     tokio::pin!(handshake);
@@ -527,6 +638,125 @@ async fn establish(
     Ok(handle)
 }
 
+/// One hidden answer from the user for a jump host, such as its password.
+async fn ask_hop_secret(
+    credentials: &Credentials,
+    hop: &Profile,
+    title: &str,
+    prompt: String,
+) -> Result<String, String> {
+    let Some(ask) = &credentials.ask_prompts else {
+        return Err(format!("it needs a {}, and there is nobody to ask", title.to_lowercase()));
+    };
+    let (reply, answer) = oneshot::channel();
+    ask(PromptQuestion {
+        host: format!("Jump host {} ({})", hop.name, hop.host.trim()),
+        name: title.into(),
+        instructions: String::new(),
+        prompts: vec![(prompt, false)],
+        reply,
+    });
+    match answer.await {
+        Ok(Some(mut answers)) if !answers.is_empty() => Ok(answers.swap_remove(0)),
+        _ => Err("Login canceled".into()),
+    }
+}
+
+/// What a jump host needs to log in: its own password or key passphrase,
+/// asked for now and never stored.
+async fn hop_credentials(hop: &Profile, credentials: &Credentials) -> Result<Credentials, String> {
+    let mut password = String::new();
+    let mut key_passphrase = String::new();
+    match hop.auth() {
+        Auth::Password => {
+            let user = if hop.username.is_empty() { local_username() } else { hop.username.clone() };
+            let prompt = format!("Password for {user}@{}:", hop.host.trim());
+            password = ask_hop_secret(credentials, hop, "SSH password", prompt).await?;
+        }
+        Auth::Key if !hop.key_file.is_empty() => {
+            let path = expand_home(&hop.key_file);
+            if let Err(russh::keys::Error::KeyIsEncrypted) = russh::keys::load_secret_key(&path, None) {
+                let prompt = format!("Passphrase for {}:", path.display());
+                key_passphrase = ask_hop_secret(credentials, hop, "Key passphrase", prompt).await?;
+            }
+        }
+        _ => {}
+    }
+    Ok(Credentials {
+        password,
+        key_passphrase,
+        known_hosts: credentials.known_hosts.clone(),
+        ask_prompts: credentials.ask_prompts.clone(),
+        jumps: Vec::new(),
+    })
+}
+
+/// A channel from a jump host to the next host's SSH port.
+async fn open_through(hop: &Hop, next: &Profile) -> Result<russh::ChannelStream<client::Msg>, String> {
+    let host = next.host.trim();
+    let open = hop.handle.channel_open_direct_tcpip(host, next.port.into(), "127.0.0.1", 0);
+    match tokio::time::timeout(CONNECT_TIMEOUT, open).await {
+        Ok(Ok(channel)) => Ok(channel.into_stream()),
+        Ok(Err(e)) => Err(format!("Jump host {} could not reach {host}:{}: {e}", hop.name, next.port)),
+        Err(_) => Err(format!("Jump host {} could not reach {host}:{}: timed out", hop.name, next.port)),
+    }
+}
+
+/// Log in to every jump host in turn, each reaching the next through a
+/// direct-tcpip channel, then to the profile itself. Every host key is checked
+/// under that host's own name and port. Only the first hop is a TCP
+/// connection from this computer, so only it goes through `access`.
+async fn establish(
+    profile: &Profile,
+    credentials: &Credentials,
+    ask: HostKeyAsker,
+    sink: Arc<dyn Sink>,
+    lost: Arc<Mutex<Option<String>>>,
+    access: &crate::network::NetworkAccess,
+) -> Result<Connection, String> {
+    let mut hops: Vec<Hop> = Vec::new();
+    for hop in &credentials.jumps {
+        let named = |e: String| format!("Jump host {}: {e}", hop.name);
+        let secrets = hop_credentials(hop, credentials).await.map_err(named)?;
+        let hop_lost = Arc::new(Mutex::new(None));
+        let hop_ask: HostKeyAsker = {
+            let (ask, name) = (ask.clone(), hop.name.clone());
+            Arc::new(move |mut question: HostKeyQuestion| {
+                question.jump_host = Some(name.clone());
+                ask(question)
+            })
+        };
+        let handle = match hops.last() {
+            None => {
+                let stream = connect_tcp(hop.host.trim(), hop.port, access).await.map_err(named)?;
+                login(hop, stream, &secrets, hop_ask, sink.clone(), hop_lost.clone(), Default::default())
+                    .await
+                    .map_err(named)?
+            }
+            // Already names the hop it went through.
+            Some(previous) => {
+                let stream = open_through(previous, hop).await?;
+                login(hop, stream, &secrets, hop_ask, sink.clone(), hop_lost.clone(), Default::default())
+                    .await
+                    .map_err(named)?
+            }
+        };
+        hops.push(Hop { name: hop.name.clone(), handle, lost: hop_lost });
+    }
+    let remote = tunnel::RemoteForwards::default();
+    let handle = match hops.last() {
+        None => {
+            let stream = connect_tcp(profile.host.trim(), profile.port, access).await?;
+            login(profile, stream, credentials, ask, sink, lost, remote.clone()).await?
+        }
+        Some(previous) => {
+            let stream = open_through(previous, profile).await?;
+            login(profile, stream, credentials, ask, sink, lost, remote.clone()).await?
+        }
+    };
+    Ok(Connection::new(handle, hops, remote))
+}
+
 /// Log in without opening a shell, for a file explorer of its own.
 pub fn connect(
     runtime: &tokio::runtime::Handle,
@@ -541,7 +771,7 @@ pub fn connect(
         let lost = Arc::new(Mutex::new(None));
         tokio::select! {
             result = establish(&profile, &credentials, ask, sink, lost, &access) => {
-                let _ = reply.send(result.map(Connection::new));
+                let _ = reply.send(result);
             }
             // Closing the tab cancels a slow connect.
             () = reply.closed() => {}
@@ -592,13 +822,13 @@ async fn run(
     let lost = Arc::new(Mutex::new(None));
     // Keep an eye on the command queue while connecting, so closing the tab
     // cancels a slow connect and a resize during it isn't lost.
-    let handle = {
+    let connection = {
         let connecting = establish(&profile, &credentials, ask, sink.clone(), lost.clone(), &access);
         tokio::pin!(connecting);
         loop {
             tokio::select! {
                 result = &mut connecting => match result {
-                    Ok(handle) => break handle,
+                    Ok(connection) => break connection,
                     Err(message) => return Some(message),
                 },
                 command = commands.recv() => match command {
@@ -611,7 +841,6 @@ async fn run(
     };
     // Don't keep the password in memory for the life of the session.
     drop(credentials);
-    let connection = Connection::new(handle);
     let handle = connection.handle.clone();
     // Transfers stop when this goes away, however the session ends.
     let alive = Arc::new(());
@@ -627,6 +856,8 @@ async fn run(
         return Some(format!("Could not open a shell: {e}"));
     }
     sink.connected();
+    // Forwards go over this (the final target's) connection and stop when run returns.
+    let _tunnels = tunnel::start(&handle, &profile.tunnels, &connection.remote, &access, sink.clone());
 
     loop {
         tokio::select! {
@@ -634,7 +865,16 @@ async fn run(
                 Some(ChannelMsg::Data { data }) => sink.data(&data),
                 Some(ChannelMsg::ExtendedData { data, .. }) => sink.data(&data),
                 Some(ChannelMsg::Close) | None => {
-                    return Some(lost.lock().take().unwrap_or_else(|| "Connection closed by remote host".into()));
+                    if !connection.hops.is_empty() {
+                        // A hop's end reaches the shell first; give its own report a moment.
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    return Some(
+                        connection
+                            .dropped_hop()
+                            .or_else(|| lost.lock().take())
+                            .unwrap_or_else(|| "Connection closed by remote host".into()),
+                    );
                 }
                 Some(_) => {}
             },
@@ -668,6 +908,20 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn password_answers_only_one_hidden_password_prompt_once() {
+        let prompts = |list: &[(&str, bool)]| list.iter().map(|(t, e)| (t.to_string(), *e)).collect::<Vec<_>>();
+        assert_eq!(password_answers(&[], "pw", false), Some(Vec::new()));
+        assert_eq!(password_answers(&prompts(&[("Password: ", false)]), "pw", false), Some(vec!["pw".into()]));
+        assert_eq!(password_answers(&prompts(&[("admin's PASSWORD:", false)]), "pw", false), Some(vec!["pw".into()]));
+        // Already used, none given, shown while typed, not a password, or more than one prompt.
+        assert_eq!(password_answers(&prompts(&[("Password: ", false)]), "pw", true), None);
+        assert_eq!(password_answers(&prompts(&[("Password: ", false)]), "", false), None);
+        assert_eq!(password_answers(&prompts(&[("Password: ", true)]), "pw", false), None);
+        assert_eq!(password_answers(&prompts(&[("Verification code: ", false)]), "pw", false), None);
+        assert_eq!(password_answers(&prompts(&[("Password: ", false), ("OTP: ", false)]), "pw", false), None);
+    }
 
     const TEST_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
 

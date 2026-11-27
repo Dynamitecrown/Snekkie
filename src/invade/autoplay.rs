@@ -86,7 +86,11 @@ impl Autoplay {
             self.plan = self.plan(run, careless);
         }
         let p = run.player();
-        let boost = if run.rig() == Rig::Bastion && p.mobility_active > 0.0 { 2.2 } else { 1.0 };
+        let boost = if matches!(run.rig(), Rig::Bastion | Rig::Tonk | Rig::Kernel) && p.mobility_active > 0.0 {
+            2.2
+        } else {
+            1.0
+        };
         let mut input =
             steer_input(self.plan, p.heading, p.velocity, run.stats().move_speed * boost, run.rig().flight().turn_rate);
         input.fire = true;
@@ -96,15 +100,15 @@ impl Autoplay {
         input.special = run.phase() == Phase::Combat
             && p.charges > 0
             && match run.rig() {
-                Rig::Probe => run.visible_enemies().next().is_some(),
+                Rig::Probe | Rig::Train | Rig::Relay => run.visible_enemies().next().is_some(),
                 Rig::Ghost => danger > 0.0 && clear_ahead,
-                Rig::Bastion => danger > 0.0,
+                Rig::Bastion | Rig::Tonk | Rig::Kernel => danger > 0.0,
             };
         input.mobility = p.mobility_cooldown <= 0.0
             && danger > 0.0
             && match run.rig() {
-                Rig::Bastion => true,
-                Rig::Probe | Rig::Ghost => clear_ahead,
+                Rig::Bastion | Rig::Tonk | Rig::Kernel => true,
+                Rig::Probe | Rig::Ghost | Rig::Train | Rig::Relay => clear_ahead,
             };
         input
     }
@@ -242,10 +246,11 @@ fn track(run: &InvadeRun, plan: Plan, horizon: f32) -> Vec<(f32, f32, f32, f32)>
     let steps = (horizon / STEP).ceil() as usize;
     let stride = (SAMPLE / STEP).round() as usize;
     for step in 1..=steps {
-        let input_boost = if run.rig() == Rig::Bastion && active > 0.0 { 2.2 } else { 1.0 };
+        let boosts = matches!(run.rig(), Rig::Bastion | Rig::Tonk | Rig::Kernel);
+        let input_boost = if boosts && active > 0.0 { 2.2 } else { 1.0 };
         let input = steer_input(plan, heading, v, base * input_boost, flight.turn_rate);
         active = (active - STEP).max(0.0);
-        let boost = if run.rig() == Rig::Bastion && active > 0.0 { 2.2 } else { 1.0 };
+        let boost = if boosts && active > 0.0 { 2.2 } else { 1.0 };
         let top = base * boost;
         let accel = base / flight.spool * boost;
         let turn = f32::from(i8::from(input.turn_right) - i8::from(input.turn_left));

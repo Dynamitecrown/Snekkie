@@ -332,8 +332,8 @@ fn fork_packets_share_damage_modifiers_but_do_not_inherit_pierce() {
         target(&mut run, (42.75, 15.0), 100.0);
         run.step(FIRE);
         seconds(&mut run, IDLE, 0.7);
-        let primary = if rig == Rig::Bastion { 3.96 } else { 1.32 };
-        let fork = if rig == Rig::Bastion { 1.188 } else { 0.396 };
+        let primary = 1.32 * rig.base().damage;
+        let fork = 0.396 * rig.base().damage;
         assert!((run.enemies[0].hp - (100.0 - primary)).abs() < 1e-4, "{rig:?}");
         for enemy in &run.enemies[1..3] {
             assert!((enemy.hp - (100.0 - fork)).abs() < 1e-4, "{rig:?}: {}", enemy.hp);
@@ -480,7 +480,9 @@ fn perimeter_streams_start_outside_respect_live_caps_and_wait_for_the_full_budge
     run.step(IDLE);
     assert_eq!(run.completed_wave(), 1);
     assert_eq!(run.compromised(), 48, "the QA helper drains and credits queued ships too");
-    assert_eq!(run.score(), 48 * 100 + 100);
+    // The four opening kills lapse during the idle stretch; the helper's 44
+    // form one streak.
+    assert_eq!(run.score(), streaked(0, 4, 100) + streaked(0, 44, 100) + 100);
 }
 
 #[test]
@@ -648,7 +650,8 @@ fn clearing_waves_and_encounters_never_offers_cards_without_collected_experience
 fn score_follows_kills_clear_bonuses_and_encounter_rewards() {
     let mut run = started(1, Rig::Probe);
     clear_encounter(&mut run);
-    assert_eq!(run.score, 48 * 100 + 100);
+    assert_eq!(run.score, streaked(0, 48, 100) + 100, "48 kills in one streak, plus the clear bonus");
+    assert_eq!(streaked(0, 48, 100), 9 * 100 + 10 * 110 + 10 * 120 + 10 * 130 + 9 * 140);
     let seed = seed_with_miniboss_on(4);
     let mut mini = started(seed, Rig::Probe);
     mini.skip_to_wave(4);
@@ -714,9 +717,33 @@ fn milestones_unlock_on_waves_minibosses_gateway_and_devices_before_offers() {
     let mut late = started(1, Rig::Probe);
     late.skip_to_wave(30);
     clear_encounter(&mut late);
-    for unlock in [Unlock::RootAccess, Unlock::Feedback, Unlock::ToolCharge] {
-        assert!(late.is_unlocked(unlock));
+    for unlock in [Unlock::RootAccess, Unlock::Feedback, Unlock::ToolCharge, Unlock::Relay, Unlock::Kernel] {
+        assert!(late.is_unlocked(unlock), "{unlock:?}");
     }
+    let mut balancer = started(1, Rig::Probe);
+    balancer.skip_to_wave(20);
+    clear_encounter(&mut balancer);
+    assert!(balancer.is_unlocked(Unlock::Failover));
+    assert!(!balancer.is_unlocked(Unlock::LogicBomb) && !balancer.is_unlocked(Unlock::Kernel));
+    for unlock in [Unlock::RateLimit, Unlock::Worm, Unlock::Relay] {
+        assert!(balancer.is_unlocked(unlock), "{unlock:?}");
+    }
+    let herder = EncounterKind::Miniboss(MinibossKind::BotHerder);
+    let seed = (0..5000).find(|&s| encounter_for(s, 5) == herder).unwrap();
+    let mut bots = InvadeRun::new(seed, Rig::Probe, [], 0);
+    bots.countdown = 0.0;
+    bots.skip_to_wave(5);
+    clear_encounter(&mut bots);
+    assert!(bots.is_unlocked(Unlock::LogicBomb) && bots.is_unlocked(Unlock::RateLimit));
+    assert!(!bots.is_unlocked(Unlock::Failover) && !bots.is_unlocked(Unlock::Worm));
+    let other = MinibossKind::ALL.into_iter().find(|&k| k != MinibossKind::BotHerder).unwrap();
+    let seed = (0..5000).find(|&s| encounter_for(s, 5) == EncounterKind::Miniboss(other)).unwrap();
+    let mut miniboss = InvadeRun::new(seed, Rig::Probe, [], 0);
+    miniboss.countdown = 0.0;
+    miniboss.skip_to_wave(5);
+    clear_encounter(&mut miniboss);
+    assert!(!miniboss.is_unlocked(Unlock::LogicBomb), "only Bot Herder grants Logic Bomb");
+
     // Already-earned content is not reported again.
     let mut again = InvadeRun::new(1, Rig::Probe, [Unlock::Ghost], 0);
     again.skip_to_wave(6);
@@ -840,7 +867,7 @@ fn bosses_and_minibosses_appear_on_schedule_with_their_health() {
         let mut run = started(1, Rig::Probe);
         run.skip_to_wave(wave);
         let EncounterKind::Boss(kind) = run.encounter() else { panic!("wave {wave}") };
-        assert_eq!(kind, BossKind::CYCLE[((wave / 10 - 1) % 4) as usize]);
+        assert_eq!(kind, BossKind::CYCLE[(wave as usize / 10 - 1) % BossKind::CYCLE.len()]);
         assert_eq!(run.boss_health(), Some((kind.name(), 1.0)));
         let hp: f32 = if kind == BossKind::LoadBalancer { run.pools[0].hp } else { run.enemies[0].hp };
         assert_eq!(hp, boss_hp(wave) as f32);
@@ -878,9 +905,9 @@ fn relay_pair_survivor_speeds_up_and_root_controller_summons_uncredited_guards()
 
     let mut root = started(1, Rig::Probe);
     root.set_immortal();
-    root.skip_to_wave(40);
+    root.skip_to_wave(50);
     seconds(&mut root, IDLE, 2.0);
-    let total = boss_hp(40) as f32;
+    let total = boss_hp(50) as f32;
     let guards = |run: &InvadeRun| run.enemies.iter().filter(|e| e.role == Role::Guard).count();
     for (fraction, expected) in [(0.2, 0), (0.15, 4), (0.2, 8), (0.25, 12)] {
         root.damage(0, total * fraction);
@@ -902,7 +929,7 @@ fn relay_pair_survivor_speeds_up_and_root_controller_summons_uncredited_guards()
 fn telegraphs_warn_and_commit_to_recorded_two_dimensional_positions() {
     let mut run = started(1, Rig::Probe);
     run.set_immortal();
-    run.skip_to_wave(30);
+    run.skip_to_wave(40);
     let mut labels = Vec::new();
     for step in 0..(10.0 / STEP) as usize {
         let weave = step % 200;
@@ -981,7 +1008,7 @@ fn scans_and_bidirectional_curtains_hit_the_actual_player_position() {
 
 #[test]
 fn every_boss_and_miniboss_can_be_survived_with_the_slowest_build() {
-    let encounters: Vec<(u64, u32)> = [10, 20, 30, 40]
+    let encounters: Vec<(u64, u32)> = [10, 20, 30, 40, 50]
         .into_iter()
         .map(|w| (1, w))
         .chain(MinibossKind::ALL.into_iter().map(|kind| {
@@ -995,7 +1022,7 @@ fn every_boss_and_miniboss_can_be_survived_with_the_slowest_build() {
             run.build.add(id);
         }
         // Later bosses represent a developed run, not four early offensive
-        // choices stretched through wave 40. Movement remains the slowest
+        // choices stretched through wave 50. Movement remains the slowest
         // legal speed: Bastion + Grounded, with no Light Frame ranks.
         if wave >= 20 {
             for id in [UpgradeId::Heatsink, UpgradeId::CacheShield] {
@@ -1011,6 +1038,11 @@ fn every_boss_and_miniboss_can_be_survived_with_the_slowest_build() {
         if wave >= 40 {
             for id in [UpgradeId::Heatsink, UpgradeId::ToolAmplifier, UpgradeId::GracePeriod] {
                 run.build.add(id);
+            }
+        }
+        if wave >= 50 {
+            for id in [UpgradeId::Payload, UpgradeId::ClockBoost] {
+                assert!(run.build.add(id), "{id:?}");
             }
         }
         run.stats = stats(Rig::Bastion, &run.build);
@@ -1057,7 +1089,8 @@ fn long_runs_stay_bounded_and_difficulty_stops_scaling() {
             assert!(run.shots.len() <= MAX_SHOTS + 3);
             assert!(run.shots.iter().filter(|s| s.kind == ShotKind::Fragment).count() <= MAX_FRAGMENTS);
             assert!(run.effects.len() <= MAX_EFFECTS);
-            assert!(run.enemies.len() <= 60);
+            // The 60-ship budget, plus two guests from each of at most 8 Hypervisors.
+            assert!(run.enemies.len() <= 60 + 16);
             assert!(run.scans.len() + run.marks.len() <= 8);
             run.completed >= goal
         });
@@ -1142,7 +1175,7 @@ fn mobility_is_rig_specific_follows_the_nose_and_is_independent_of_x_special_cha
         assert_eq!(run.player.charges, 1);
         assert_eq!(run.player.mobility_cooldown, rig.mobility_recharge());
         match rig {
-            Rig::Probe => {
+            Rig::Probe | Rig::Train | Rig::Relay => {
                 while run.player.dash.is_some() {
                     run.step(IDLE);
                 }
@@ -1154,7 +1187,7 @@ fn mobility_is_rig_specific_follows_the_nose_and_is_independent_of_x_special_cha
                 assert!((run.player.x - 54.0).abs() < 0.01 && (run.player.y - 14.0).abs() < 1e-3);
                 assert_eq!(run.player.speed(), 0.0, "Blink keeps the momentum it had");
             }
-            Rig::Bastion => {
+            Rig::Bastion | Rig::Tonk | Rig::Kernel => {
                 seconds(&mut run, THRUST, 0.25);
                 seconds(&mut plain, THRUST, 0.25);
                 assert!((run.player.speed() / plain.player.speed() - BOOST).abs() < 0.01);
@@ -1346,14 +1379,14 @@ fn protected_curtain_crossings_do_not_consume_the_wall_after_the_ship_moves_away
 #[test]
 fn every_single_aimed_packet_follows_a_warning_from_its_source() {
     let seed_for = |kind| (0..2000u64).find(|&s| encounter_for(s, 7) == EncounterKind::Miniboss(kind)).unwrap();
-    let cases = [(seed_for(MinibossKind::PortSentry), 7), (seed_for(MinibossKind::TraceHunter), 7), (1, 40), (1, 3)];
+    let cases = [(seed_for(MinibossKind::PortSentry), 7), (seed_for(MinibossKind::TraceHunter), 7), (1, 50), (1, 3)];
     for (seed, wave) in cases {
         let mut run = started(seed, Rig::Probe);
         run.set_immortal();
         run.skip_to_wave(wave);
-        if wave == 40 {
+        if wave == 50 {
             // Summon the guards.
-            let total = boss_hp(40) as f32;
+            let total = boss_hp(50) as f32;
             run.damage(0, total * 0.3);
         }
         let mut player = Autoplay::new(Skill::EXPERT, seed);
@@ -1597,7 +1630,7 @@ fn bosses_trail_the_camera_more_slowly_than_the_ship_and_cannot_be_left_behind()
     let slowest = stats(Rig::Bastion, &Build::default().with(UpgradeId::Grounded)).move_speed;
     assert!(FRAME_SPEED < slowest, "{FRAME_SPEED} vs {slowest}");
     let boss = |run: &InvadeRun| run.enemies().find(|e| matches!(e.role, Role::Boss(_))).unwrap().center();
-    for wave in [10, 20, 30, 40] {
+    for wave in [10, 20, 30, 40, 50] {
         let mut run = started(1, Rig::Probe);
         run.set_immortal();
         run.skip_to_wave(wave);
@@ -1614,7 +1647,8 @@ fn bosses_trail_the_camera_more_slowly_than_the_ship_and_cannot_be_left_behind()
     // Even the fastest rig fleeing in any direction keeps the encounter in
     // view, and the formation is never carried onto the ship.
     let seed_for = |kind| (0..2000u64).find(|&s| encounter_for(s, 7) == EncounterKind::Miniboss(kind)).unwrap();
-    let encounters = [10, 20, 30, 40].map(|w| (1, w)).into_iter().chain(MinibossKind::ALL.map(|k| (seed_for(k), 7)));
+    let encounters =
+        [10, 20, 30, 40, 50].map(|w| (1, w)).into_iter().chain(MinibossKind::ALL.map(|k| (seed_for(k), 7)));
     for (seed, wave) in encounters {
         for flee in [LEFT, RIGHT, UP, DOWN, heading_of((1.0, -1.0))] {
             let mut run = started(seed, Rig::Ghost);
@@ -1718,6 +1752,68 @@ fn all_six_weapons_damage_through_their_own_paths() {
     let d = spec(&run).damage;
     let lost = hp_lost(&run);
     assert!(close_to(lost[0], d) && close_to(lost[1], d) && lost[2] == 0.0, "Pulse {lost:?}");
+}
+
+#[test]
+fn evolved_weapons_really_fire_their_bonus_in_the_sim() {
+    let evolved = |kind: WeaponKind| {
+        let mut run = armed(kind);
+        run.weapons[0].rank = WEAPON_RANK_CAP;
+        run
+    };
+    let fire = |run: &mut InvadeRun| run.step(Input { fire: true, ..IDLE });
+    let spec = |run: &InvadeRun| run.weapons[0].spec(run.rig, &run.stats);
+
+    // Packet and Worm: two fanned shots per volley instead of one.
+    for (kind, shot) in [(WeaponKind::Packet, ShotKind::Primary), (WeaponKind::Worm, ShotKind::Worm)] {
+        let mut run = evolved(kind);
+        fire(&mut run);
+        assert_eq!(run.shots.iter().filter(|s| s.kind == shot).count(), 2, "{kind:?}");
+        let headings: Vec<f32> = run.shots.iter().map(|shot| (shot.vy * ASPECT).atan2(shot.vx)).collect();
+        assert!(close_to((headings[1] - headings[0]).abs(), 6.0f32.to_radians()), "{kind:?} {headings:?}");
+    }
+    // Scatter and Flamethrower: wider fans.
+    for (kind, count) in [(WeaponKind::Scatter, 9), (WeaponKind::Flamethrower, 5)] {
+        let mut run = evolved(kind);
+        fire(&mut run);
+        assert_eq!(run.shots.len(), count, "{kind:?}");
+    }
+    // Scatter and Rail: the extra pierce rides on every shot.
+    for kind in [WeaponKind::Scatter, WeaponKind::Rail] {
+        let mut run = evolved(kind);
+        fire(&mut run);
+        let four = kind.spec(WEAPON_RANK_CAP - 1, run.rig, &run.stats).pierce;
+        assert!(run.shots.iter().all(|s| s.pierce == spec(&run).pierce && s.pierce > four), "{kind:?}");
+    }
+    // Orbit and Shield: more orbitals per activation.
+    for (kind, count) in [(WeaponKind::Orbit, 6), (WeaponKind::Shield, 4)] {
+        let mut run = evolved(kind);
+        fire(&mut run);
+        assert_eq!(run.orbitals().len(), count, "{kind:?}");
+    }
+
+    // Storm Arc: five distinct devices, and no sixth.
+    let mut run = evolved(WeaponKind::Arc);
+    for at in [(38.5, 21.5), (50.5, 21.5), (50.5, 15.5), (62.5, 15.5), (62.5, 21.5), (74.5, 21.5)] {
+        target(&mut run, at, 100.0);
+    }
+    fire(&mut run);
+    let d = spec(&run).damage;
+    let lost = hp_lost(&run);
+    assert!(lost[..5].iter().all(|&l| close_to(l, d)) && lost[5] == 0.0, "Storm Arc {lost:?}");
+
+    // Shockwave: reaches a device 15 units out, beyond rank 5's 13.
+    let mut run = evolved(WeaponKind::Pulse);
+    let x = run.player.x + 15.0;
+    let y = run.player.y;
+    target(&mut run, (x, y), 100.0);
+    fire(&mut run);
+    assert!(close_to(hp_lost(&run)[0], spec(&run).damage), "Shockwave {:?}", hp_lost(&run));
+
+    // Cluster Bomb: the blast uses the evolved radius.
+    let run = evolved(WeaponKind::Mine);
+    assert_eq!(run.blast(ShotKind::Mine), Some(spec(&run).radius));
+    assert!(close_to(spec(&run).radius, 11.0));
 }
 
 #[test]
@@ -1849,7 +1945,8 @@ fn asteroid_contacts_push_and_bounce_and_use_the_same_hit_protection_as_packets(
                 run.player.x < before && run.player.velocity.0 < 0.0,
                 "the rock pushes back and reverses incoming momentum"
             );
-            let expected = if protection == 0 { MAX_INTEGRITY - rig.base().hit_cost } else { MAX_INTEGRITY };
+            let full = rig.base().max_integrity;
+            let expected = if protection == 0 { full - rig.base().hit_cost } else { full };
             assert_eq!(run.integrity(), expected, "{rig:?} protection {protection}");
             assert!(!run.player.shield_ready);
             let damage = run.integrity();
@@ -1933,7 +2030,7 @@ fn enemy_flight_steers_around_a_rock_instead_of_flying_straight_through_it() {
 #[test]
 fn root_guards_warn_only_while_visible_but_keep_their_committed_warning() {
     let mut run = started(1, Rig::Probe);
-    run.skip_to_wave(40);
+    run.skip_to_wave(50);
     for enemy in &mut run.enemies {
         enemy.entry = None;
         enemy.entered = true;
@@ -1960,7 +2057,7 @@ fn root_guards_warn_only_while_visible_but_keep_their_committed_warning() {
 fn root_streams_warn_then_sweep_outward_from_the_recorded_point_without_tracking_the_ship() {
     let mut run = started(1, Rig::Bastion);
     run.clear_asteroids();
-    run.skip_to_wave(40);
+    run.skip_to_wave(50);
     for e in &mut run.enemies {
         e.entry = None;
         e.entered = true;
@@ -2211,13 +2308,15 @@ fn missile_blast_damages_a_shared_boss_pool_once_and_amplifier_increases_blast()
             e.pool = Some(0);
         }
     }
-    run.explode((42.0, 23.0), 12.0);
+    let radius = run.blast(ShotKind::Missile).unwrap();
+    run.explode((42.0, 23.0), 12.0, radius);
     assert_eq!(run.pools[0].hp, 88.0);
     assert_eq!(run.effects.last().unwrap().radius, 8.0);
     run.grant(UpgradeId::ToolAmplifier);
     run.launch_missile();
     assert_eq!(run.shots[0].damage, 14.0);
-    run.explode((42.0, 23.0), 14.0);
+    let radius = run.blast(ShotKind::Missile).unwrap();
+    run.explode((42.0, 23.0), 14.0, radius);
     assert_eq!(run.effects.last().unwrap().radius, 9.0);
 }
 
@@ -2227,6 +2326,8 @@ fn elites_are_rare_seeded_tougher_and_drop_their_unique_cargo_once() {
     let mut b = quiet(Rig::Probe);
     a.wave = 4;
     b.wave = 4;
+    a.unlocked.insert(Unlock::Failover);
+    b.unlocked.insert(Unlock::Failover);
     for _ in 0..1000 {
         a.spawn_device(DeviceKind::Endpoint, None);
         b.spawn_device(DeviceKind::Endpoint, None);
@@ -2243,13 +2344,14 @@ fn elites_are_rare_seeded_tougher_and_drop_their_unique_cargo_once() {
     for index in 0..a.enemies.len() {
         a.damage(index, 100000.0);
     }
-    assert_eq!(a.item_drops.len(), 2, "duplicates never fill the world");
+    assert_eq!(a.item_drops.len(), ItemKind::ALL.len(), "duplicates never fill the world");
     assert_eq!(
         a.orbs.iter().map(|o| o.value).sum::<u64>(),
         1000 + a.enemies.iter().filter(|e| e.elite).count() as u64 * 4
     );
     let mut run = quiet(Rig::Probe);
-    for _ in 0..2 {
+    run.unlocked.insert(Unlock::Failover);
+    for _ in ItemKind::ALL {
         run.place_elite((50.0, 26.0));
         let i = run.enemies.len() - 1;
         run.damage(i, 10000.0);
@@ -2257,25 +2359,47 @@ fn elites_are_rare_seeded_tougher_and_drop_their_unique_cargo_once() {
     }
     let mut kinds: Vec<_> = run.item_drops.iter().map(|d| d.kind).collect();
     kinds.sort();
-    assert_eq!(kinds, ItemKind::ALL, "the second elite drops the other item");
-    assert_eq!(run.compromised, 2);
+    assert_eq!(kinds, ItemKind::ALL, "each elite drops an item not yet dropped");
+    assert_eq!(run.compromised, ItemKind::ALL.len() as u64);
 }
 
 #[test]
 fn elites_never_drop_an_item_the_player_has_equipped() {
     for seed in 0..40 {
-        let mut run = InvadeRun::new(seed, Rig::Probe, [], 0);
-        run.collect_item(ItemKind::JumboFrame);
+        let mut run = InvadeRun::new(seed, Rig::Probe, [Unlock::Failover], 0);
+        let (last, held) = ItemKind::ALL.split_last().unwrap();
+        for &kind in held {
+            run.collect_item(kind);
+        }
         run.place_elite((50.0, 26.0));
         let i = run.enemies.len() - 1;
         run.damage(i, 10000.0);
-        assert_eq!(run.item_drops.iter().map(|d| d.kind).collect::<Vec<_>>(), [ItemKind::PortMirroring]);
+        assert_eq!(run.item_drops.iter().map(|d| d.kind).collect::<Vec<_>>(), [*last]);
         run.item_drops.clear();
-        run.collect_item(ItemKind::PortMirroring);
+        run.collect_item(*last);
         run.place_elite((50.0, 26.0));
         let i = run.enemies.len() - 1;
         run.damage(i, 10000.0);
         assert!(run.item_drops.is_empty(), "nothing left to drop");
+    }
+}
+
+#[test]
+fn failover_never_drops_until_load_balancer_unlocks_it() {
+    for seed in 0..40 {
+        let mut run = InvadeRun::new(seed, Rig::Probe, [], 0);
+        for kind in ItemKind::ALL.into_iter().filter(|&k| k != ItemKind::Failover) {
+            run.collect_item(kind);
+        }
+        run.place_elite((50.0, 26.0));
+        let i = run.enemies.len() - 1;
+        run.damage(i, 10000.0);
+        assert!(run.item_drops.is_empty(), "a locked item is never chosen");
+        run.unlocked.insert(Unlock::Failover);
+        run.place_elite((50.0, 26.0));
+        let i = run.enemies.len() - 1;
+        run.damage(i, 10000.0);
+        assert_eq!(run.item_drops.iter().map(|d| d.kind).collect::<Vec<_>>(), [ItemKind::Failover]);
     }
 }
 
@@ -2384,4 +2508,621 @@ fn missile_amplifier_cards_describe_the_selected_specials_actual_damage_and_radi
     assert_eq!(run.cards()[0].effect, "Missile blast damage 14 -> 16; radius 9 -> 10.");
     run.set_pivot_kind(PivotKind::Chain);
     assert!(run.cards()[0].effect.contains("Pivot chains"));
+}
+
+#[test]
+fn ghost_cloak_is_wave_locked_unhittable_for_three_seconds_and_hides_from_the_swarm() {
+    let mut locked = quiet(Rig::Ghost);
+    locked.set_pivot_kind(PivotKind::Cloak);
+    assert_eq!(locked.pivot_kind(), PivotKind::Chain, "Cloak needs its wave unlock");
+    let mut probe = quiet(Rig::Probe);
+    probe.unlocked.insert(Unlock::Cloak);
+    probe.set_pivot_kind(PivotKind::Cloak);
+    assert_eq!(probe.pivot_kind(), PivotKind::Chain, "Cloak is Ghost's alone");
+    assert_eq!(Unlock::Cloak.wave(), Some(10));
+
+    let mut run = quiet(Rig::Ghost);
+    run.unlocked.insert(Unlock::Cloak);
+    run.set_pivot_kind(PivotKind::Cloak);
+    assert_eq!(run.pivot_kind(), PivotKind::Cloak);
+    let x = run.player.x;
+    run.step(Input { special: true, ..IDLE });
+    assert_eq!(run.player.x, x, "Cloak does not dash");
+    assert!(run.player.cloak > 2.9 && run.player.protection > 2.9);
+    seconds(&mut run, IDLE, 2.5);
+    hostile_at_player(&mut run);
+    seconds(&mut run, IDLE, 0.3);
+    assert_eq!(run.integrity, run.max_integrity(), "unhittable while cloaked");
+    seconds(&mut run, IDLE, 0.5);
+    assert_eq!(run.player.cloak, 0.0);
+    hostile_at_player(&mut run);
+    seconds(&mut run, IDLE, 0.3);
+    assert!(run.integrity < run.max_integrity(), "visible and hittable again");
+
+    let mut hidden = started(3, Rig::Ghost);
+    hidden.player.cloak = 1000.0;
+    hidden.player.protection = 1000.0;
+    seconds(&mut hidden, IDLE, 20.0);
+    assert!(hidden.hostiles.is_empty() && hidden.marks.is_empty(), "ordinary ships cannot target a cloaked Ghost");
+}
+
+#[test]
+fn tonk_is_slow_and_tough_and_reflect_bounces_ordinary_packets_back() {
+    let tonk = Rig::Tonk.base();
+    for rig in Rig::ALL.into_iter().filter(|&r| r != Rig::Tonk) {
+        assert!(tonk.move_speed < rig.base().move_speed && tonk.max_integrity > rig.base().max_integrity);
+    }
+    assert!(tonk.move_speed > FRAME_SPEED, "bosses still trail the camera");
+    let mut run = quiet(Rig::Tonk);
+    assert_eq!(run.integrity(), 8);
+    run.step(Input { special: true, ..IDLE });
+    assert!(run.player.barrier && (run.player.protection - run.stats.reflect_protection).abs() < 0.02);
+    hostile_at_player(&mut run);
+    seconds(&mut run, IDLE, 0.3);
+    assert_eq!(run.integrity(), 8);
+    assert!(run.shots.iter().any(|s| s.kind == ShotKind::Reflected), "the packet comes back");
+}
+
+#[test]
+fn train_tail_cars_grow_from_level_ups_follow_like_a_snake_and_can_be_hit() {
+    let mut run = quiet(Rig::Train);
+    assert!(run.player.tail.is_empty());
+    let ctx = run.offer_context();
+    assert!(crate::invade::upgrades::eligible(&ctx, |_| true).contains(&UpgradeId::TailCar));
+    let probe = quiet(Rig::Probe);
+    assert!(!crate::invade::upgrades::eligible(&probe.offer_context(), |_| true).contains(&UpgradeId::TailCar));
+    let before = run.stats;
+    for _ in 0..3 {
+        run.grant(UpgradeId::TailCar);
+    }
+    assert!(run.stats.damage > before.damage && run.stats.fire_rate > before.fire_rate);
+    run.set_flight(RIGHT, (0.0, 0.0));
+    seconds(&mut run, THRUST, 1.5);
+    assert_eq!(run.player.tail.len(), 3);
+    let mut leader = (run.player.x, run.player.y + 0.5);
+    for &car in &run.player.tail {
+        assert!(car.0 < leader.0, "cars trail behind the head");
+        assert!(visual_distance(car, leader) <= TAIL_SPACING + 0.01);
+        leader = car;
+    }
+    let car = *run.player.tail.last().unwrap();
+    run.player.velocity = (0.0, 0.0);
+    run.hostiles.push(Hostile {
+        unblockable: false,
+        kind: HostileKind::Straight,
+        x: car.0,
+        y: car.1 - 2.0,
+        vx: 0.0,
+        vy: 15.0,
+    });
+    seconds(&mut run, IDLE, 0.3);
+    assert!(run.integrity() < run.max_integrity(), "the tail is a bigger target");
+}
+
+#[test]
+fn stinger_is_late_short_slow_and_its_poison_stacks_and_ticks_slowly() {
+    let mut run = quiet(Rig::Bastion);
+    run.set_pivot_kind(PivotKind::Stinger);
+    assert_eq!(run.pivot_kind(), PivotKind::Chain, "locked until wave 25");
+    assert_eq!(Unlock::Stinger.wave(), Some(25));
+    for rig in Rig::ALL {
+        assert!(PivotKind::options(rig).contains(&PivotKind::Stinger), "{rig:?}");
+    }
+    run.unlocked.insert(Unlock::Stinger);
+    run.set_pivot_kind(PivotKind::Stinger);
+    assert_eq!(run.pivot_kind(), PivotKind::Stinger);
+    run.player.x = 40.0;
+    let near = target(&mut run, (38.5, 22.0), 100.0);
+    let far = target(&mut run, (38.5, 2.0), 100.0);
+    run.step(Input { special: true, aim: Some((40.0, -1000.0)), ..IDLE });
+    let glob = run.shots.iter().find(|s| s.kind == ShotKind::Stinger).unwrap();
+    assert!(glob.radius > 0.5 && glob.vx.hypot(glob.vy * ASPECT) < SHOT_SPEED, "big and slow");
+    seconds(&mut run, IDLE, 0.5);
+    let poisoned = |run: &InvadeRun, id| run.enemies.iter().find(|e| e.id == id).unwrap().clone();
+    assert_eq!(poisoned(&run, near).poison, 1);
+    assert_eq!(poisoned(&run, far).poison, 0, "short range");
+    assert!(poisoned(&run, near).hp > 99.0, "no burst damage, only poison over time");
+    run.player.charges = 1;
+    run.step(Input { special: true, aim: Some((40.0, -1000.0)), ..IDLE });
+    seconds(&mut run, IDLE, 0.5);
+    assert_eq!(poisoned(&run, near).poison, 2, "stacks");
+    let hp = poisoned(&run, near).hp;
+    seconds(&mut run, IDLE, 1.0);
+    let lost = hp - poisoned(&run, near).hp;
+    assert!((lost - 2.0 * run.poison_per_stack()).abs() < 0.05, "{lost}");
+    seconds(&mut run, IDLE, POISON_DURATION);
+    assert_eq!(poisoned(&run, near).poison, 0, "poison wears off");
+}
+
+#[test]
+fn poison_outlasts_every_rigs_recharge_so_repeat_casts_really_stack() {
+    for rig in Rig::ALL {
+        assert!(POISON_DURATION > rig.base().recharge, "{rig:?}");
+    }
+    let mut run = quiet(Rig::Probe);
+    run.unlocked.insert(Unlock::Stinger);
+    run.set_pivot_kind(PivotKind::Stinger);
+    run.player.x = 40.0;
+    let id = target(&mut run, (38.5, 22.0), 10_000.0);
+    let aim = Some((40.0, -1000.0));
+    for stacks in 1..=3 {
+        run.step(Input { special: true, aim, ..IDLE });
+        let wait = run.stats.recharge + 0.1;
+        seconds(&mut run, IDLE, wait);
+        assert_eq!(run.enemies.iter().find(|e| e.id == id).unwrap().poison, stacks);
+    }
+    run.enemies[0].poison = POISON_MAX_STACKS;
+    run.poison_cloud((39.0, 22.0));
+    assert_eq!(run.enemies[0].poison, POISON_MAX_STACKS, "stacks are capped");
+}
+
+#[test]
+fn linked_boss_parts_take_one_poison_stack_between_them() {
+    let mut run = quiet(Rig::Probe);
+    let first = target(&mut run, (38.0, 20.0), 100.0);
+    let second = target(&mut run, (42.0, 20.0), 100.0);
+    run.pools.push(Pool { hp: 100.0, alive: true });
+    run.enemies.iter_mut().for_each(|e| e.pool = Some(0));
+    run.poison_cloud((40.0, 20.0));
+    let stacks: u8 = run.enemies.iter().filter(|e| [first, second].contains(&e.id)).map(|e| e.poison).sum();
+    assert_eq!(stacks, 1);
+    seconds(&mut run, IDLE, 1.1);
+    assert!(
+        (run.pools[0].hp - (100.0 - run.poison_per_stack())).abs() < 0.05,
+        "the shared pool ticks once: {}",
+        run.pools[0].hp
+    );
+}
+
+#[test]
+fn level_cards_describe_the_equipped_cloak_or_stinger_not_the_rigs_own_special() {
+    let mut run = quiet(Rig::Ghost);
+    run.unlocked.extend([Unlock::Cloak, Unlock::Stinger]);
+    run.set_pivot_kind(PivotKind::Stinger);
+    run.offers = vec![
+        LevelChoice::Module(Offer::Upgrade(UpgradeId::ToolAmplifier)),
+        LevelChoice::Module(Offer::Upgrade(UpgradeId::Heatsink)),
+    ];
+    let cards = run.cards();
+    assert_eq!(cards[0].effect, "Poison 1.00 -> 1.17 damage per second per stack.");
+    assert!(cards[1].effect.starts_with("Stinger recharge"), "{}", cards[1].effect);
+
+    run.set_pivot_kind(PivotKind::Cloak);
+    for seed in 0..64 {
+        run.xp = u64::from(run.experience_needed());
+        run.offer_count = seed;
+        run.phase = Phase::Combat;
+        assert!(run.enter_level_choice());
+        assert!(
+            !run.offers.contains(&LevelChoice::Module(Offer::Upgrade(UpgradeId::ToolAmplifier))),
+            "Cloak's fixed length makes Tool Amplifier a dead pick"
+        );
+    }
+}
+
+#[test]
+fn worm_homes_on_a_device_off_its_aim_and_burrows_on_to_the_next() {
+    let mut run = armed(WeaponKind::Worm);
+    // FIRE aims straight up; both devices sit off to the sides.
+    target(&mut run, (50.0, 22.0), 100.0);
+    target(&mut run, (30.0, 23.0), 100.0);
+    run.step(FIRE);
+    assert_eq!(run.shots.iter().map(|s| s.kind).collect::<Vec<_>>(), [ShotKind::Worm]);
+    seconds(&mut run, IDLE, 4.0);
+    let spec = WeaponKind::Worm.spec(1, Rig::Probe, &run.stats);
+    let mut lost = hp_lost(&run);
+    lost.sort_by(f32::total_cmp);
+    assert!((lost[0] - spec.damage * PIERCE_RETAIN).abs() < 1e-4 && (lost[1] - spec.damage).abs() < 1e-4, "{lost:?}");
+    assert!(run.shots.is_empty(), "one extra device at rank 1, then it is spent");
+}
+
+#[test]
+fn logic_bombs_stay_put_and_blast_what_touches_them_or_when_their_timer_ends() {
+    let mut run = armed(WeaponKind::Mine);
+    run.step(FIRE);
+    let spec = WeaponKind::Mine.spec(1, Rig::Probe, &run.stats);
+    let bomb = (run.shots[0].x, run.shots[0].y);
+    seconds(&mut run, IDLE, 1.0);
+    assert_eq!((run.shots[0].x, run.shots[0].y), bomb, "it stays where it was dropped");
+    // One device on the bomb, one inside the blast only, one outside it.
+    target(&mut run, (bomb.0 - 1.5, bomb.1 - 0.5), 100.0);
+    target(&mut run, (bomb.0 + 3.0, bomb.1 - 0.5), 100.0);
+    target(&mut run, (bomb.0 + 12.0, bomb.1 - 0.5), 100.0);
+    run.step(IDLE);
+    assert!(run.shots.is_empty());
+    assert_eq!(hp_lost(&run), [spec.damage, spec.damage, 0.0]);
+
+    let mut timed = armed(WeaponKind::Mine);
+    timed.step(FIRE);
+    target(&mut timed, (bomb.0 + 3.0, bomb.1 - 0.5), 100.0);
+    seconds(&mut timed, IDLE, spec.range - 0.5);
+    assert_eq!((timed.shots.len(), hp_lost(&timed)), (1, vec![0.0]), "untouched and still armed");
+    seconds(&mut timed, IDLE, 1.0);
+    assert_eq!((timed.shots.len(), hp_lost(&timed)), (0, vec![spec.damage]));
+}
+
+#[test]
+fn rate_limit_slows_packets_and_ordinary_ships_until_it_runs_out() {
+    let mut run = quiet(Rig::Bastion);
+    run.unlocked.insert(Unlock::RateLimit);
+    run.set_pivot_kind(PivotKind::RateLimit);
+    assert_eq!(run.special_name(), "Rate Limit");
+    run.hostiles.push(Hostile { unblockable: false, kind: HostileKind::Straight, x: 10.0, y: 14.0, vx: 6.0, vy: 0.0 });
+    let advance = |run: &mut InvadeRun, input| {
+        let x = run.hostiles[0].x;
+        run.step(input);
+        run.hostiles[0].x - x
+    };
+    let free = advance(&mut run, IDLE);
+    let slowed = advance(&mut run, Input { special: true, ..IDLE });
+    assert!((slowed / free - RATE_LIMIT_SLOW).abs() < 0.01, "{slowed} vs {free}");
+    assert!(!run.player.barrier, "it replaces Bastion's Barrier");
+
+    let ship = run.add_enemy(Role::Device(DeviceKind::Endpoint), (60.0, 20.0), (3.0, 1.0), 4.0, true, 100);
+    let index = run.alive_index(ship).unwrap();
+    for _ in 0..30 {
+        let x = run.enemies[index].x;
+        run.fly_ship(index);
+        let e = &run.enemies[index];
+        assert!((e.x - x - e.velocity.0 * STEP * RATE_LIMIT_SLOW).abs() < 1e-5);
+    }
+    assert_eq!(run.rate_limit_time(), RATE_LIMIT_TIME);
+    seconds(&mut run, IDLE, RATE_LIMIT_TIME);
+    assert_eq!(run.rate_limited(), 0.0);
+    assert!((advance(&mut run, IDLE) / free - 1.0).abs() < 0.01);
+    run.grant(UpgradeId::ToolAmplifier);
+    assert_eq!(run.rate_limit_time(), RATE_LIMIT_TIME + 1.0);
+}
+
+#[test]
+fn failover_survives_one_fatal_hit_and_packet_sniffer_doubles_the_magnet() {
+    let mut run = quiet(Rig::Probe);
+    run.collect_item(ItemKind::Failover);
+    run.lose();
+    assert_eq!((run.integrity(), run.phase), (1, Phase::Combat));
+    assert!(run.items().next().is_none(), "Failover is spent");
+    assert!(run.player.protection >= 2.0);
+    run.lose();
+    assert_eq!(run.ended(), Some(EndReason::Defeated));
+
+    // The default Collector magnet reaches 10.5; this orb lies beyond it.
+    let mut run = quiet(Rig::Probe);
+    let x = run.player.x + XP_MAGNET_RADIUS * 2.0;
+    run.spawn_experience(x, run.player.y + 0.5, 1);
+    run.step(IDLE);
+    assert_eq!(run.orbs[0].x, x, "out of reach");
+    run.collect_item(ItemKind::PacketSniffer);
+    run.step(IDLE);
+    assert!(run.orbs[0].x < x, "pulled in from twice as far");
+}
+
+#[test]
+fn hypervisors_release_two_endpoints_and_bots_never_shoot() {
+    let mut run = quiet(Rig::Probe);
+    run.add_enemy(Role::Device(DeviceKind::Hypervisor), (50.0, 20.0), (3.0, 1.0), 10.0, true, 300);
+    run.damage(0, 100.0);
+    let hp = device_hp(DeviceKind::Endpoint.base_hp(), run.wave) as f32;
+    let guests: Vec<_> = run.enemies().map(|e| (e.role, e.hp, e.velocity.0.signum())).collect();
+    assert_eq!(guests, [-1.0, 1.0].map(|side| (Role::Device(DeviceKind::Endpoint), hp, side)));
+    assert_eq!((run.compromised, run.orbs.len()), (1, 1));
+    run.defeat_all();
+    assert_eq!((run.enemies().count(), run.compromised), (0, 3), "one pass clears the guests as well");
+
+    let mut run = quiet(Rig::Probe);
+    run.add_enemy(Role::Device(DeviceKind::Bot), (10.0, 14.0), (3.0, 1.0), 2.0, true, 60);
+    run.swarm_shot();
+    assert!(run.marks.is_empty(), "a Bot only rams");
+    run.add_enemy(Role::Device(DeviceKind::Hypervisor), (10.0, 16.0), (3.0, 1.0), 10.0, true, 300);
+    run.swarm_shot();
+    assert_eq!(run.marks.len(), 1);
+    let slowest = stats(Rig::Tonk, &Build::default().with(UpgradeId::Grounded)).move_speed;
+    assert!(flight_speed(DeviceKind::Bot, 60) < slowest, "every rig can outrun a Bot");
+}
+
+#[test]
+fn bot_herder_calls_a_bounded_pack_of_uncredited_bots() {
+    let herder = EncounterKind::Miniboss(MinibossKind::BotHerder);
+    let seed = (0..2000).find(|&s| encounter_for(s, 7) == herder).unwrap();
+    let mut run = started(seed, Rig::Probe);
+    run.set_immortal();
+    run.skip_to_wave(7);
+    let bots = |run: &InvadeRun| run.enemies().filter(|e| e.role == Role::Device(DeviceKind::Bot)).count();
+    let mut most = 0;
+    for _ in 0..(40.0 / STEP) as usize {
+        run.step(IDLE);
+        // Hold the called Bots where they appear: a Bot that rams the ship is
+        // spent, which would otherwise keep the pack below its cap.
+        for e in run.enemies.iter_mut().filter(|e| e.role == Role::Device(DeviceKind::Bot)) {
+            e.velocity = (0.0, 0.0);
+        }
+        most = most.max(bots(&run));
+    }
+    assert_eq!(most, HERDER_BOTS);
+    let before = (run.score, run.compromised);
+    let orbs = run.orbs.len();
+    for i in 0..run.enemies.len() {
+        if matches!(run.enemies[i].role, Role::Device(_)) {
+            run.damage(i, 1e6);
+        }
+    }
+    assert_eq!((bots(&run), (run.score, run.compromised)), (0, before), "reinforcements award nothing");
+    assert_eq!(run.orbs.len(), orbs, "called Bots drop no EXP either");
+    assert_eq!(run.encounter(), herder, "the Herder itself still has to be destroyed");
+}
+
+#[test]
+fn bots_burst_on_contact_for_nothing_even_when_the_hit_is_absorbed() {
+    let ram = |kind, protection| {
+        let mut run = quiet(Rig::Probe);
+        run.player.protection = protection;
+        run.add_enemy(Role::Device(kind), (run.player.x - 1.0, run.player.y), (3.0, 1.0), 4.0, true, 60);
+        let before = (run.integrity(), run.score, run.compromised, run.orbs.len());
+        run.step(IDLE);
+        let after = (run.integrity(), run.score, run.compromised, run.orbs.len());
+        (run.enemies.iter().any(|e| e.alive), before, after)
+    };
+    let (alive, before, after) = ram(DeviceKind::Bot, 0.0);
+    assert!(!alive);
+    assert_eq!((after.0, after.1, after.2, after.3), (before.0 - 1, before.1, before.2, before.3));
+    let (alive, before, after) = ram(DeviceKind::Bot, 1.0);
+    assert!(!alive, "it pops harmlessly against protection");
+    assert_eq!(after, before);
+    assert!(ram(DeviceKind::Endpoint, 0.0).0, "other devices survive a collision");
+}
+
+#[test]
+fn repeaters_patch_the_most_damaged_device_in_range_and_never_shoot() {
+    let mut run = quiet(Rig::Probe);
+    run.add_enemy(Role::Device(DeviceKind::Repeater), (50.0, 20.0), (3.0, 1.0), 6.0, true, 250);
+    run.enemies[0].entered = true;
+    run.enemies[0].cooldown = 0.0;
+    target(&mut run, (58.0, 20.0), 12.0);
+    let far = target(&mut run, (50.0 + REPAIR_RANGE + 10.0, 20.0), 12.0);
+    let far = run.alive_index(far).unwrap();
+    run.enemies[far].hp = 2.0;
+    run.enemies[1].hp = 12.0;
+
+    run.repair_devices();
+    assert_eq!(run.enemies[0].cooldown, 0.0, "nothing damaged in range: no patch, no cooldown");
+    assert_eq!(run.enemies[far].hp, 2.0, "out of range");
+
+    run.enemies[1].hp = 5.0;
+    run.repair_devices();
+    assert!((run.enemies[1].hp - (5.0 + REPAIR_SHARE * 12.0)).abs() < 1e-4);
+    assert_eq!(run.enemies[0].cooldown, REPAIR_INTERVAL);
+    assert!(run.effects.iter().any(|e| e.kind == EffectKind::Repair));
+    let patched = run.enemies[1].hp;
+    run.repair_devices();
+    assert_eq!(run.enemies[1].hp, patched, "one patch per interval");
+
+    run.enemies[0].cooldown = 0.0;
+    run.repair_devices();
+    run.enemies[0].cooldown = 0.0;
+    run.repair_devices();
+    assert_eq!(run.enemies[1].hp, 12.0, "never above maximum");
+
+    let mut run = quiet(Rig::Probe);
+    run.add_enemy(Role::Device(DeviceKind::Repeater), (50.0, 20.0), (3.0, 1.0), 6.0, true, 250);
+    run.enemies[0].entered = true;
+    run.swarm_shot();
+    assert!(run.marks.is_empty(), "a Repeater never attacks");
+}
+
+#[test]
+fn wave_events_change_arrival_pace_and_elite_odds_and_show_in_the_banner() {
+    let find = |wanted| {
+        (0..200u64).flat_map(|s| (5..30).map(move |w| (s, w))).find(|&(s, w)| wave_event(s, w) == Some(wanted)).unwrap()
+    };
+    let (seed, wave) = find(WaveEvent::Flood);
+    let mut run = started(seed, Rig::Probe);
+    run.set_immortal();
+    run.skip_to_wave(wave);
+    assert_eq!(run.wave_event(), Some(WaveEvent::Flood));
+    assert_eq!(run.banner(), Some(format!("WAVE {wave:02} · FLOOD").as_str()));
+    let Encounter::Swarm(mut swarm) = run.encounter else { panic!("an ordinary wave") };
+    swarm.timer = 0.0;
+    run.encounter = Encounter::Swarm(swarm);
+    run.step(IDLE);
+    let Encounter::Swarm(swarm) = run.encounter else { panic!("still a swarm") };
+    assert_eq!(swarm.timer, spawn_interval(wave) * 0.6);
+
+    let (seed, wave) = find(WaveEvent::ElitePack);
+    let mut run = started(seed, Rig::Probe);
+    run.skip_to_wave(wave);
+    assert_eq!(run.banner(), Some(format!("WAVE {wave:02} · ELITE PACK").as_str()));
+    let mut run = quiet(Rig::Probe);
+    run.event = Some(WaveEvent::ElitePack);
+    run.wave = 5;
+    for _ in 0..1000 {
+        run.spawn_device(DeviceKind::Endpoint, None);
+    }
+    let elites = run.enemies.iter().filter(|e| e.elite).count();
+    assert!((120..=290).contains(&elites), "{elites} elites");
+}
+
+#[test]
+fn null_route_rings_leave_a_gap_its_pull_drags_the_ship_and_bosses_enrage_when_low() {
+    let mut run = started(1, Rig::Probe);
+    run.set_immortal();
+    run.clear_asteroids();
+    run.skip_to_wave(30);
+    assert_eq!(run.encounter(), EncounterKind::Boss(BossKind::NullRoute));
+    let (mut ring, mut pulled) = (0, false);
+    for _ in 0..(12.0 / STEP) as usize {
+        run.step(IDLE);
+        ring = ring.max(run.hostiles.iter().filter(|h| h.kind == HostileKind::Diagonal).count());
+        if let Encounter::Special(pattern) = run.encounter
+            && pattern.stream > 0.0
+        {
+            let toward = direction((run.player.x, run.player.y + 0.5), run.enemies[0].center()).unwrap();
+            pulled |= run.player.velocity.0 * toward.0 + run.player.velocity.1 * toward.1 > 1.0;
+        }
+    }
+    assert_eq!(ring, (NULL_RING - NULL_GAP) as usize, "one gap in every ring");
+    assert!(pulled, "an idle ship is dragged toward the boss");
+
+    let mut run = started(1, Rig::Probe);
+    run.set_immortal();
+    run.skip_to_wave(10);
+    seconds(&mut run, IDLE, 4.0);
+    let enraged = |run: &InvadeRun| matches!(run.encounter, Encounter::Special(pattern) if pattern.enraged);
+    assert!(!enraged(&run));
+    run.damage(0, boss_hp(10) as f32 * (1.0 - ENRAGE_AT + 0.05));
+    run.step(IDLE);
+    assert!(enraged(&run));
+    assert_eq!(run.banner(), Some("GATEWAY ENRAGED"));
+}
+
+#[test]
+fn relay_and_kernel_start_locked_until_wave_18_and_null_route() {
+    assert_eq!((Rig::Relay.unlock(), Rig::Kernel.unlock()), (Some(Unlock::Relay), Some(Unlock::Kernel)));
+    assert_eq!(Unlock::Relay.wave(), Some(18));
+    let fresh = started(1, Rig::Probe);
+    assert!(!fresh.is_unlocked(Unlock::Relay) && !fresh.is_unlocked(Unlock::Kernel));
+    let mut early = started(1, Rig::Probe);
+    early.skip_to_wave(17);
+    clear_encounter(&mut early);
+    assert!(!early.is_unlocked(Unlock::Relay));
+    let mut relay = started(1, Rig::Probe);
+    relay.skip_to_wave(18);
+    clear_encounter(&mut relay);
+    assert!(relay.is_unlocked(Unlock::Relay) && !relay.is_unlocked(Unlock::Kernel));
+    let mut null_route = started(1, Rig::Probe);
+    null_route.skip_to_wave(30);
+    assert_eq!(encounter_for(1, 30), EncounterKind::Boss(BossKind::NullRoute));
+    clear_encounter(&mut null_route);
+    assert!(null_route.is_unlocked(Unlock::Kernel));
+}
+
+#[test]
+fn relay_overclock_roughly_doubles_shots_fired() {
+    let damage_over = |overclock: bool| {
+        let mut run = quiet(Rig::Relay);
+        run.player.y = 14.0;
+        target(&mut run, (44.0, 14.0), 1e6);
+        run.step(Input { special: overclock, ..IDLE });
+        if overclock {
+            assert!(run.overclocked() > run.stats.overclock_time - 0.05);
+        }
+        seconds(&mut run, Input { fire: true, ..IDLE }, 3.0);
+        1e6 - run.enemies[0].hp
+    };
+    let (plain, overclocked) = (damage_over(false), damage_over(true));
+    let ratio = overclocked / plain;
+    assert!((1.7..=2.3).contains(&ratio), "{plain} -> {overclocked}");
+    let mut run = quiet(Rig::Relay);
+    run.step(Input { special: true, ..IDLE });
+    let time = run.stats.overclock_time;
+    seconds(&mut run, IDLE, time);
+    assert_eq!(run.overclocked(), 0.0, "Overclock runs out");
+}
+
+#[test]
+fn kernel_purge_erases_packets_and_damages_devices_only_inside_its_radius() {
+    let mut run = quiet(Rig::Kernel);
+    let center = (run.player.x, run.player.y + 0.5);
+    let radius = run.stats.purge_radius;
+    let packet = |x: f32, y: f32| Hostile { unblockable: true, kind: HostileKind::Straight, x, y, vx: 0.0, vy: 0.0 };
+    let inside = [(center.0 + radius - 1.0, center.1), (center.0, center.1 - (radius - 1.0) / ASPECT)];
+    let outside = [(center.0 + radius + 2.0, center.1), (center.0, center.1 - (radius + 2.0) / ASPECT)];
+    for (x, y) in inside.into_iter().chain(outside) {
+        run.hostiles.push(packet(x, y));
+    }
+    let near = target(&mut run, (center.0 + 4.0, center.1 - 2.0), 100.0);
+    let far = target(&mut run, (center.0 + radius + 6.0, center.1 - 2.0), 100.0);
+    run.step(Input { special: true, ..IDLE });
+    let left: Vec<_> = run.hostiles.iter().map(|h| (h.x, h.y)).collect();
+    assert!(inside.iter().all(|p| !left.contains(p)), "{left:?}");
+    assert!(outside.iter().all(|p| left.contains(p)), "{left:?}");
+    let hp = |id| run.enemies[run.alive_index(id).unwrap()].hp;
+    assert!((hp(near) - (100.0 - run.stats.pivot_direct)).abs() < 1e-3);
+    assert_eq!(hp(far), 100.0);
+}
+
+/// What `n` credited kills worth `value` each pay after a streak of `from`.
+fn streaked(from: u32, n: u32, value: u64) -> u64 {
+    (from + 1..=from + n)
+        .map(|k| (value as f64 * f64::from((1.0 + STREAK_BONUS * (k / STREAK_STEP) as f32).min(2.0))).round() as u64)
+        .sum()
+}
+
+/// Credit `n` Firewall kills worth 100 each.
+fn streak_kills(run: &mut InvadeRun, n: u32) {
+    for _ in 0..n {
+        let id = target(run, (60.0, 10.0), 1.0);
+        let index = run.alive_index(id).unwrap();
+        run.damage(index, 1e6);
+    }
+}
+
+#[test]
+fn kill_streak_steps_the_multiplier_every_ten_kills_and_caps_at_double() {
+    let mut run = quiet(Rig::Probe);
+    streak_kills(&mut run, 9);
+    assert_eq!((run.streak(), run.streak_multiplier(), run.score), (9, 1.0, 900));
+    streak_kills(&mut run, 1);
+    assert_eq!(run.score, 1010, "the tenth kill already pays x1.1");
+    streak_kills(&mut run, 9);
+    assert_eq!(run.score, 1010 + 9 * 110, "19 / 10 is still one step");
+    streak_kills(&mut run, 1);
+    assert!((run.streak_multiplier() - 1.2).abs() < 1e-6);
+    assert_eq!(run.score, 1010 + 9 * 110 + 120);
+    streak_kills(&mut run, 79);
+    assert!(run.streak_multiplier() < STREAK_MAX_MULTIPLIER, "99 kills is x1.9");
+    let before = run.score;
+    streak_kills(&mut run, 1);
+    assert_eq!((run.streak(), run.streak_multiplier(), run.score - before), (100, 2.0, 200));
+    streak_kills(&mut run, 50);
+    assert_eq!(run.streak_multiplier(), STREAK_MAX_MULTIPLIER, "capped past 100");
+    assert_eq!(run.finish(EndReason::Closed).unwrap().best_streak, 150);
+}
+
+#[test]
+fn kill_streak_lapses_after_its_window_and_ignores_uncredited_kills() {
+    let mut run = quiet(Rig::Probe);
+    // A distant live device keeps the encounter in combat.
+    target(&mut run, (5.0, 2.0), 1e9);
+    streak_kills(&mut run, 12);
+    seconds(&mut run, IDLE, STREAK_WINDOW - 0.1);
+    assert_eq!((run.phase, run.streak()), (Phase::Combat, 12));
+    streak_kills(&mut run, 1);
+    seconds(&mut run, IDLE, STREAK_WINDOW - 0.1);
+    assert_eq!(run.streak(), 13, "every kill restarts the window");
+    seconds(&mut run, IDLE, 0.2);
+    assert_eq!((run.streak(), run.streak_multiplier(), run.best_streak()), (0, 1.0, 13));
+
+    let mut run = quiet(Rig::Probe);
+    streak_kills(&mut run, 3);
+    for kind in [DeviceKind::Bot, DeviceKind::Hypervisor] {
+        let id = run.add_enemy(Role::Device(kind), (60.0, 10.0), (3.0, 1.0), 1.0, false, 300);
+        let index = run.alive_index(id).unwrap();
+        run.damage(index, 1e6);
+    }
+    run.defeat_all();
+    assert_eq!((run.streak(), run.score), (3, 300), "reinforcements and their guests do not count");
+}
+
+#[test]
+fn kill_streak_resets_on_integrity_loss_and_failover_but_not_on_an_absorbed_hit() {
+    let mut run = quiet(Rig::Probe);
+    streak_kills(&mut run, 15);
+    run.player.protection = 1.0;
+    hostile_at_player(&mut run);
+    run.step(IDLE);
+    assert_eq!((run.integrity(), run.streak()), (MAX_INTEGRITY, 15), "protection absorbs the hit");
+    run.player.protection = 0.0;
+    run.player.shield_ready = true;
+    hostile_at_player(&mut run);
+    run.step(IDLE);
+    assert_eq!((run.integrity(), run.streak()), (MAX_INTEGRITY, 15), "Cache Shield absorbs the hit");
+    run.player.invulnerable = 0.0;
+    hostile_at_player(&mut run);
+    run.step(IDLE);
+    assert_eq!((run.integrity(), run.streak()), (MAX_INTEGRITY - 1, 0));
+
+    let mut run = quiet(Rig::Probe);
+    run.collect_item(ItemKind::Failover);
+    streak_kills(&mut run, 15);
+    run.lose();
+    assert_eq!((run.integrity(), run.streak(), run.best_streak()), (1, 0, 15), "Failover's save resets it");
 }

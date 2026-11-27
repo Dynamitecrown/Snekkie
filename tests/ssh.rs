@@ -121,6 +121,8 @@ impl Sshd {
             password: password.into(),
             key_passphrase: passphrase.into(),
             known_hosts: self.path("known_hosts"),
+            ask_prompts: None,
+            jumps: Vec::new(),
         }
     }
 }
@@ -273,8 +275,13 @@ fn unreachable_host_fails_quickly() {
     let profile = Profile { host: "127.0.0.1".into(), port, ..Profile::default() };
     let (ask, _) = asker(true);
     let dir = tempfile::tempdir().unwrap();
-    let credentials =
-        Credentials { password: String::new(), key_passphrase: String::new(), known_hosts: dir.path().join("kh") };
+    let credentials = Credentials {
+        password: String::new(),
+        key_passphrase: String::new(),
+        known_hosts: dir.path().join("kh"),
+        ask_prompts: None,
+        jumps: Vec::new(),
+    };
     let conn = connect(profile, credentials, ask);
     let reason = closed_reason(&conn);
     assert!(reason.starts_with("Could not connect to 127.0.0.1"), "{reason}");

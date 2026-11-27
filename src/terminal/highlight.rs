@@ -8,6 +8,9 @@ use regex::{Regex, RegexBuilder};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::settings::{self, HighlightRule};
 
 pub const DEFAULT_INTENSITY: u8 = 3;
 pub const INTENSITY_RANGE: std::ops::RangeInclusive<u8> = 1..=5;
@@ -233,13 +236,7 @@ pub fn highlight_line(text: &str, syntax: &str, intensity: u8) -> Vec<Span> {
         return Vec::new();
     }
     let intensity = normalize_intensity(intensity);
-    let mut char_at = vec![0usize; text.len() + 1];
-    let mut count = 0;
-    for (byte, ch) in text.char_indices() {
-        char_at[byte..byte + ch.len_utf8()].fill(count);
-        count += 1;
-    }
-    char_at[text.len()] = count;
+    let (char_at, count) = char_positions(text);
     let mut per_char: Vec<Option<(u8, Category)>> = vec![None; count];
     for rule in COMMON.iter().chain(device).filter(|r| r.level <= intensity) {
         for capture in rule.pattern.captures_iter(text) {
@@ -265,9 +262,135 @@ pub fn highlight_line(text: &str, syntax: &str, intensity: u8) -> Vec<Span> {
     spans
 }
 
+/// The character position of every byte offset in `text`, and the count.
+fn char_positions(text: &str) -> (Vec<usize>, usize) {
+    let mut char_at = vec![0usize; text.len() + 1];
+    let mut count = 0;
+    for (byte, ch) in text.char_indices() {
+        char_at[byte..byte + ch.len_utf8()].fill(count);
+        count += 1;
+    }
+    char_at[text.len()] = count;
+    (char_at, count)
+}
+
+pub const MAX_USER_RULES: usize = 50;
+
+/// A user rule as a matcher, or why its regular expression is invalid.
+pub fn compile_rule(rule: &HighlightRule) -> Result<Regex, String> {
+    let pattern = if rule.regex { rule.text.clone() } else { regex::escape(&rule.text) };
+    RegexBuilder::new(&pattern).case_insensitive(!rule.match_case).size_limit(1 << 20).build().map_err(|error| {
+        match error {
+            // The last line names the problem, e.g. "error: unclosed group".
+            regex::Error::Syntax(text) => text.lines().last().unwrap_or_default().trim().to_string(),
+            _ => "error: this expression is too large".into(),
+        }
+    })
+}
+
+/// The user's highlight rules, compiled each time they change. Empty and
+/// invalid rules are left out.
+pub struct UserRules {
+    /// New for every compile, so views know to forget earlier matches.
+    pub id: u64,
+    pub source: Vec<HighlightRule>,
+    rules: Vec<(Regex, Color32, bool)>,
+}
+
+pub static NO_USER_RULES: UserRules = UserRules { id: 0, source: Vec::new(), rules: Vec::new() };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserSpan {
+    /// Character positions, as in [`Span`].
+    pub start: usize,
+    pub end: usize,
+    pub color: Color32,
+    pub bold: bool,
+}
+
+impl UserRules {
+    pub fn compile(source: &[HighlightRule]) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let rules = source
+            .iter()
+            .take(MAX_USER_RULES)
+            .filter(|rule| !rule.text.is_empty())
+            .filter_map(|rule| Some((compile_rule(rule).ok()?, settings::parse_hex(&rule.color)?, rule.bold)))
+            .collect();
+        UserRules { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), source: source.to_vec(), rules }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    /// Where the rules match in one row. Where rules overlap, the one listed
+    /// first wins.
+    pub fn spans(&self, text: &str) -> Vec<UserSpan> {
+        let text = text.trim_end();
+        if self.rules.is_empty() || text.is_empty() {
+            return Vec::new();
+        }
+        let (char_at, count) = char_positions(text);
+        let mut per_char: Vec<Option<usize>> = vec![None; count];
+        for (index, (pattern, _, _)) in self.rules.iter().enumerate() {
+            for m in pattern.find_iter(text) {
+                for slot in &mut per_char[char_at[m.start()]..char_at[m.end()]] {
+                    slot.get_or_insert(index);
+                }
+            }
+        }
+        let mut spans: Vec<UserSpan> = Vec::new();
+        for (i, rule) in per_char.into_iter().enumerate() {
+            let Some(rule) = rule else { continue };
+            let (_, color, bold) = self.rules[rule];
+            match spans.last_mut() {
+                Some(last) if last.end == i && last.color == color && last.bold == bold => last.end = i + 1,
+                _ => spans.push(UserSpan { start: i, end: i + 1, color, bold }),
+            }
+        }
+        spans
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_rules_match_text_or_regex_first_rule_wins_and_bad_ones_are_skipped() {
+        let rule = |text: &str, regex: bool, match_case: bool, color: &str| HighlightRule {
+            text: text.into(),
+            regex,
+            match_case,
+            color: color.into(),
+            bold: color == "#00ff00",
+        };
+        let rules = UserRules::compile(&[
+            rule("(bad", true, false, "#ff0000"),
+            rule("ERR", false, true, "#ff0000"),
+            rule(r"Gi\d+/\d+", true, false, "#00ff00"),
+            rule("err", false, false, "#0000ff"),
+            rule("", false, false, "#0000ff"),
+            rule("on", false, false, "not a color"),
+        ]);
+        assert!(compile_rule(&rule("(bad", true, false, "")).unwrap_err().contains("unclosed group"));
+        assert!(compile_rule(&rule("(bad", false, false, "")).is_ok());
+        let (red, green, blue) =
+            (Color32::from_rgb(255, 0, 0), Color32::from_rgb(0, 255, 0), Color32::from_rgb(0, 0, 255));
+        assert_eq!(
+            rules.spans("ERR on gi1/0 err é"),
+            [
+                UserSpan { start: 0, end: 3, color: red, bold: false },
+                UserSpan { start: 7, end: 12, color: green, bold: true },
+                UserSpan { start: 13, end: 16, color: blue, bold: false },
+            ]
+        );
+        assert!(NO_USER_RULES.spans("ERR").is_empty());
+        let many = UserRules::compile(&vec![rule("x", false, false, "#ff0000"); 60]);
+        assert_eq!(many.rules.len(), MAX_USER_RULES);
+        assert_ne!(many.id, rules.id);
+    }
 
     fn words(text: &str, syntax: &str, intensity: u8) -> Vec<(String, Category)> {
         let chars: Vec<char> = text.chars().collect();

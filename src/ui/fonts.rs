@@ -62,8 +62,14 @@ impl Fonts {
                 let _ = tx.send(db);
             })
             .ok();
+        let mut defs = FontDefinitions::default();
+        // The UI font lacks arrows such as "→"; egui's monospace font has them.
+        let mono = defs.families.get(&FontFamily::Monospace).and_then(|f| f.first()).cloned();
+        if let (Some(mono), Some(ui)) = (mono, defs.families.get_mut(&FontFamily::Proportional)) {
+            ui.push(mono);
+        }
         Fonts {
-            defs: FontDefinitions::default(),
+            defs,
             db: None,
             pending: Some(rx),
             loaded: HashSet::new(),

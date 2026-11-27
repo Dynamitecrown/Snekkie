@@ -2,6 +2,7 @@ use crate::{
     profiles::Profile,
     putty::{self, ImportBatch},
     settings::AppSettings,
+    ssh_config,
 };
 use std::sync::mpsc::{self, Receiver};
 
@@ -12,6 +13,8 @@ pub struct PuttyImport {
     pending: Option<Receiver<Result<ImportBatch, String>>>,
     error: Option<String>,
     loaded: bool,
+    /// Reading an OpenSSH client config rather than PuTTY sessions.
+    openssh: bool,
 }
 
 impl PuttyImport {
@@ -23,7 +26,23 @@ impl PuttyImport {
             pending: None,
             error: None,
             loaded: false,
+            openssh: false,
         }
+    }
+    /// The same preview for ~/.ssh/config, read straight away.
+    pub fn openssh(ctx: &egui::Context, defaults: &AppSettings) -> Self {
+        let mut import = Self { openssh: true, ..Self::new(defaults) };
+        import.load(ctx, None);
+        import
+    }
+    /// The OpenSSH preview over an already parsed file (QA and tests).
+    pub fn openssh_batch(defaults: &AppSettings, batch: ImportBatch) -> Self {
+        let mut import = Self { openssh: true, ..Self::new(defaults) };
+        import.set_batch(batch);
+        import
+    }
+    pub fn is_openssh(&self) -> bool {
+        self.openssh
     }
     pub fn set_batch(&mut self, batch: ImportBatch) {
         self.selected = vec![true; batch.profiles.len()];
@@ -49,14 +68,22 @@ impl PuttyImport {
         self.error = None;
         let defaults = self.defaults.clone();
         let ctx = ctx.clone();
+        let openssh = self.openssh;
         if let Err(e) = std::thread::Builder::new().name("PuTTY import".into()).spawn(move || {
-            let result = path.map_or_else(|| putty::read_registry(&defaults), |p| putty::read_export(&p, &defaults));
+            let result = match path {
+                _ if openssh => ssh_config::read(&path.unwrap_or_else(ssh_config::default_path), &defaults),
+                Some(p) => putty::read_export(&p, &defaults),
+                None => putty::read_registry(&defaults),
+            };
             let _ = tx.send(result);
             ctx.request_repaint();
         }) {
             self.pending = None;
             self.error = Some(format!("Could not start import: {e}"));
         }
+    }
+    pub fn title(&self) -> &'static str {
+        if self.openssh { "Import OpenSSH config" } else { "Import PuTTY sessions" }
     }
     /// Some(true) imports the selected profiles; Some(false) cancels.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<bool> {
@@ -76,11 +103,28 @@ impl PuttyImport {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        ui.heading("Import PuTTY sessions");
+        ui.heading(self.title());
         let room = (ui.ctx().content_rect().height() - 150.0).max(60.0);
         egui::ScrollArea::vertical().id_salt("putty_import_body").max_height(room).auto_shrink([false, true]).show(ui, |ui| {
-        ui.label("Preview and select sessions before adding them. Existing Snekkie sessions are kept; conflicting names get a PuTTY suffix. Nothing is connected automatically.");
+        ui.label(if self.openssh {
+            "Preview and select hosts before adding them. Existing Snekkie sessions are kept; conflicting names get an Imported suffix. Nothing is connected or run."
+        } else {
+            "Preview and select sessions before adding them. Existing Snekkie sessions are kept; conflicting names get a PuTTY suffix. Nothing is connected automatically."
+        });
         ui.add_enabled_ui(self.pending.is_none(), |ui| {
+            if self.openssh {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Read ~/.ssh/config").clicked() {
+                        self.load(ui.ctx(), None);
+                    }
+                    if ui.button("Open other config file…").clicked()
+                        && let Some(path) = rfd::FileDialog::new().set_title("OpenSSH config").pick_file()
+                    {
+                        self.load(ui.ctx(), Some(path));
+                    }
+                });
+                return;
+            }
             ui.horizontal_wrapped(|ui| {
                 if ui.add_enabled(cfg!(windows), egui::Button::new("Read Windows PuTTY sessions")).clicked() {
                     self.load(ui.ctx(), None);
@@ -137,7 +181,11 @@ impl PuttyImport {
                     });
             }
         }
-        ui.label(egui::RichText::new("Imports SSH, Telnet, raw TCP and supported serial settings. Passwords, host keys, colors, proxies and forwarding rules are not imported. .ppk keys require Pageant or conversion to OpenSSH.").small());
+        if self.openssh {
+            ui.label(egui::RichText::new("Imports Host blocks: HostName, User, Port, IdentityFile (as a key file path), ProxyJump to another imported host, and simple Local, Remote and Dynamic forwards. Wildcard hosts, Match, Include, ProxyCommand and other options are not imported.").small());
+        } else {
+        ui.label(egui::RichText::new("Imports SSH, Telnet, raw TCP and supported serial settings. Simple port forwardings are imported as tunnels. Passwords, host keys, colors and proxies are not imported. .ppk keys require Pageant or conversion to OpenSSH.").small());
+        }
         });
         ui.horizontal(|ui| {
             if ui

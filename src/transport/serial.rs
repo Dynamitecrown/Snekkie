@@ -202,7 +202,7 @@ pub fn start(profile: Profile, sink: Arc<dyn Sink>) -> Link {
         move || match open_port(&profile) {
             Ok(port) => {
                 sink.connected();
-                let reason = run(port, commands, sink.as_ref());
+                let reason = run(port, commands, sink.as_ref(), profile.lf_to_crlf);
                 sink.closed(reason);
             }
             Err(message) => sink.closed(Some(message)),
@@ -215,8 +215,14 @@ pub fn start(profile: Profile, sink: Arc<dyn Sink>) -> Link {
 }
 
 /// Pump the port until it closes. Returns why it ended (None = on purpose).
-fn run(mut port: Box<dyn SerialPort>, mut commands: UnboundedReceiver<Command>, sink: &dyn Sink) -> Option<String> {
+fn run(
+    mut port: Box<dyn SerialPort>,
+    mut commands: UnboundedReceiver<Command>,
+    sink: &dyn Sink,
+    lf_to_crlf: bool,
+) -> Option<String> {
     let mut buf = vec![0u8; 8192];
+    let mut after_cr = false;
     loop {
         loop {
             match commands.try_recv() {
@@ -242,6 +248,7 @@ fn run(mut port: Box<dyn SerialPort>, mut commands: UnboundedReceiver<Command>, 
         }
         match port.read(&mut buf) {
             Ok(0) => {}
+            Ok(n) if lf_to_crlf => sink.data(&add_cr(&buf[..n], &mut after_cr)),
             Ok(n) => sink.data(&buf[..n]),
             Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
             Err(e) => return Some(format!("Serial port error: {e}")),
@@ -249,9 +256,30 @@ fn run(mut port: Box<dyn SerialPort>, mut commands: UnboundedReceiver<Command>, 
     }
 }
 
+/// Each bare LF becomes CR+LF; an LF already after a CR is left alone, even
+/// when the CR ended the previous read.
+fn add_cr(bytes: &[u8], after_cr: &mut bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    for &b in bytes {
+        if b == b'\n' && !*after_cr {
+            out.push(b'\r');
+        }
+        out.push(b);
+        *after_cr = b == b'\r';
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn received_lf_gains_a_cr_once() {
+        let mut after_cr = false;
+        assert_eq!(add_cr(b"a\nb\r\nc\r", &mut after_cr), b"a\r\nb\r\nc\r");
+        assert_eq!(add_cr(b"\nd\n", &mut after_cr), b"\nd\r\n");
+    }
 
     fn usb(device: &str, description: &str, serial: &str, location: &str) -> PortInfo {
         PortInfo {

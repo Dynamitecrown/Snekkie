@@ -5,10 +5,10 @@ Open **Settings → Preferences…**, or press **Ctrl+,** (**Cmd+,** on macOS). 
 | Section | Controls | When changes take effect |
 | --- | --- | --- |
 | Appearance | Preset themes, custom colors, monochrome output and app appearance | All open and new sessions after saving |
-| Terminal | Default font family, font size and scrollback | When starting a **New session**; open sessions and saved profiles retain their own settings |
-| Input & paste | Right-click behavior, multiline paste review, paste delay and automatic paging | Future input and paste actions in open and new sessions after saving |
+| Terminal | Default font family, font size and scrollback; **Reopen tabs from last time** | When starting a **New session**; open sessions and saved profiles retain their own settings. Reopening tabs applies on the next launch |
+| Input & paste | Right-click behavior, multiline paste review, paste delay, automatic paging, remote clipboard and remote tab titles | Future input and paste actions in open and new sessions after saving |
 | Network | Offline mode, startup update checks and AI agent access | Network policy applies on saving; the startup-check choice is used on the next launch |
-| Highlighting | Global highlighting intensity and a device sample | All open and new sessions after saving |
+| Highlighting | Global highlighting intensity, a device sample and your own highlight rules | All open and new sessions after saving |
 | Animations | Master switch, speed, typing styles and output styles | All open and new sessions after saving |
 
 ## Save or discard changes
@@ -29,7 +29,7 @@ On the Highlighting page, **Preview device** changes only the sample. Choose a r
 
 ## Workspace themes and contrast
 
-There are 21 built-in themes. Standard themes now carry their colors through the terminal, sidebar, menus, dialogs and Preferences. Light themes use light controls; dark themes use dark controls. The sidebar and menu share a ground, with a recessed terminal, neutral actions and thin accent lines on selected tabs and saved sessions.
+There are 30 built-in themes. Standard themes now carry their colors through the terminal, sidebar, menus, dialogs and Preferences. Light themes use light controls; dark themes use dark controls. The sidebar and menu share a ground, with a recessed terminal, neutral actions and thin accent lines on selected tabs and saved sessions.
 
 | Theme | Appearance |
 | --- | --- |
@@ -39,7 +39,7 @@ There are 21 built-in themes. Standard themes now carry their colors through the
 | Copper Night | Warm graphite, pale parchment text and a copper cursor; preserves device and syntax colors |
 | Forest Night | Charcoal green, pale text and a soft sage cursor; preserves device and syntax colors |
 
-These five presets have revised palettes. Existing custom and named saved themes retain their stored colors. CRT, E-Ink, Blueprint and Amber app appearances retain their distinctive monitor treatments. Saving applies the selected theme immediately and keeps it after restarting.
+These five presets have revised palettes. Existing custom and named saved themes retain their stored colors. CRT, E-Ink, Blueprint, Amber, Space, Neon and Sonar app appearances have their own monitor treatments; see the [feature guide](new-features.md). Saving applies the selected theme immediately and keeps it after restarting.
 
 The Solarized foregrounds retain their contrast adjustments:
 
@@ -55,6 +55,17 @@ Every built-in palette is regression-checked for at least 4.5:1 base-text contra
 ## Files
 
 **Open with** sets the program that **Edit** in a file explorer opens server files in, such as your IDE. Use **Choose…** to find it, or type a program on your `PATH`. **Use default app** goes back to the app your system picks for each file type. Saving applies it to open explorers too; files already open stay where they are. See [File transfers](file-transfers.md#editing-a-server-file).
+
+## Startup
+
+**Reopen tabs from last time** (off by default) remembers, when Snekkie closes, the tabs that came from saved sessions, file explorer tabs, the split view and the selected tab. On the next start they come back disconnected, each with **Reconnect**; nothing dials by itself. Unsaved tabs are not kept, and sessions deleted since are skipped. Only profile names are stored in `settings.json`, never passwords. Split dividers come back evenly sized.
+
+## Remote host
+
+Under **Input & paste → Remote host**, both off by default:
+
+- **Allow remote apps to set the clipboard (OSC 52)** lets programs on the far end, such as tmux or vim, replace your clipboard. Snekkie shows a short message when that happens. Remote programs can never read your clipboard.
+- **Use title set by remote host for tabs** shows the title the far end sets (for example `user@host: ~`) on the tab. The profile name stays in the tab's tooltip, and a closed tab goes back to the profile name.
 
 ## Network privacy
 
@@ -80,6 +91,8 @@ The new **Focus** text effect starts at 96% size and fades into place over 200 m
 
 Run `cargo run --locked --example preferences_qa` to render every section and each unselected tab's hover state at 1000 × 640 and 520 × 320 in Snekkie Dark, Paper Light, CRT, E-Ink, Frost Light, Copper Night and Forest Night. It uses temporary settings and never writes the user's preferences. Images are written to `target/preferences-qa/`.
 
-Run `cargo run --locked --example themes_motion_qa` for terminal samples of all 21 palettes and 19-frame timelines of each new output effect in four palettes. Images are written to `target/themes-motion-qa/`. The timelines assert that animations preserve the emulator text. Unit regressions exercise every animation choice, check bounded cursor opacity, and verify transient effects settle even at the slowest speed.
+Run `cargo run --locked --example themes_motion_qa` for terminal samples of all 30 palettes and 19-frame timelines of each new output effect in four palettes. Images are written to `target/themes-motion-qa/`. The timelines assert that animations preserve the emulator text. Unit regressions exercise every animation choice, check bounded cursor opacity, and verify transient effects settle even at the slowest speed.
+
+Run `cargo run --locked --example space_qa` to render Space, Neon, Sonar and the newer palettes in the real app against a local fictional device. Images are written to `target/space-qa/`.
 
 For a manual check, change a theme and font, visit another section, and compare **Cancel** with **Save changes**. In a small window, check that all section tabs, animation styles and footer buttons remain reachable. With a network session open, enable Offline mode, read the warning, then Cancel to keep the session connected.

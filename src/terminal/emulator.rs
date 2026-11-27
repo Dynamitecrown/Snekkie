@@ -32,6 +32,13 @@ struct Shared {
     cell_height: u16,
     columns: u16,
     lines: u16,
+    /// A bell arrived since the UI last asked.
+    bell: bool,
+    /// Window title the far end set (OSC 0/2); None after a reset.
+    title: Option<String>,
+    /// Text the far end asked to put on the clipboard (OSC 52), waiting for
+    /// the UI to decide whether that's allowed.
+    clipboard: Option<String>,
 }
 
 #[derive(Clone)]
@@ -62,6 +69,11 @@ impl EventListener for Listener {
                 drop(s);
                 (self.respond)(format(size).into_bytes());
             }
+            Event::Bell => self.shared.lock().bell = true,
+            Event::Title(title) => self.shared.lock().title = Some(title),
+            Event::ResetTitle => self.shared.lock().title = None,
+            Event::ClipboardStore(_, text) => self.shared.lock().clipboard = Some(text),
+            // Reading the clipboard (ClipboardLoad) is never answered.
             _ => {}
         }
     }
@@ -93,6 +105,9 @@ impl Emulator {
             cell_height: 16,
             columns: columns as u16,
             lines: lines as u16,
+            bell: false,
+            title: None,
+            clipboard: None,
         }));
         let config = Config { scrolling_history: scrollback, ..Config::default() };
         let listener = Listener { respond, shared: shared.clone() };
@@ -194,6 +209,25 @@ impl Emulator {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
+    /// The far end wants pastes wrapped in ESC [200~ ... ESC [201~.
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// True once per bell since the last call.
+    pub fn take_bell(&self) -> bool {
+        std::mem::take(&mut self.shared.lock().bell)
+    }
+
+    pub fn remote_title(&self) -> Option<String> {
+        self.shared.lock().title.clone()
+    }
+
+    /// The latest OSC 52 clipboard request, once.
+    pub fn take_clipboard(&self) -> Option<String> {
+        self.shared.lock().clipboard.take()
+    }
+
     pub fn cursor_visible(&self) -> bool {
         self.term.mode().contains(TermMode::SHOW_CURSOR)
     }
@@ -231,6 +265,30 @@ impl Emulator {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    /// The logical line (soft-wrapped rows joined) through a grid point, and
+    /// the cell of each character, for finding a link under the pointer.
+    pub fn logical_line(&self, point: Point) -> (String, Vec<Point>) {
+        use alacritty_terminal::term::cell::Flags;
+
+        let grid = self.term.grid();
+        let wraps = |line: i32| grid[Line(line)][grid.last_column()].flags.contains(Flags::WRAPLINE);
+        // Bounded, like the command line: a huge wrapped line isn't a link.
+        let (mut first, mut last) = (point.line.0, point.line.0);
+        while first > grid.topmost_line().0 && point.line.0 - first < 16 && wraps(first - 1) {
+            first -= 1;
+        }
+        while last < grid.bottommost_line().0 && last - point.line.0 < 16 && wraps(last) {
+            last += 1;
+        }
+        (first..=last)
+            .flat_map(|row| (0..self.columns()).map(move |column| Point::new(Line(row), Column(column))))
+            .filter(|&at| {
+                !grid[at].flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN)
+            })
+            .map(|at| (grid[at].c, at))
+            .unzip()
     }
 
     // -- scrollback -----------------------------------------------------
@@ -339,6 +397,9 @@ impl Emulator {
     pub fn reset(&mut self) {
         self.feed(b"\x1bc");
         self.term.grid_mut().clear_history();
+        // A reconnect starts clean: no title or clipboard request from before.
+        let mut shared = self.shared.lock();
+        (shared.title, shared.clipboard, shared.bell) = (None, None, false);
     }
 
     /// Clear the screen and the scrollback: the prompt you're typing at
@@ -390,6 +451,43 @@ mod tests {
         assert_eq!(emu.line_text(0), "hello");
         assert_eq!(emu.line_text(1), "world");
         assert_eq!(emu.cursor(), Point::new(Line(1), Column(5)));
+    }
+
+    #[test]
+    fn remote_modes_bell_title_and_clipboard() {
+        let (mut emu, sent) = emulator(20, 4, 100);
+        assert!(!emu.bracketed_paste());
+        emu.feed(b"\x1b[?2004h");
+        assert!(emu.bracketed_paste());
+        emu.feed(b"\x1b[?2004l");
+        assert!(!emu.bracketed_paste());
+
+        assert!(!emu.take_bell());
+        emu.feed(b"\x07");
+        assert!(emu.take_bell());
+        assert!(!emu.take_bell());
+
+        emu.feed(b"\x1b]2;router1: ~\x07");
+        assert_eq!(emu.remote_title().as_deref(), Some("router1: ~"));
+        emu.reset();
+        assert_eq!(emu.remote_title(), None, "a reconnect forgets the old title");
+
+        // OSC 52 store, base64 "hi"; a load request must get no answer.
+        emu.feed(b"\x1b]52;c;aGk=\x07");
+        assert_eq!(emu.take_clipboard().as_deref(), Some("hi"));
+        assert_eq!(emu.take_clipboard(), None);
+        emu.feed(b"\x1b]52;c;?\x07");
+        assert!(sent.lock().is_empty());
+    }
+
+    #[test]
+    fn logical_line_joins_wrapped_rows_with_their_cells() {
+        let (mut emu, _) = emulator(10, 4, 100);
+        emu.feed(b"x\r\nhttps://example.com\r\nnext");
+        let (text, cells) = emu.logical_line(Point::new(Line(2), Column(3)));
+        assert_eq!(text.trim_end(), "https://example.com");
+        assert_eq!(cells[12], Point::new(Line(2), Column(2)));
+        assert_eq!(emu.logical_line(Point::new(Line(3), Column(0))).0.trim_end(), "next");
     }
 
     #[test]

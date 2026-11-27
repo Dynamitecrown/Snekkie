@@ -36,6 +36,21 @@ impl SnippetWindow {
         Self { target, page: Page::Library, selected: None, filter: String::new(), reset_scroll: true }
     }
 
+    /// Straight to the review page of one snippet, as the button bar opens it.
+    pub fn review(target: Option<SnippetTarget>, snippet: &Snippet) -> Self {
+        let mut window = Self::new(target);
+        window.selected = Some(snippet.id);
+        if let Ok(template) = Template::parse(&snippet.template) {
+            window.page = Page::Review { snippet: snippet.clone(), template, values: BTreeMap::new() };
+        }
+        window
+    }
+
+    #[cfg(test)]
+    pub fn reviewing(&self) -> bool {
+        matches!(self.page, Page::Review { .. })
+    }
+
     pub fn saved(&mut self, id: u64) {
         self.selected = Some(id);
         self.page = Page::Library;
@@ -132,6 +147,7 @@ impl SnippetWindow {
                     ui.add(egui::TextEdit::singleline(&mut snippet.group).char_limit(128).desired_width(f32::INFINITY)).labelled_by(group.id);
                     let template = ui.label("Command template");
                     ui.add(egui::TextEdit::multiline(&mut snippet.template).code_editor().desired_rows(8).desired_width(f32::INFINITY).char_limit(65536)).labelled_by(template.id);
+                    ui.checkbox(&mut snippet.pinned, "Show on button bar");
                     if let Err(error) = snippet.validate() { ui.colored_label(ui.visuals().error_fg_color, error); }
                 }
                 Page::Review { snippet, template, values } => {

@@ -59,7 +59,7 @@ async fn open(inner: &Inner, arguments: &Value) -> Result<Files, String> {
         return tab
             .link
             .and_then(|link| link.files())
-            .ok_or_else(|| format!("{} isn't connected. Ask the user to reconnect it.", tab.name));
+            .ok_or_else(|| format!("{} isn't connected. Ask the user to reconnect this file explorer.", tab.name));
     }
     let session = find(&inner.listing, arguments)?;
     if session.kind() != Kind::Ssh {
@@ -70,7 +70,7 @@ async fn open(inner: &Inner, arguments: &Value) -> Result<Files, String> {
         ));
     }
     let shared = session.share_connection().ok_or_else(|| {
-        format!("{} is {}, so no file was touched. Ask the user to reconnect it.", session.name, {
+        format!("{} is {}, so no file was touched. Use reconnect_session to bring it back.", session.name, {
             state_text(&session.state())
         })
     })?;

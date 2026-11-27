@@ -12,13 +12,16 @@
 use std::collections::BTreeSet;
 
 use super::arsenal::{Loadout, WeaponKind, WeaponSpec, WeaponState, acquire_weapon, initial_weapons};
-use super::loot::{ItemDrop, ItemKind, PivotKind};
+use super::loot::{
+    ItemDrop, ItemKind, POISON_DURATION, POISON_MAX_STACKS, PivotKind, RATE_LIMIT_SLOW, RATE_LIMIT_TIME, STINGER_RADIUS,
+};
 
 mod expansion;
 use super::content::{
     ARENA_H, ARENA_W, ASPECT, BossKind, DeviceKind, EncounterKind, FRAGMENT_DEVICES, Flight, GUARD_BASE_HP,
-    MinibossKind, Rig, Unlock, WORLD_H, WORLD_W, boss_hp, device_flight, device_hp, encounter_for, fire_interval,
-    flight_speed, hostile_speed, level, miniboss_hp, pattern_pace, spawn_interval, telegraph_interval, wave_roster,
+    MinibossKind, Rig, Unlock, WORLD_H, WORLD_W, WaveEvent, boss_hp, device_flight, device_hp, encounter_for,
+    fire_interval, flight_speed, hostile_speed, level, miniboss_hp, pattern_pace, spawn_interval, telegraph_interval,
+    wave_event, wave_roster,
 };
 use super::rng::{Rng, STREAM_ASTEROIDS, STREAM_COMBAT, STREAM_OFFERS};
 use super::upgrades::{
@@ -40,6 +43,11 @@ pub const TELEGRAPH: f32 = 1.15;
 pub const SCAN_WIDTH: f32 = 3.0;
 pub const CURTAIN_MIN_GAP: f32 = 9.0;
 pub const CURTAIN_MAX_SHIFT: f32 = 12.0;
+/// Seconds a kill streak survives without another credited kill.
+pub const STREAK_WINDOW: f32 = 2.5;
+pub const STREAK_STEP: u32 = 10;
+pub const STREAK_BONUS: f32 = 0.1;
+pub const STREAK_MAX_MULTIPLIER: f32 = 2.0;
 
 const MAX_SHOTS: usize = 96;
 const MAX_FRAGMENTS: usize = 48;
@@ -120,6 +128,34 @@ const ROCK_BOUNCE: f32 = 0.5;
 /// Ships steer to keep this much room between their center and a rock.
 const ROCK_CLEARANCE: f32 = 3.0;
 const HP_EPSILON: f32 = 1e-3;
+/// Ghost's Cloak: seconds invisible and unhittable.
+pub const CLOAK_TIME: f32 = 3.0;
+/// Train's tail: visual units between car centers, and each car's hit radius.
+const TAIL_SPACING: f32 = 3.0;
+const TAIL_CAR_RADIUS: f32 = 1.0;
+const STINGER_SPEED: f32 = 16.0;
+pub const STINGER_SHOT_RADIUS: f32 = 0.9;
+const STINGER_RANGE: f32 = 18.0;
+/// Seconds between poison damage ticks.
+const POISON_TICK: f32 = 0.5;
+/// A Logic Bomb goes off when a device comes this close to it.
+pub const MINE_TRIGGER: f32 = 1.2;
+/// Below this share of its health a boss enrages: its pattern waits shrink.
+pub const ENRAGE_AT: f32 = 0.3;
+const ENRAGE_PACE: f32 = 0.8;
+/// Bot Herder stops calling Bots while this many ships are alive.
+const HERDER_BOTS: usize = 6;
+/// Null Route: packets per ring before the gap, the gap's width in packets,
+/// seconds of pull and its acceleration in visual units per second squared.
+const NULL_RING: u32 = 16;
+const NULL_GAP: u32 = 3;
+const NULL_PULL_TIME: f32 = 2.5;
+const NULL_PULL: f32 = 12.0;
+/// A Repeater patches one damaged device in range this often, restoring this
+/// share of its maximum health.
+const REPAIR_INTERVAL: f32 = 4.0;
+const REPAIR_RANGE: f32 = 14.0;
+const REPAIR_SHARE: f32 = 0.35;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Input {
@@ -213,6 +249,7 @@ pub struct Summary {
     pub reason: EndReason,
     /// Devices compromised this run.
     pub compromised: u64,
+    pub best_streak: u32,
     pub unlocks: Vec<Unlock>,
 }
 
@@ -246,6 +283,10 @@ pub struct Enemy {
     /// Visual units per second.
     pub velocity: (f32, f32),
     pub thrusting: bool,
+    /// Stinger poison stacks and the seconds they have left.
+    pub poison: u8,
+    pub poison_time: f32,
+    poison_tick: f32,
     pool: Option<usize>,
     credit: bool,
     score: u64,
@@ -296,6 +337,9 @@ pub enum ShotKind {
     Flame,
     Missile,
     Reflected,
+    Stinger,
+    Worm,
+    Mine,
 }
 
 #[derive(Debug, Clone)]
@@ -436,6 +480,10 @@ pub enum EffectKind {
     Damage,
     /// A radial pulse centered on the rig.
     Pulse,
+    /// A Stinger's poison cloud.
+    Poison,
+    /// A Repeater patching a device, so it is not read as the player's chain.
+    Repair,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -492,6 +540,10 @@ pub struct Player {
     /// Seconds left of Slip or Barrier protection.
     pub protection: f32,
     pub barrier: bool,
+    /// Seconds left of Ghost's Cloak.
+    pub cloak: f32,
+    /// Train's tail cars, centers in world cells, nearest first.
+    pub tail: Vec<(f32, f32)>,
     pub charges: u8,
     /// Seconds accumulated toward the next charge.
     pub recharge: f32,
@@ -567,6 +619,7 @@ struct Pattern {
     stream_target: Option<(f32, f32)>,
     light: f32,
     total_hp: f32,
+    enraged: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -604,6 +657,7 @@ pub struct InvadeRun {
     effects: Vec<Effect>,
     encounter: Encounter,
     encounter_kind: EncounterKind,
+    event: Option<WaveEvent>,
     offers: Vec<LevelChoice>,
     loadout: Loadout,
     weapons: Vec<WeaponState>,
@@ -634,6 +688,13 @@ pub struct InvadeRun {
     arrivals: Rng,
     player_previous: (f32, f32),
     player_teleported: bool,
+    /// Seconds left of Rate Limit.
+    throttle: f32,
+    /// Seconds left of Relay's Overclock.
+    overclock: f32,
+    streak: u32,
+    streak_timer: f32,
+    best_streak: u32,
 }
 
 /// Where along a→b (0 to 1) the segment first touches the rectangle.
@@ -692,6 +753,16 @@ fn box_nearest(p: (f32, f32), left: f32, top: f32, right: f32, bottom: f32) -> (
 }
 
 /// Unit vector along a heading, in visual space.
+/// Poison damage per stack per second; Tool Amplifier raises it.
+fn poison_per_stack(stats: &Stats) -> f32 {
+    stats.pivot_direct / 6.0
+}
+
+/// Seconds one Rate Limit lasts; Tool Amplifier adds one per rank.
+fn rate_limit_time(stats: &Stats) -> f32 {
+    RATE_LIMIT_TIME + f32::from(stats.pivot_jumps.saturating_sub(3))
+}
+
 fn nose(heading: f32) -> (f32, f32) {
     let (sin, cos) = heading.sin_cos();
     (sin, -cos)
@@ -817,7 +888,7 @@ impl InvadeRun {
             wave: 0,
             completed: 0,
             score: 0,
-            integrity: MAX_INTEGRITY,
+            integrity: stats.max_integrity,
             player: Player {
                 x: WORLD_W / 2.0,
                 y: PLAYER_START_Y,
@@ -831,6 +902,8 @@ impl InvadeRun {
                 invulnerable: 0.0,
                 protection: 0.0,
                 barrier: false,
+                cloak: 0.0,
+                tail: Vec::new(),
                 charges: stats.max_charges,
                 recharge: 0.0,
                 shield_ready: false,
@@ -855,6 +928,7 @@ impl InvadeRun {
             effects: Vec::new(),
             encounter: Encounter::None,
             encounter_kind: EncounterKind::Ordinary,
+            event: None,
             offers: Vec::new(),
             loadout,
             weapons: initial_weapons(loadout),
@@ -885,6 +959,11 @@ impl InvadeRun {
             arrivals: Rng::stream(seed, STREAM_COMBAT ^ 0xA771, 1),
             player_previous: (WORLD_W / 2.0, PLAYER_START_Y),
             player_teleported: false,
+            throttle: 0.0,
+            overclock: 0.0,
+            streak: 0,
+            streak_timer: 0.0,
+            best_streak: 0,
         };
         run.seed_asteroids();
         run.start_wave(1);
@@ -960,6 +1039,9 @@ impl InvadeRun {
     pub fn integrity(&self) -> u8 {
         self.integrity
     }
+    pub fn max_integrity(&self) -> u8 {
+        self.stats.max_integrity
+    }
     pub fn player(&self) -> &Player {
         &self.player
     }
@@ -1019,6 +1101,9 @@ impl InvadeRun {
     pub fn encounter(&self) -> EncounterKind {
         self.encounter_kind
     }
+    pub fn wave_event(&self) -> Option<WaveEvent> {
+        self.event
+    }
     /// What follows the current wave, for announcements.
     pub fn next_encounter(&self) -> EncounterKind {
         encounter_for(self.seed, self.wave + 1)
@@ -1029,6 +1114,19 @@ impl InvadeRun {
     }
     pub fn compromised(&self) -> u64 {
         self.compromised
+    }
+    pub fn streak(&self) -> u32 {
+        self.streak
+    }
+    /// Seconds before the streak lapses without another kill.
+    pub fn streak_remaining(&self) -> f32 {
+        self.streak_timer
+    }
+    pub fn best_streak(&self) -> u32 {
+        self.best_streak
+    }
+    pub fn streak_multiplier(&self) -> f32 {
+        (1.0 + STREAK_BONUS * (self.streak / STREAK_STEP) as f32).min(STREAK_MAX_MULTIPLIER)
     }
     pub fn earned_unlocks(&self) -> &[Unlock] {
         &self.earned
@@ -1060,7 +1158,7 @@ impl InvadeRun {
             rig: self.rig,
             build: &self.build,
             integrity: self.integrity,
-            max_integrity: MAX_INTEGRITY,
+            max_integrity: self.stats.max_integrity,
             charges: self.player.charges,
             wave: self.completed,
         }
@@ -1073,6 +1171,32 @@ impl InvadeRun {
             .iter()
             .map(|offer| {
                 let mut card = describe_level(*offer, &ctx, &self.weapons);
+                if self.pivot_kind == PivotKind::Stinger
+                    && *offer == LevelChoice::Module(Offer::Upgrade(UpgradeId::ToolAmplifier))
+                {
+                    let next = stats(self.rig, &self.build.with(UpgradeId::ToolAmplifier));
+                    card.effect = format!(
+                        "Poison {:.2} -> {:.2} damage per second per stack.",
+                        poison_per_stack(&self.stats),
+                        poison_per_stack(&next)
+                    );
+                }
+                if self.pivot_kind == PivotKind::RateLimit
+                    && *offer == LevelChoice::Module(Offer::Upgrade(UpgradeId::ToolAmplifier))
+                {
+                    let next = stats(self.rig, &self.build.with(UpgradeId::ToolAmplifier));
+                    card.effect = format!(
+                        "Rate Limit lasts {:.0} -> {:.0} s.",
+                        rate_limit_time(&self.stats),
+                        rate_limit_time(&next)
+                    );
+                }
+                if matches!(self.pivot_kind, PivotKind::Cloak | PivotKind::Stinger | PivotKind::RateLimit) {
+                    // Recharge, Heatsink and the like name the special in use.
+                    let (rig, kind) = (self.rig.special_name(), self.pivot_kind.name());
+                    card.effect = card.effect.replace(rig, kind);
+                    card.downside = card.downside.map(|text| text.replace(rig, kind));
+                }
                 if self.rig == Rig::Probe
                     && self.pivot_kind == PivotKind::Missile
                     && *offer == LevelChoice::Module(Offer::Upgrade(UpgradeId::ToolAmplifier))
@@ -1182,6 +1306,7 @@ impl InvadeRun {
             seed: self.seed,
             reason,
             compromised: self.compromised,
+            best_streak: self.best_streak,
             unlocks: self.earned.clone(),
         })
     }
@@ -1198,6 +1323,8 @@ impl InvadeRun {
             return;
         }
         self.elapsed += f64::from(STEP);
+        self.throttle = (self.throttle - STEP).max(0.0);
+        self.overclock = (self.overclock - STEP).max(0.0);
         self.player_previous = (self.player.x, self.player.y);
         self.player_teleported = false;
         for enemy in &mut self.enemies {
@@ -1236,6 +1363,10 @@ impl InvadeRun {
         for enemy in &mut self.enemies {
             enemy.flash = (enemy.flash - STEP).max(0.0);
         }
+        self.streak_timer = (self.streak_timer - STEP).max(0.0);
+        if self.streak_timer == 0.0 {
+            self.streak = 0;
+        }
         match self.encounter {
             Encounter::Swarm(swarm) => self.update_swarm(swarm),
             Encounter::Special(pattern) => self.update_pattern(pattern),
@@ -1247,6 +1378,7 @@ impl InvadeRun {
         self.update_curtains();
         self.move_shots();
         self.update_orbitals();
+        self.update_poison();
         self.move_hostiles();
         self.update_effects();
         self.update_telegraph_flags();
@@ -1270,13 +1402,18 @@ impl InvadeRun {
         let p = &mut self.player;
         p.invulnerable = (p.invulnerable - STEP).max(0.0);
         p.protection = (p.protection - STEP).max(0.0);
+        p.cloak = (p.cloak - STEP).max(0.0);
         p.mobility_cooldown = (p.mobility_cooldown - STEP).max(0.0);
         p.mobility_active = (p.mobility_active - STEP).max(0.0);
         if p.protection == 0.0 {
             p.barrier = false;
         }
         p.heading = wrap_heading(p.heading + turn * flight.turn_rate * STEP);
-        let boost = if self.rig == Rig::Bastion && p.mobility_active > 0.0 { BOOST } else { 1.0 };
+        let boost = if matches!(self.rig, Rig::Bastion | Rig::Tonk | Rig::Kernel) && p.mobility_active > 0.0 {
+            BOOST
+        } else {
+            1.0
+        };
         let top = s.move_speed * boost;
         let accel = s.move_speed / flight.spool * boost;
         p.braking = input.brake;
@@ -1314,6 +1451,7 @@ impl InvadeRun {
             p.y += v.1 / ASPECT * STEP;
         }
         self.clamp_player();
+        self.update_tail();
 
         self.update_aim(input.aim);
 
@@ -1322,7 +1460,7 @@ impl InvadeRun {
             let dir = p.nose();
             p.mobility_cooldown = self.rig.mobility_recharge();
             match self.rig {
-                Rig::Probe => {
+                Rig::Probe | Rig::Train | Rig::Relay => {
                     let to = (
                         (p.x + dir.0 * DASH_DISTANCE).clamp(half, WORLD_W - half),
                         (p.y + dir.1 * DASH_DISTANCE / ASPECT).clamp(0.0, WORLD_H - 1.0),
@@ -1343,7 +1481,7 @@ impl InvadeRun {
                     p.mobility_active = 0.25;
                     self.player_teleported = true;
                 }
-                Rig::Bastion => p.mobility_active = 1.0,
+                Rig::Bastion | Rig::Tonk | Rig::Kernel => p.mobility_active = 1.0,
             }
         }
         if self.player_teleported {
@@ -1363,15 +1501,18 @@ impl InvadeRun {
         }
         if input.special && combat && p.charges > 0 {
             p.charges -= 1;
-            match self.rig {
-                Rig::Probe => {
-                    if self.pivot_kind == PivotKind::Missile {
-                        self.launch_missile();
-                    } else {
-                        self.launch_pivot();
-                    }
+            match (self.pivot_kind, self.rig) {
+                (PivotKind::Stinger, _) => self.launch_stinger(),
+                (PivotKind::Missile, _) => self.launch_missile(),
+                (PivotKind::RateLimit, _) => self.rate_limit(),
+                (PivotKind::Cloak, _) => {
+                    let p = &mut self.player;
+                    p.cloak = p.cloak.max(CLOAK_TIME);
+                    p.protection = p.protection.max(CLOAK_TIME);
+                    p.barrier = false;
                 }
-                Rig::Ghost => {
+                (_, Rig::Probe | Rig::Train) => self.launch_pivot(),
+                (_, Rig::Ghost) => {
                     let p = &mut self.player;
                     let dir = p.nose();
                     let to = (
@@ -1382,11 +1523,18 @@ impl InvadeRun {
                     p.protection = p.protection.max(s.slip_protection);
                     p.barrier = false;
                 }
-                Rig::Bastion => {
+                (_, Rig::Bastion) => {
                     let p = &mut self.player;
                     p.protection = p.protection.max(s.barrier_protection);
                     p.barrier = true;
                 }
+                (_, Rig::Tonk) => {
+                    let p = &mut self.player;
+                    p.protection = p.protection.max(s.reflect_protection);
+                    p.barrier = true;
+                }
+                (_, Rig::Relay) => self.overclock = s.overclock_time,
+                (_, Rig::Kernel) => self.purge(),
             }
         }
         self.player.fire_cooldown = (self.player.fire_cooldown - STEP).max(0.0);
@@ -1635,8 +1783,9 @@ impl InvadeRun {
 
     fn fire_weapons(&mut self, fire: bool) {
         self.weapon_cooldowns.resize(self.weapons.len(), 0.0);
+        let tick = if self.overclock > 0.0 { STEP * 2.0 } else { STEP };
         for index in 0..self.weapons.len() {
-            self.weapon_cooldowns[index] = (self.weapon_cooldowns[index] - STEP).max(0.0);
+            self.weapon_cooldowns[index] = (self.weapon_cooldowns[index] - tick).max(0.0);
             if !fire || self.weapon_cooldowns[index] > 0.0 {
                 continue;
             }
@@ -1644,7 +1793,11 @@ impl InvadeRun {
             let spec = weapon.spec(self.rig, &self.stats);
             self.weapon_cooldowns[index] = spec.cooldown;
             match weapon.kind {
-                WeaponKind::Packet | WeaponKind::Scatter | WeaponKind::Rail | WeaponKind::Flamethrower => {
+                WeaponKind::Packet
+                | WeaponKind::Scatter
+                | WeaponKind::Rail
+                | WeaponKind::Flamethrower
+                | WeaponKind::Worm => {
                     let heading = self.player.aim;
                     for n in 0..spec.projectiles {
                         let angle = if spec.projectiles <= 1 {
@@ -1652,8 +1805,11 @@ impl InvadeRun {
                         } else {
                             spec.spread * (f32::from(n) / f32::from(spec.projectiles - 1) - 0.5)
                         };
-                        let kind =
-                            if weapon.kind == WeaponKind::Flamethrower { ShotKind::Flame } else { ShotKind::Primary };
+                        let kind = match weapon.kind {
+                            WeaponKind::Flamethrower => ShotKind::Flame,
+                            WeaponKind::Worm => ShotKind::Worm,
+                            _ => ShotKind::Primary,
+                        };
                         self.weapon_packet(kind, rotated(heading, angle), spec.damage, spec);
                     }
                     if self.stats.fork_damage.is_some() {
@@ -1667,6 +1823,8 @@ impl InvadeRun {
                         }
                     }
                 }
+                // Stationary, so Port Mirroring has no second direction to add.
+                WeaponKind::Mine => self.single_packet(ShotKind::Mine, (0.0, 0.0), spec.damage, spec),
                 WeaponKind::Arc => {
                     if self.items.contains(&ItemKind::PortMirroring) {
                         for side in [-1.0, 1.0] {
@@ -1741,8 +1899,13 @@ impl InvadeRun {
             return;
         }
         let (vx, vy) = velocity(heading, spec.speed * self.projectile_speed());
+        let radius = match kind {
+            ShotKind::Worm => 0.3,
+            ShotKind::Mine => MINE_TRIGGER,
+            _ => 0.15,
+        };
         self.shots.push(Shot {
-            radius: 0.15 * self.projectile_size(),
+            radius: radius * self.projectile_size(),
             target: None,
             kind,
             x: self.player.x,
@@ -1754,7 +1917,7 @@ impl InvadeRun {
             hit: Vec::new(),
             travelled: 0.0,
             range: spec.range,
-            guided: self.stats.guidance && kind != ShotKind::Flame,
+            guided: self.stats.guidance && matches!(kind, ShotKind::Primary | ShotKind::Fork),
         });
     }
 
@@ -1852,7 +2015,8 @@ impl InvadeRun {
     fn update_orbs(&mut self) {
         let at = (self.player.x, self.player.y + 0.5);
         let previous = if self.player_teleported { at } else { (self.player_previous.0, self.player_previous.1 + 0.5) };
-        let magnet = XP_MAGNET_RADIUS * self.loadout.module.magnet_multiplier();
+        let sniffer = if self.items.contains(&ItemKind::PacketSniffer) { 2.0 } else { 1.0 };
+        let magnet = XP_MAGNET_RADIUS * self.loadout.module.magnet_multiplier() * sniffer;
         let mut gained = 0u64;
         self.orbs.retain_mut(|orb| {
             let from = (orb.x, orb.y);
@@ -1895,7 +2059,13 @@ impl InvadeRun {
         self.xp_level = self.xp_level.saturating_add(1);
         self.offer_count += 1;
         let mut rng = Rng::stream(self.seed, STREAM_OFFERS, self.offer_count);
-        self.offers = level_offers(&mut rng, &self.offer_context(), &self.weapons, |u| self.unlocked.contains(&u));
+        let mut build = self.build.clone();
+        if self.pivot_kind == PivotKind::Cloak {
+            // Cloak is a fixed three seconds, so Tool Amplifier would do nothing.
+            while build.add(UpgradeId::ToolAmplifier) {}
+        }
+        let ctx = OfferContext { build: &build, ..self.offer_context() };
+        self.offers = level_offers(&mut rng, &ctx, &self.weapons, |u| self.unlocked.contains(&u));
         self.phase = Phase::Upgrade;
         self.events.push(Event::Leveled(self.xp_level));
         true
@@ -1916,7 +2086,7 @@ impl InvadeRun {
     }
 
     fn repair(&mut self, amount: u8) {
-        self.integrity = (self.integrity + amount).min(MAX_INTEGRITY);
+        self.integrity = (self.integrity + amount).min(self.stats.max_integrity);
     }
 
     fn unlock(&mut self, unlock: Unlock) {
@@ -1947,7 +2117,7 @@ impl InvadeRun {
         self.live_fragments = shots.iter().filter(|s| s.kind == ShotKind::Fragment).count();
         self.live_shots = shots.len();
         shots.retain_mut(|shot| {
-            if shot.kind == ShotKind::Missile {
+            if matches!(shot.kind, ShotKind::Missile | ShotKind::Worm) {
                 self.steer_missile(shot);
             } else if shot.guided {
                 self.steer(shot);
@@ -1955,11 +2125,18 @@ impl InvadeRun {
             let from = (shot.x, shot.y);
             shot.x += shot.vx * STEP;
             shot.y += shot.vy * STEP;
-            shot.travelled += (shot.vx.hypot(shot.vy * ASPECT)) * STEP;
+            // A Logic Bomb sits still: its range counts seconds, not distance.
+            shot.travelled += if shot.kind == ShotKind::Mine { STEP } else { shot.vx.hypot(shot.vy * ASPECT) * STEP };
             let consumed = self.phase == Phase::Combat && self.collide(shot, from);
             let gone = shot.travelled > shot.range;
-            if gone && !consumed && shot.kind == ShotKind::Missile {
-                self.explode((shot.x, shot.y), shot.damage);
+            if gone
+                && !consumed
+                && let Some(radius) = self.blast(shot.kind)
+            {
+                self.explode((shot.x, shot.y), shot.damage, radius);
+            }
+            if gone && !consumed && shot.kind == ShotKind::Stinger {
+                self.poison_cloud((shot.x, shot.y));
             }
             if consumed || gone {
                 self.live_shots = self.live_shots.saturating_sub(1);
@@ -2032,8 +2209,12 @@ impl InvadeRun {
                 continue;
             }
             let at = self.enemies[index].center();
-            if shot.kind == ShotKind::Missile {
-                self.explode((from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t), shot.damage);
+            if let Some(radius) = self.blast(shot.kind) {
+                self.explode((from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t), shot.damage, radius);
+                return true;
+            }
+            if shot.kind == ShotKind::Stinger {
+                self.poison_cloud((from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t));
                 return true;
             }
             if shot.kind == ShotKind::Pivot {
@@ -2044,6 +2225,8 @@ impl InvadeRun {
             let killed = self.damage(index, impact);
             self.effect(EffectKind::Spark, (shot.x, at.1), (0.0, 0.0), 0.12);
             shot.hit.push(id);
+            // A Worm that burrows on looks for its next device.
+            shot.target = None;
             if matches!(shot.kind, ShotKind::Primary | ShotKind::Fork) {
                 self.feedback();
                 if killed {
@@ -2060,8 +2243,12 @@ impl InvadeRun {
         if let Some(t) = rock {
             // Rocks absorb packets from either side.
             let at = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
-            if shot.kind == ShotKind::Missile {
-                self.explode(at, shot.damage);
+            if let Some(radius) = self.blast(shot.kind) {
+                self.explode(at, shot.damage, radius);
+                return true;
+            }
+            if shot.kind == ShotKind::Stinger {
+                self.poison_cloud(at);
                 return true;
             }
             self.effect(EffectKind::Spark, at, (0.0, 0.0), 0.12);
@@ -2107,18 +2294,24 @@ impl InvadeRun {
         }
         enemy.alive = false;
         enemy.hp = 0.0;
-        if enemy.credit {
-            self.score += enemy.score;
-            self.compromised += 1;
-        }
         let at = enemy.center();
         let elite = enemy.elite;
-        let value = match enemy.role {
+        let (role, credit, score) = (enemy.role, enemy.credit, enemy.score);
+        if credit {
+            self.streak += 1;
+            self.streak_timer = STREAK_WINDOW;
+            self.best_streak = self.best_streak.max(self.streak);
+            self.score += (score as f64 * f64::from(self.streak_multiplier())).round() as u64;
+            self.compromised += 1;
+        }
+        let value = match role {
+            // Called reinforcements give nothing, so stalling cannot farm EXP.
+            Role::Device(_) if !credit => 0,
             Role::Device(_) | Role::Guard => 1,
             Role::Miniboss(MinibossKind::RelayPair) => 12,
             Role::Miniboss(_) => 24,
             Role::Boss(_) => {
-                if enemy.credit {
+                if credit {
                     48
                 } else {
                     0
@@ -2135,6 +2328,19 @@ impl InvadeRun {
         self.effect(EffectKind::Burst, at, (0.0, 0.0), 0.35);
         if self.prior_devices.saturating_add(self.compromised) >= FRAGMENT_DEVICES {
             self.unlock(Unlock::Fragment);
+        }
+        if role == Role::Device(DeviceKind::Hypervisor) {
+            // Its two guests escape sideways as ordinary Endpoints.
+            let guest = DeviceKind::Endpoint;
+            let hp = device_hp(guest.base_hp(), self.wave) as f32;
+            for side in [-1.0, 1.0] {
+                let spot =
+                    ((at.0 - 1.5 + side * 2.5).clamp(0.0, WORLD_W - 3.0), (at.1 - 0.5).clamp(0.0, WORLD_H - 1.0));
+                self.add_enemy(Role::Device(guest), spot, (3.0, 1.0), hp, credit, guest.score());
+                let e = self.enemies.last_mut().unwrap();
+                e.cooldown = 1.5;
+                e.velocity = (side * flight_speed(guest, self.wave), 0.0);
+            }
         }
     }
 
@@ -2224,10 +2430,15 @@ impl InvadeRun {
         let mut hits = 0;
         let mut absorbed = Vec::new();
         let mut reflected = Vec::new();
+        // Tonk's Reflect sends ordinary packets back at the swarm.
+        let reflecting = self.rig == Rig::Tonk && self.player.barrier && self.player.protection > 0.0;
+        let reflect_damage = self.stats.damage * 2.0;
+        let tail = self.player.tail.clone();
+        let dt = STEP * self.slow();
         hostiles.retain_mut(|h| {
             let from = (h.x, h.y);
-            h.x += h.vx * STEP;
-            h.y += h.vy * STEP;
+            h.x += h.vx * dt;
+            h.y += h.vy * dt;
             let previous = if self.player_teleported { (self.player.x, self.player.y) } else { self.player_previous };
             let relative_from = (from.0 + self.player.x - previous.0, from.1 + self.player.y - previous.1);
             let player = segment_enters(relative_from, (h.x, h.y), left, top, right, bottom);
@@ -2247,16 +2458,24 @@ impl InvadeRun {
                 && rock.is_none_or(|r| t < r)
                 && player.is_none_or(|p| t < p)
             {
-                reflected.push(((from.0 + h.vx * STEP * t, from.1 + h.vy * STEP * t), (-h.vx, -h.vy), damage));
+                reflected.push(((from.0 + h.vx * dt * t, from.1 + h.vy * dt * t), (-h.vx, -h.vy), damage));
                 return false;
             }
             if let Some(t) = rock
                 && player.is_none_or(|p| t < p)
             {
-                absorbed.push((from.0 + h.vx * STEP * t, from.1 + h.vy * STEP * t));
+                absorbed.push((from.0 + h.vx * dt * t, from.1 + h.vy * dt * t));
                 return false;
             }
             if player.is_some() {
+                if reflecting && !h.unblockable && h.kind != HostileKind::Stream {
+                    reflected.push(((h.x, h.y), (-h.vx, -h.vy), reflect_damage));
+                } else {
+                    hits += 1;
+                }
+                return false;
+            }
+            if tail.iter().any(|&car| segment_circle(from, (h.x, h.y), car, TAIL_CAR_RADIUS).is_some()) {
                 hits += 1;
                 return false;
             }
@@ -2306,7 +2525,14 @@ impl InvadeRun {
         if self.immortal {
             return;
         }
+        self.streak = 0;
         self.integrity = self.integrity.saturating_sub(amount);
+        if self.integrity == 0 && self.items.remove(&ItemKind::Failover) {
+            self.integrity = 1;
+            self.player.protection = self.player.protection.max(2.0);
+            self.banner = Some(("FAILOVER".into(), BANNER));
+            return;
+        }
         if self.integrity == 0 {
             self.ended = Some(EndReason::Defeated);
             self.phase = Phase::Over;
@@ -2522,9 +2748,13 @@ impl InvadeRun {
         self.encounter_kind = encounter_for(self.seed, wave);
         self.roster.clear();
         self.arrivals = Rng::stream(self.seed, STREAM_COMBAT ^ 0xA771, u64::from(wave));
+        self.event = wave_event(self.seed, wave);
         self.banner = Some((
             match self.encounter_kind {
-                EncounterKind::Ordinary => format!("WAVE {wave:02}"),
+                EncounterKind::Ordinary => match self.event {
+                    Some(event) => format!("WAVE {wave:02} · {}", event.name().to_uppercase()),
+                    None => format!("WAVE {wave:02}"),
+                },
                 EncounterKind::Miniboss(kind) => format!("WAVE {wave:02} · MINIBOSS · {}", kind.name().to_uppercase()),
                 EncounterKind::Boss(kind) => format!("WAVE {wave:02} · BOSS · {}", kind.name().to_uppercase()),
             },
@@ -2570,6 +2800,9 @@ impl InvadeRun {
             heading,
             velocity: (0.0, 0.0),
             thrusting: false,
+            poison: 0,
+            poison_time: 0.0,
+            poison_tick: 0.0,
             pool: None,
             credit,
             score,
@@ -2645,7 +2878,8 @@ impl InvadeRun {
         let at = self.perimeter((3.0, 1.0), edge);
         let hp = device_hp(kind.base_hp(), self.wave) as f32;
         self.add_enemy(Role::Device(kind), at, (3.0, 1.0), hp, true, kind.score());
-        if self.wave >= 3 && self.loot_rng.below(20) == 0 {
+        let elite_odds = if self.event == Some(WaveEvent::ElitePack) { 5 } else { 20 };
+        if self.wave >= 3 && self.loot_rng.below(elite_odds) == 0 {
             let e = self.enemies.last_mut().unwrap();
             e.elite = true;
             e.hp *= 3.0;
@@ -2670,27 +2904,65 @@ impl InvadeRun {
 
     fn update_swarm(&mut self, mut swarm: Swarm) {
         swarm.timer -= STEP;
+        let flood = self.event == Some(WaveEvent::Flood);
+        let cap = if flood { SWARM_CAP + 8 } else { SWARM_CAP };
         let alive = self.enemies.iter().filter(|e| e.alive).count();
-        if swarm.spawned < self.roster.len() && swarm.timer <= 0.0 && alive < SWARM_CAP {
+        if swarm.spawned < self.roster.len() && swarm.timer <= 0.0 && alive < cap {
             self.spawn_device(self.roster[swarm.spawned], None);
             swarm.spawned += 1;
-            swarm.timer = spawn_interval(self.wave);
+            swarm.timer = spawn_interval(self.wave) * if flood { 0.6 } else { 1.0 };
         }
         let ships: Vec<usize> = (0..self.enemies.len()).filter(|&i| self.enemies[i].alive).collect();
         for ship in ships {
             self.fly_ship(ship);
         }
+        self.repair_devices();
         swarm.fire -= STEP;
+        swarm.telegraph -= STEP;
+        if self.player.cloak > 0.0 {
+            // Ordinary ships cannot see a cloaked Ghost to aim at it.
+            self.encounter = Encounter::Swarm(swarm);
+            return;
+        }
         if swarm.fire <= 0.0 {
             swarm.fire = fire_interval(self.wave) * self.rng.range(0.8, 1.2);
             self.swarm_shot();
         }
-        swarm.telegraph -= STEP;
         if swarm.telegraph <= 0.0 {
             swarm.telegraph = telegraph_interval(self.wave) * self.rng.range(0.8, 1.2);
             self.swarm_telegraph();
         }
         self.encounter = Encounter::Swarm(swarm);
+    }
+
+    /// Each ready Repeater patches the most damaged device within range.
+    fn repair_devices(&mut self) {
+        for index in 0..self.enemies.len() {
+            let r = &self.enemies[index];
+            if !r.alive || r.role != Role::Device(DeviceKind::Repeater) || !r.entered || r.cooldown > 0.0 {
+                continue;
+            }
+            let (id, from) = (r.id, r.center());
+            let target = self
+                .enemies
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    e.alive
+                        && e.id != id
+                        && matches!(e.role, Role::Device(_))
+                        && e.hp < e.max_hp
+                        && visual_distance(e.center(), from) <= REPAIR_RANGE
+                })
+                .min_by(|(_, a), (_, b)| (a.hp / a.max_hp).total_cmp(&(b.hp / b.max_hp)).then(a.id.cmp(&b.id)))
+                .map(|(i, _)| i);
+            let Some(target) = target else { continue };
+            let t = &mut self.enemies[target];
+            t.hp = (t.hp + REPAIR_SHARE * t.max_hp).min(t.max_hp);
+            let to = t.center();
+            self.enemies[index].cooldown = REPAIR_INTERVAL;
+            self.effect(EffectKind::Repair, from, to, 0.35);
+        }
     }
 
     fn fly_ship(&mut self, index: usize) {
@@ -2717,8 +2989,12 @@ impl InvadeRun {
                             .unwrap_or(toward),
                         top,
                     ),
-                    DeviceKind::Switch | DeviceKind::IdsProbe => {
-                        let preferred = if kind == DeviceKind::IdsProbe { 20.0 } else { 16.0 };
+                    DeviceKind::Switch | DeviceKind::IdsProbe | DeviceKind::Repeater => {
+                        let preferred = match kind {
+                            DeviceKind::IdsProbe => 20.0,
+                            DeviceKind::Repeater => 22.0,
+                            _ => 16.0,
+                        };
                         let radial = ((distance - preferred) / 4.0).clamp(-1.0, 1.0);
                         let dir = unit((toward.0 * radial + tangent.0 * 0.5, toward.1 * radial + tangent.1 * 0.5))
                             .unwrap_or(tangent);
@@ -2733,10 +3009,11 @@ impl InvadeRun {
         let dir = unit((want_dir.0 + avoid.0, want_dir.1 + avoid.1)).unwrap_or(want_dir);
         let want = (dir.0 * want_speed, dir.1 * want_speed);
         let (heading, velocity, thrusting) = steer_ship(heading, velocity, want, device_flight(kind), top);
+        let dt = STEP * self.slow();
         let e = &mut self.enemies[index];
         (e.heading, e.velocity, e.thrusting) = (heading, velocity, thrusting);
-        e.x += velocity.0 * STEP;
-        e.y += velocity.1 / ASPECT * STEP;
+        e.x += velocity.0 * dt;
+        e.y += velocity.1 / ASPECT * dt;
         self.rock_push(index);
         let e = &mut self.enemies[index];
         if e.x >= camera.0 && e.y >= camera.1 && e.x + e.w <= camera.0 + ARENA_W && e.y + e.h <= camera.1 + ARENA_H {
@@ -2763,7 +3040,12 @@ impl InvadeRun {
                     && e.entered
                     && e.visible_in(self.camera())
                     && e.cooldown <= 0.0
-                    && matches!(e.role, Role::Device(DeviceKind::Endpoint | DeviceKind::Router | DeviceKind::Firewall))
+                    && matches!(
+                        e.role,
+                        Role::Device(
+                            DeviceKind::Endpoint | DeviceKind::Router | DeviceKind::Firewall | DeviceKind::Hypervisor
+                        )
+                    )
                     && visual_distance(e.center(), player) >= 12.0
             })
             .collect();
@@ -2779,7 +3061,8 @@ impl InvadeRun {
         let index = shooters[self.rng.below(shooters.len() as u32) as usize];
         let e = &self.enemies[index];
         let router = e.role == Role::Device(DeviceKind::Router);
-        let interval = if e.role == Role::Device(DeviceKind::Firewall) { 6.0 } else { 3.0 };
+        let heavy = matches!(e.role, Role::Device(DeviceKind::Firewall | DeviceKind::Hypervisor));
+        let interval = if heavy { 6.0 } else { 3.0 };
         self.enemies[index].cooldown = interval * pattern_pace(self.wave);
         // Like every aimed attack, a ship's shot warns first and then flies
         // at the spot it marked, not at wherever the player went.
@@ -2833,7 +3116,7 @@ impl InvadeRun {
         let half = self.rig.width() / 2.0 - FORGIVENESS;
         let from = if self.player_teleported { (self.player.x, self.player.y) } else { self.player_previous };
         let to = (self.player.x, self.player.y + 0.5);
-        let touching = self.enemies.iter().filter(|e| e.alive).any(|e| {
+        let touches = |e: &Enemy| {
             let relative_from = (from.0 + e.x - e.previous.0, from.1 + 0.5 + e.y - e.previous.1);
             segment_enters(
                 relative_from,
@@ -2844,9 +3127,22 @@ impl InvadeRun {
                 e.y + e.h + 0.5 - FORGIVENESS,
             )
             .is_some()
-        });
-        if touching {
-            self.hit_player();
+        };
+        let touching: Vec<usize> =
+            (0..self.enemies.len()).filter(|&i| self.enemies[i].alive && touches(&self.enemies[i])).collect();
+        if touching.is_empty() {
+            return;
+        }
+        self.hit_player();
+        // A ramming Bot is spent even when the hit was absorbed; it pays nothing.
+        for index in touching {
+            if self.enemies[index].role == Role::Device(DeviceKind::Bot) {
+                let e = &mut self.enemies[index];
+                e.alive = false;
+                e.hp = 0.0;
+                let at = e.center();
+                self.effect(EffectKind::Burst, at, (0.0, 0.0), 0.35);
+            }
         }
     }
 
@@ -2877,9 +3173,12 @@ impl InvadeRun {
         self.completed = wave;
         match kind {
             EncounterKind::Ordinary => self.score += 100 * u64::from(wave),
-            EncounterKind::Miniboss(_) => {
+            EncounterKind::Miniboss(miniboss) => {
                 self.score += 1500 + 100 * u64::from(wave);
                 self.unlock(Unlock::Fork);
+                if miniboss == MinibossKind::BotHerder {
+                    self.unlock(Unlock::LogicBomb);
+                }
             }
             EncounterKind::Boss(boss) => {
                 self.score += 5000 + 250 * u64::from(wave);
@@ -2887,6 +3186,12 @@ impl InvadeRun {
                 if boss == BossKind::Gateway {
                     self.unlock(Unlock::Guidance);
                     self.unlock(Unlock::Bastion);
+                }
+                if boss == BossKind::LoadBalancer {
+                    self.unlock(Unlock::Failover);
+                }
+                if boss == BossKind::NullRoute {
+                    self.unlock(Unlock::Kernel);
                 }
             }
         }
@@ -2929,7 +3234,7 @@ impl InvadeRun {
                 pattern.total_hp = hp;
                 let size = sprite_size(mini.sprite());
                 match mini {
-                    MinibossKind::PortSentry => {
+                    MinibossKind::PortSentry | MinibossKind::BotHerder => {
                         self.add_enemy(Role::Miniboss(mini), (centered(size.0), 2.0), size, hp, true, 0);
                     }
                     MinibossKind::RelayPair => {
@@ -3089,7 +3394,7 @@ impl InvadeRun {
     }
 
     fn update_pattern(&mut self, mut pattern: Pattern) {
-        let pace = pattern_pace(self.wave);
+        let mut pace = pattern_pace(self.wave);
         let parts = self.special_parts();
         if parts.is_empty() {
             self.encounter = Encounter::Special(pattern);
@@ -3115,9 +3420,89 @@ impl InvadeRun {
             self.encounter = Encounter::Special(pattern);
             return;
         }
+        if let EncounterKind::Boss(boss) = self.encounter_kind
+            && self.boss_health().is_some_and(|(_, left)| left < ENRAGE_AT)
+        {
+            if !pattern.enraged {
+                pattern.enraged = true;
+                self.banner = Some((format!("{} ENRAGED", boss.name().to_uppercase()), BANNER));
+            }
+            pace *= ENRAGE_PACE;
+        }
         pattern.timer -= STEP;
         let due = pattern.timer <= 0.0;
         match self.encounter_kind {
+            EncounterKind::Miniboss(MinibossKind::BotHerder) => {
+                let main = parts[0];
+                self.drift(main, &mut pattern, 5.0);
+                let ships: Vec<usize> = (0..self.enemies.len())
+                    .filter(|&i| self.enemies[i].alive && matches!(self.enemies[i].role, Role::Device(_)))
+                    .collect();
+                if due {
+                    if pattern.step.is_multiple_of(2) && ships.len() < HERDER_BOTS {
+                        // Uncredited reinforcements, like Root Controller's guards.
+                        let hp = device_hp(DeviceKind::Bot.base_hp(), self.wave) as f32;
+                        let e = &self.enemies[main];
+                        let (y, ends) = (e.y + e.h, [e.x - 3.0, e.x + e.w]);
+                        for x in ends {
+                            let at = (x.clamp(0.0, WORLD_W - 3.0), y.min(WORLD_H - 1.0));
+                            self.add_enemy(Role::Device(DeviceKind::Bot), at, (3.0, 1.0), hp, false, 0);
+                        }
+                    } else {
+                        let from = self.bottom_center(main);
+                        self.fan(from, 5, 70.0);
+                    }
+                    pattern.step += 1;
+                    pattern.timer = 2.4 * pace;
+                }
+                pattern.light -= STEP;
+                if pattern.light <= 0.0 {
+                    pattern.light = 1.8 * pace;
+                    self.mark_shot(main);
+                }
+                for ship in ships {
+                    self.fly_ship(ship);
+                }
+            }
+            EncounterKind::Boss(BossKind::NullRoute) => {
+                let main = parts[0];
+                self.drift(main, &mut pattern, 2.5);
+                let center = self.enemies[main].center();
+                // `stream` doubles as the seconds of pull left.
+                if pattern.stream > 0.0 {
+                    pattern.stream -= STEP;
+                    if let Some(toward) = direction((self.player.x, self.player.y + 0.5), center) {
+                        let v = &mut self.player.velocity;
+                        *v = (v.0 + toward.0 * NULL_PULL * STEP, v.1 + toward.1 * NULL_PULL * STEP);
+                    }
+                }
+                if due {
+                    match pattern.step % 3 {
+                        0 => {
+                            // A ring with one gap. The boss stays above the ship, so
+                            // the gap moves along the lower arc: below, right, left.
+                            let gap = [7, 4, 9, 6][(pattern.step / 3 % 4) as usize];
+                            let speed = hostile_speed(self.wave) * ASPECT;
+                            for i in (0..NULL_RING).filter(|i| (i + NULL_RING - gap) % NULL_RING >= NULL_GAP) {
+                                let angle = std::f32::consts::TAU * i as f32 / NULL_RING as f32;
+                                self.spawn(HostileKind::Diagonal, center, velocity(nose(angle), speed));
+                            }
+                            pattern.timer = 2.0 * pace;
+                        }
+                        1 => {
+                            pattern.stream = NULL_PULL_TIME;
+                            self.banner = Some(("NULL ROUTE · PULLING YOU IN".into(), NULL_PULL_TIME));
+                            self.mark_player(main, MarkAttack::Pair, TELEGRAPH);
+                            pattern.timer = NULL_PULL_TIME + 0.6 * pace;
+                        }
+                        _ => {
+                            self.mark_player(main, MarkAttack::Burst, TELEGRAPH);
+                            pattern.timer = TELEGRAPH + 1.2 * pace;
+                        }
+                    }
+                    pattern.step += 1;
+                }
+            }
             EncounterKind::Miniboss(MinibossKind::PortSentry) => {
                 let main = parts[0];
                 self.drift(main, &mut pattern, 7.0 * (1.0 + 0.4 * level(self.wave)));
@@ -3383,10 +3768,9 @@ impl InvadeRun {
             swarm.spawned = self.roster.len();
             self.encounter = Encounter::Swarm(swarm);
         }
-        for index in 0..self.enemies.len() {
-            if self.enemies[index].alive && !matches!(self.enemies[index].role, Role::Guard) {
-                self.damage(index, f32::MAX);
-            }
+        // A loop, not one pass: a destroyed Hypervisor adds its guests.
+        while let Some(index) = self.enemies.iter().position(|e| e.alive && !matches!(e.role, Role::Guard)) {
+            self.damage(index, f32::MAX);
         }
     }
 

@@ -16,8 +16,9 @@ use crate::settings::Theme;
 use crate::terminal::emulator::{Emulator, Responder};
 use crate::terminal::keys;
 use crate::terminal::paging::{AutoPager, PROMPT_WAIT};
-use crate::transport::ssh::{Credentials, HostKeyAsker};
+use crate::transport::ssh::{Credentials, HostKeyAsker, PromptAsker};
 use crate::transport::transfer::{self, Direction, Progress};
+use crate::transport::tunnel::TunnelStatus;
 use crate::transport::{Command, Link, Sink, serial, ssh, tcp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +78,8 @@ pub struct Shared {
     // UI status must never wait for a writer blocked on filesystem I/O.
     log_status: Mutex<LogStatus>,
     notices: Mutex<Vec<Notice>>,
+    /// The SSH tunnels of the current connection.
+    tunnels: Mutex<Vec<TunnelStatus>>,
     /// The far end has agreed to echo what's typed (telnet only).
     remote_echo: AtomicBool,
     pager: Mutex<AutoPager>,
@@ -166,7 +169,14 @@ impl Shared {
 }
 
 /// Submit input only to the connection that was reviewed, preserving echo/paging.
-fn submit(shared: &Shared, link: &Mutex<Option<Link>>, echo: bool, generation: u64, bytes: Vec<u8>) -> bool {
+fn submit(
+    shared: &Shared,
+    link: &Mutex<Option<Link>>,
+    echo: bool,
+    enter: keys::EnterSends,
+    generation: u64,
+    bytes: Vec<u8>,
+) -> bool {
     if *shared.state.lock() != State::Connected || !shared.is_current(generation) {
         return false;
     }
@@ -179,7 +189,7 @@ fn submit(shared: &Shared, link: &Mutex<Option<Link>>, echo: bool, generation: u
     pager.sent(&bytes, &visible);
     // Arm suppression before the device can echo any of these bytes.
     let input = shared.privacy.lock().input(&bytes, &visible);
-    let submitted = link.lock().as_ref().is_some_and(|link| link.try_write(bytes));
+    let submitted = link.lock().as_ref().is_some_and(|link| link.try_write(enter.translate(bytes)));
     drop(pager);
     if submitted {
         shared.record_safe_input(input);
@@ -223,6 +233,11 @@ impl Remote {
         self.shared.state.lock().clone()
     }
 
+    /// Changes each time the session connects again.
+    pub fn connection_generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::SeqCst)
+    }
+
     /// Everything on the screen and in the scrollback, as the user sees it.
     pub fn text(&self) -> String {
         self.shared.emulator.lock().all_text()
@@ -240,7 +255,8 @@ impl Remote {
     /// Send input as if typed, logged the same way. False unless connected.
     pub fn write(&self, bytes: Vec<u8>) -> bool {
         let echo = self.profile.local_echo().applies(self.kind(), self.shared.remote_echo.load(Ordering::SeqCst));
-        submit(&self.shared, &self.link, echo, self.shared.generation.load(Ordering::SeqCst), bytes)
+        let generation = self.shared.generation.load(Ordering::SeqCst);
+        submit(&self.shared, &self.link, echo, self.profile.enter_sends(), generation, bytes)
     }
 
     /// Device output from now until the receiver is dropped.
@@ -317,6 +333,7 @@ impl Sink for SessionSink {
             *state = State::Closed(reason);
         }
         drop(state);
+        self.shared.tunnels.lock().clear();
         {
             let mut log = self.shared.log.lock();
             // Reconnecting may have replaced the log while this worker closed.
@@ -341,12 +358,25 @@ impl Sink for SessionSink {
             self.shared.remote_echo.store(on, Ordering::SeqCst);
         }
     }
+
+    fn tunnels(&self, status: Vec<TunnelStatus>) {
+        let mut tunnels = self.shared.tunnels.lock();
+        if self.shared.is_current(self.generation) && *self.shared.state.lock() == State::Connected {
+            *tunnels = status;
+            drop(tunnels);
+            (self.shared.repaint)();
+        }
+    }
 }
 
 /// What a connection needs besides the profile.
 pub struct ConnectContext<'a> {
     pub runtime: &'a tokio::runtime::Handle,
     pub ask_host_key: HostKeyAsker,
+    /// Keyboard-interactive prompts the password can't answer, such as MFA codes.
+    pub ask_prompts: Option<PromptAsker>,
+    /// Saved SSH sessions to connect through first, first hop first.
+    pub jumps: Vec<Profile>,
     pub password: String,
     pub key_passphrase: String,
     pub network: crate::network::NetworkAccess,
@@ -392,6 +422,7 @@ impl Session {
             privacy: Mutex::new(Privacy::default()),
             log_status: Mutex::new(LogStatus::Off),
             notices: Mutex::new(Vec::new()),
+            tunnels: Mutex::new(Vec::new()),
             remote_echo: AtomicBool::new(false),
             pager: Mutex::new(AutoPager::default()),
             generation: AtomicU64::new(0),
@@ -409,9 +440,13 @@ impl Session {
         if let Some(old) = self.link.lock().take() {
             old.send(Command::Close);
         }
+        // Together, so whoever sees the new generation also sees Connecting.
+        let mut state = self.shared.state.lock();
         let generation = self.shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.shared.state.lock() = State::Connecting;
+        *state = State::Connecting;
+        drop(state);
         self.shared.remote_echo.store(false, Ordering::SeqCst);
+        self.shared.tunnels.lock().clear();
         *self.shared.privacy.lock() = Privacy::new(self.profile.log_passwords);
         self.open_log();
 
@@ -442,6 +477,8 @@ impl Session {
                     password: cx.password,
                     key_passphrase: cx.key_passphrase,
                     known_hosts: ssh::known_hosts_path(),
+                    ask_prompts: cx.ask_prompts,
+                    jumps: cx.jumps,
                 };
                 ssh::start_with_access(
                     cx.runtime,
@@ -572,6 +609,11 @@ impl Session {
         !matches!(self.state(), State::Closed(_))
     }
 
+    /// The current connection's SSH tunnels and what each is doing.
+    pub fn tunnels(&self) -> Vec<TunnelStatus> {
+        self.shared.tunnels.lock().clone()
+    }
+
     pub fn take_notices(&self) -> Vec<Notice> {
         std::mem::take(&mut *self.shared.notices.lock())
     }
@@ -584,7 +626,7 @@ impl Session {
 
     /// Submit input only to the connection that was reviewed, preserving echo/paging.
     pub fn write_reviewed(&self, generation: u64, bytes: Vec<u8>) -> bool {
-        submit(&self.shared, &self.link, self.echoes_locally(), generation, bytes)
+        submit(&self.shared, &self.link, self.echoes_locally(), self.profile.enter_sends(), generation, bytes)
     }
 
     pub fn remote(&self) -> Remote {
@@ -690,6 +732,7 @@ impl Session {
             *self.shared.log_status.lock() = LogStatus::Off;
         }
         *self.shared.input_log.lock() = None;
+        self.shared.tunnels.lock().clear();
     }
 
     pub fn description(&self) -> String {
@@ -773,6 +816,8 @@ mod logging_tests {
             session.connect(ConnectContext {
                 runtime: runtime.handle(),
                 ask_host_key: Arc::new(|_| {}),
+                ask_prompts: None,
+                jumps: Vec::new(),
                 password: String::new(),
                 key_passphrase: String::new(),
                 network: Default::default(),
@@ -1163,6 +1208,8 @@ mod tests {
         session.connect(ConnectContext {
             runtime: runtime.handle(),
             ask_host_key: Arc::new(|_| {}),
+            ask_prompts: None,
+            jumps: Vec::new(),
             password: String::new(),
             key_passphrase: String::new(),
             network: Default::default(),

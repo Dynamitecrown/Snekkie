@@ -181,6 +181,8 @@ impl LineMark {
             NewLines::Radar => (0.6 * (1.0 - t), width.min(12.0) * ease_out_quad(t)),
             NewLines::Bookends => (0.8 * (1.0 - ease_out_cubic(t)), 0.0),
             NewLines::Outline => (0.45 * (1.0 - ease_out_quad(t)), 0.0),
+            NewLines::Wipe => (0.28 * (1.0 - t), width * ease_out_cubic(t)),
+            NewLines::Beacon => (((t * TAU * 2.0 - FRAC_PI_2).sin() * 0.5 + 0.5) * (1.0 - t), 0.0),
         };
         LineMark { style, t, start, end, alpha, reach }
     }
@@ -298,6 +300,8 @@ pub struct Animator {
     particles_until: f64,
     shake: ShakeState,
     rng: Rng,
+    /// New text on the last update: mean (row, column) and how many cells.
+    fresh_text: Option<(f32, f32, usize)>,
 }
 
 impl Default for Animator {
@@ -333,6 +337,7 @@ impl Default for Animator {
             particles_until: NEVER,
             shake: ShakeState::default(),
             rng: Rng(0x9e37_79b9_7f4a_7c15),
+            fresh_text: None,
         }
     }
 }
@@ -358,6 +363,7 @@ impl Animator {
     pub fn update(&mut self, now: f64, settings: &Animations, screen: &Snapshot<'_>) {
         self.settings = *settings;
         self.pace = f64::from(settings.pace());
+        self.fresh_text = None;
         let (columns, lines) = (screen.columns, screen.lines());
         if !settings.enabled || lines == 0 {
             self.reset();
@@ -390,6 +396,11 @@ impl Animator {
         }
         self.key_row = self.key_row.and_then(|row| movement.target(row));
         let mut fresh = std::mem::take(&mut self.fresh);
+        if !fresh.is_empty() {
+            let (rows, cols) = fresh.iter().fold((0, 0), |(r, c), &i| (r + i / columns, c + i % columns));
+            let n = fresh.len();
+            self.fresh_text = Some((rows as f32 / n as f32, cols as f32 / n as f32, n));
+        }
         if let Some(row) = self.echo_row(screen, movement, &fresh) {
             let mut typed = 0;
             // A read can carry both an echo and the device's reply. Remove
@@ -515,6 +526,11 @@ impl Animator {
             Kind::Output if now < state.start => Some(CellLook::HIDDEN),
             Kind::Output => output_look(self.settings.new_text, age, state.seed),
         }
+    }
+
+    /// Text that landed on the last update: mean (row, column) and how many cells.
+    pub fn fresh_text(&self) -> Option<(f32, f32, usize)> {
+        self.fresh_text
     }
 
     /// The mark on a live-screen row that just got output, if any.
@@ -1067,6 +1083,9 @@ impl Animator {
             KeystrokeBurst::Lasers => 4,
             KeystrokeBurst::Lightning => 3,
             KeystrokeBurst::Portal => 9,
+            KeystrokeBurst::Comet => 6,
+            KeystrokeBurst::Fireflies => 5,
+            KeystrokeBurst::Orbit => 3,
         };
         let pace = self.pace as f32;
         let first_color = self.rng.between(0, CONFETTI.len() - 1);
@@ -1123,6 +1142,12 @@ pub fn blink_level(style: CursorBlink, now: f64, epoch: f64) -> f32 {
             }
         }
         CursorBlink::Pulse => 0.675 + 0.325 * (std::f64::consts::TAU * elapsed / PULSE).cos() as f32,
+        CursorBlink::Heartbeat => {
+            // Two beats close together, then a rest.
+            let beat = (elapsed / PULSE).fract() as f32;
+            let pulse = |at: f32| (1.0 - ((beat - at) / 0.09).abs()).max(0.0);
+            0.5 + 0.5 * pulse(0.12).max(pulse(0.34))
+        }
         CursorBlink::Glow | CursorBlink::Steady => 1.0,
     }
 }
@@ -1152,7 +1177,7 @@ pub fn blink_wake(style: CursorBlink, now: f64, epoch: f64) -> f64 {
             let wait = rest_ends - phase;
             if wait > BLINK_SLACK { wait } else { BLINK_FRAME }
         }
-        CursorBlink::Pulse | CursorBlink::Glow => BLINK_FRAME,
+        CursorBlink::Pulse | CursorBlink::Glow | CursorBlink::Heartbeat => BLINK_FRAME,
     }
 }
 
@@ -1210,6 +1235,8 @@ fn typed_duration(style: TypedText) -> f32 {
         TypedText::Fade => 0.14,
         TypedText::Stamp => 0.24,
         TypedText::Laser => 0.28,
+        TypedText::Jelly => 0.34,
+        TypedText::Neon => 0.26,
     }
 }
 
@@ -1224,6 +1251,8 @@ fn new_text_duration(style: NewText) -> f32 {
         NewText::Hologram => 0.32,
         NewText::Matrix => 0.38,
         NewText::Focus => 0.20,
+        NewText::Flicker => 0.30,
+        NewText::Glitch => 0.24,
     }
 }
 
@@ -1239,6 +1268,8 @@ fn line_duration(style: NewLines) -> f32 {
         NewLines::Radar => 0.65,
         NewLines::Bookends => 0.20,
         NewLines::Outline => 0.25,
+        NewLines::Wipe => 0.40,
+        NewLines::Beacon => 0.8,
     }
 }
 
@@ -1280,6 +1311,11 @@ fn typed_look(style: TypedText, age: f32) -> Option<CellLook> {
             alpha: (t / 0.12).min(1.0),
             ..CellLook::PLAIN
         },
+        TypedText::Jelly => CellLook { scale: 1.0 + 0.3 * (1.0 - t) * (t * TAU * 2.0).cos(), ..CellLook::PLAIN },
+        TypedText::Neon => {
+            let lit = if ((t * 6.0) as u32).is_multiple_of(2) || t > 0.7 { 1.0 } else { 0.25 };
+            CellLook { alpha: lit, accent: 1.0 - t, ..CellLook::PLAIN }
+        }
     };
     Some(look)
 }
@@ -1326,6 +1362,17 @@ fn output_look(style: NewText, age: f32, seed: u32) -> Option<CellLook> {
             offset_y: in_steps(0.08 * (t * TAU * 2.0).sin() * (1.0 - t)),
             ..CellLook::PLAIN
         },
+        // By age alone, so cells shown together stay one run of text.
+        NewText::Flicker => {
+            let lit = if t > 0.75 || matches!((t * 10.0) as u32, 1 | 2 | 5 | 6) { 1.0 } else { 0.2 };
+            CellLook { alpha: lit, accent: 0.25 * (1.0 - t), ..CellLook::PLAIN }
+        }
+        NewText::Glitch => {
+            let pick = scramble(u64::from(seed) << 32 | (age / DECODE_TICK) as u64);
+            // One cell in four scrambles; the rest only carry the tint.
+            let glyph = seed.is_multiple_of(4).then(|| DECODE_GLYPHS[pick as usize % DECODE_GLYPHS.len()]);
+            CellLook { glyph, accent: 0.7 * (1.0 - t), ..CellLook::PLAIN }
+        }
     };
     Some(look)
 }
@@ -1813,6 +1860,27 @@ impl Particle {
                 phase: if i == 0 { -1.0 } else { TAU * i as f32 / count as f32 },
                 ..base
             },
+            KeystrokeBurst::Comet => {
+                // `first_color` is shared by this burst: the head and its dust fly one way.
+                let angle = -FRAC_PI_2 + (first_color as f32 - 2.0) * 0.45;
+                let speed = 11.0 * (1.0 - i as f32 * 0.14);
+                Particle {
+                    life: if i == 0 { 0.5 } else { rng.range(0.3, 0.5) },
+                    velocity: throw(angle + if i == 0 { 0.0 } else { rng.range(-0.08, 0.08) }, speed),
+                    angle,
+                    size: if i == 0 { 0.09 } else { rng.range(0.04, 0.07) },
+                    phase: if i == 0 { -1.0 } else { base.phase },
+                    ..base
+                }
+            }
+            KeystrokeBurst::Fireflies => Particle {
+                life: rng.range(0.8, 0.98),
+                velocity: throw(rng.range(0.0, TAU), rng.range(0.6, 1.4)),
+                size: rng.range(0.07, 0.1),
+                color: ParticleColor::Fixed(Color32::from_rgb(0xd8, 0xf3, 0x6a)),
+                ..base
+            },
+            KeystrokeBurst::Orbit => Particle { life: 0.7, size: 0.09, phase: TAU * i as f32 / count as f32, ..base },
         }
     }
 
@@ -1891,6 +1959,22 @@ impl Particle {
                 let angle = self.phase + age * 9.0;
                 (radius * angle.sin(), radius * angle.cos(), self.size, 1.0 - u, ParticleShape::Star { angle })
             }
+            KeystrokeBurst::Comet if self.phase < 0.0 => {
+                (vy * age, vx * age, self.size, 1.0 - u, ParticleShape::Beam { angle: self.angle, length: 1.8 })
+            }
+            KeystrokeBurst::Comet => (vy * age, vx * age, self.size, (1.0 - u) * 0.8, ParticleShape::Dot),
+            KeystrokeBurst::Fireflies => (
+                vy * age + wobble(0.3, 1.1),
+                vx * age + wobble(0.2, 0.7),
+                self.size,
+                (1.0 - u) * (0.5 + 0.5 * (TAU * 3.0 * age + self.phase).sin()),
+                ParticleShape::Dot,
+            ),
+            KeystrokeBurst::Orbit => {
+                // A tilted circle: one turn in its lifetime, flatter than it is wide.
+                let angle = self.phase + TAU * u;
+                (0.55 * angle.sin(), 0.65 * angle.cos(), self.size, 1.0 - u * u, ParticleShape::Dot)
+            }
         };
         Some(ParticleLook {
             pos: (self.origin.0 + dy, self.origin.1 + dx * ASPECT),
@@ -1946,7 +2030,7 @@ impl Rng {
 }
 
 /// The same well-mixed number for the same input (splitmix64's finish).
-fn scramble(mut x: u64) -> u64 {
+pub(super) fn scramble(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x ^= x >> 27;
@@ -2551,10 +2635,44 @@ mod tests {
     }
 
     #[test]
+    fn newer_cell_and_line_styles_show_then_finish() {
+        for style in [TypedText::Jelly, TypedText::Neon] {
+            assert!(typed_look(style, 0.03).is_some_and(|l| l.scale != 1.0 || l.alpha < 1.0 || l.accent > 0.0));
+            assert_eq!(typed_look(style, 1.0), None);
+        }
+        for style in [NewText::Flicker, NewText::Glitch] {
+            assert!(output_look(style, 0.03, 8).is_some_and(|l| l.glyph.is_some() || l.alpha < 1.0 || l.accent > 0.0));
+            assert_eq!(output_look(style, 1.0, 8), None);
+        }
+        // Glitch scrambles only some cells, so most text stays legible as it lands.
+        let scrambled = (0..400).filter(|&seed| output_look(NewText::Glitch, 0.05, seed).unwrap().glyph.is_some());
+        assert_eq!(scrambled.count(), 100);
+
+        let wipe = (LineMark::new(NewLines::Wipe, 0.1, 2, 12), LineMark::new(NewLines::Wipe, 0.9, 2, 12));
+        assert!(wipe.0.reach < wipe.1.reach && wipe.1.reach <= 10.0 && wipe.0.alpha > wipe.1.alpha);
+        let beacon = |t: f32| LineMark::new(NewLines::Beacon, t, 2, 12).alpha;
+        assert!(beacon(0.25) > beacon(0.5) && beacon(0.75) > beacon(0.5), "blinks twice");
+        assert!(beacon(0.999) < 0.01);
+    }
+
+    #[test]
+    fn heartbeat_beats_twice_then_rests() {
+        let level = |beat: f64| blink_level(CursorBlink::Heartbeat, beat * PULSE, 0.0);
+        assert!(level(0.12) > 0.95 && level(0.34) > 0.95);
+        assert!(level(0.23) < level(0.12) && level(0.8) == 0.5);
+    }
+
+    #[test]
     fn creative_bursts_are_bounded_finite_and_finish_without_changing_output() {
-        for style in
-            [KeystrokeBurst::Explosion, KeystrokeBurst::Lasers, KeystrokeBurst::Lightning, KeystrokeBurst::Portal]
-        {
+        for style in [
+            KeystrokeBurst::Explosion,
+            KeystrokeBurst::Lasers,
+            KeystrokeBurst::Lightning,
+            KeystrokeBurst::Portal,
+            KeystrokeBurst::Comet,
+            KeystrokeBurst::Fireflies,
+            KeystrokeBurst::Orbit,
+        ] {
             let mut rng = Rng(1234);
             for i in 0..18 {
                 let particle = Particle::new(style, i, 18, 0, 1.0, 1.0, (5.0, 5.0), &mut rng);

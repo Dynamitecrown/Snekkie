@@ -82,6 +82,18 @@ impl<T: Copy + PartialEq> TabLayout<T> {
         TabLayout { columns: vec![Column::new(left, 1.0), Column::new(right, 1.0)] }
     }
 
+    /// Even columns of one or two tabs, as `rows` gives them back. None
+    /// unless it holds two tabs or more.
+    pub fn from_rows(rows: &[Vec<T>]) -> Option<Self> {
+        let columns: Vec<_> = rows
+            .iter()
+            .filter_map(|tabs| Some(Column { bottom: tabs.get(1).copied(), ..Column::new(*tabs.first()?, 1.0) }))
+            .take(MAX_COLUMNS)
+            .collect();
+        let layout = TabLayout { columns };
+        (layout.tabs().len() >= 2).then_some(layout)
+    }
+
     /// Every tab, by column and then from the top.
     pub fn tabs(&self) -> Vec<T> {
         self.columns.iter().flat_map(|column| std::iter::once(column.top).chain(column.bottom)).collect()
@@ -303,6 +315,14 @@ mod tests {
             layout = add(&layout, tab, above, Edge::Bottom);
         }
         layout
+    }
+
+    #[test]
+    fn rebuilds_from_rows() {
+        let layout = full();
+        assert_eq!(TabLayout::from_rows(&layout.rows()).unwrap().rows(), layout.rows());
+        assert_eq!(TabLayout::from_rows(&[vec![1], vec![], vec![2, 3, 4]]).unwrap().rows(), [vec![1], vec![2, 3]]);
+        assert!(TabLayout::<u32>::from_rows(&[vec![1]]).is_none());
     }
 
     #[test]

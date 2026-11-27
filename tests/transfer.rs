@@ -306,6 +306,8 @@ fn connect(offers: Offers) -> Harness {
         password: "secret".into(),
         key_passphrase: String::new(),
         known_hosts: local.path().join("known_hosts"),
+        ask_prompts: None,
+        jumps: Vec::new(),
     };
     let ask: ssh::HostKeyAsker = Arc::new(|q: ssh::HostKeyQuestion| {
         let _ = q.reply.send(true);

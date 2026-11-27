@@ -31,6 +31,10 @@ The destination stays bound to the tab and connection that opened the library. C
 
 Commands use the shared [paste controller](paste-behavior.md) and the saved **Paste delay between lines** (100 ms by default). The status bar shows queued progress and **Stop paste**; Stop, disconnect, reconnect or closing the target discards remaining lines. Set the delay to 0 ms for immediate submission. A queued paste pauses while a dialog is open.
 
+## Button bar
+
+Tick **Show on button bar** when editing a snippet, then turn on **View → Button bar** (off by default; Snekkie remembers the choice). A row of buttons appears above the current terminal; it scrolls sideways when there are many. A button opens that snippet's review page for the current tab, so you still fill in variables and choose **Send commands**. Nothing is sent from the bar itself. If the tab is not connected, Send stays disabled. With nothing pinned, the bar shows a short hint.
+
 ## Local storage and sharing
 
 Templates are saved in `snippets.json` beside `sessions.json`, separately from profiles and preferences. Names must be unique within a group, ignoring case. Editing or moving a template preserves its ID. IDs are local; imported templates receive new IDs.

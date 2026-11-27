@@ -151,6 +151,78 @@ fn visible_command(line: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// The CLI mode a network device prompt shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliMode {
+    User,
+    Privileged,
+    Config,
+}
+
+impl CliMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            CliMode::User => "user",
+            CliMode::Privileged => "privileged",
+            CliMode::Config => "config",
+        }
+    }
+}
+
+/// A device prompt the cursor sits at: the hostname, and the CLI mode when it
+/// looks like a network device rather than a shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prompt {
+    pub host: String,
+    pub mode: Option<CliMode>,
+}
+
+/// Programs whose own prompts look like a device's.
+const NOT_HOSTS: [&str; 6] = ["mysql", "mariadb", "ftp", "sftp", "telnet", "irb"];
+
+/// Read a prompt such as "SW1#", "SW1(config-if)#", "admin@fw>" or
+/// "user@host:~$". Only a line that ends in the prompt counts, so a command
+/// being typed (or ordinary output) never renames anything.
+pub fn parse_prompt(line: &str) -> Option<Prompt> {
+    let line = line.trim();
+    let end = line.chars().next_back()?;
+    if !matches!(end, '#' | '>' | '$' | '%') {
+        return None;
+    }
+    let body = line[..line.len() - 1].trim_end();
+    let config = body.contains("(config");
+    // "SW1(config-if)" and FortiGate's "FGT (root)" keep the name before the bracket.
+    let name = body.split_once('(').map_or(body, |(name, _)| name.trim_end());
+    let (host, shell) = if let Some(inner) = name.strip_prefix('[').and_then(|n| n.strip_suffix(']')) {
+        // "[user@host ~]"
+        let user_host = inner.split_whitespace().next().unwrap_or_default();
+        (user_host.rsplit_once('@').map_or(user_host, |(_, h)| h), true)
+    } else if let Some((_, rest)) = name.rsplit_once('@') {
+        // "user@host:~" is a shell; "admin@fw" a device.
+        let host = rest.split(':').next().unwrap_or_default();
+        (host, rest.contains(':') || matches!(end, '$' | '%'))
+    } else {
+        // IOS XR's "RP/0/RSP0/CPU0:XR1" names the router last.
+        (name.rsplit(':').next().unwrap_or_default(), matches!(end, '$' | '%'))
+    };
+    let valid = host.len() <= 63
+        && host.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !host.chars().all(|c| c.is_ascii_digit())
+        && !NOT_HOSTS.contains(&host.to_ascii_lowercase().as_str());
+    if !valid {
+        return None;
+    }
+    let mode = (!shell).then_some(if config {
+        CliMode::Config
+    } else if end == '#' {
+        CliMode::Privileged
+    } else {
+        CliMode::User
+    });
+    Some(Prompt { host: host.to_string(), mode })
+}
+
 fn is_show(command: &str) -> bool {
     let mut words = command.split_whitespace();
     let mut first = words.next().unwrap_or_default();
@@ -347,6 +419,42 @@ mod tests {
         pager.sent(command, "Switch#");
         assert!(pager.active);
         pager
+    }
+
+    #[test]
+    fn prompts_give_host_and_mode_and_shells_give_only_host() {
+        use CliMode::*;
+        for (line, host, mode) in [
+            ("SW1#", "SW1", Some(Privileged)),
+            ("SW1> ", "SW1", Some(User)),
+            ("SW1(config-if)#", "SW1", Some(Config)),
+            ("core-rtr.lab(config)# ", "core-rtr.lab", Some(Config)),
+            ("admin@fw>", "fw", Some(User)),
+            ("user@host#", "host", Some(Privileged)),
+            ("FGT (root) #", "FGT", Some(Privileged)),
+            ("RP/0/RSP0/CPU0:XR1#", "XR1", Some(Privileged)),
+            ("user@host:~$", "host", None),
+            ("root@web01:/etc# ", "web01", None),
+            ("[user@db1 ~]$", "db1", None),
+            ("me@mac %", "mac", None),
+        ] {
+            assert_eq!(parse_prompt(line), Some(Prompt { host: host.into(), mode }), "{line}");
+        }
+        for line in [
+            "",
+            "#",
+            "$ ",
+            "SW1#show version",
+            "Press any key to continue>",
+            ">>>",
+            "->",
+            "mysql>",
+            "1>",
+            "  interface Gi0/1",
+            "--More--",
+        ] {
+            assert_eq!(parse_prompt(line), None, "{line}");
+        }
     }
 
     #[test]

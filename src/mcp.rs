@@ -38,6 +38,7 @@ const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", 
 const MAX_REQUEST: u64 = 1024 * 1024;
 const REQUEST_WAIT: Duration = Duration::from_secs(10);
 const MAX_COMMAND_SECONDS: u64 = 120;
+const RECONNECT_SECONDS: u64 = 30;
 const MAX_TRANSFER_SECONDS: u64 = 6 * 60 * 60;
 /// Output kept for one command; a flood beyond this is counted, not stored.
 const MAX_CAPTURE: usize = 4 * 1024 * 1024;
@@ -59,8 +60,9 @@ const NOT_RUNNING: &str = "Snekkie is not running, or AI agent access is off. As
 const INSTRUCTIONS: &str = "Snekkie is the user's terminal for network devices and servers. Its sessions are live \
      SSH, Telnet, raw TCP and serial connections the user opened. Anything you send runs on real equipment exactly \
      as if the user typed it, and is recorded in the session log when logging is on. Call list_sessions first, then \
-     send_command one line at a time and read what comes back. If the user allows file access, the file tools work \
-     on SSH sessions and file explorer tabs over SFTP.";
+     send_command one line at a time and read what comes back. After a session drops, such as when a host reboots, \
+     reconnect_session brings it back; the user answers any password or host key question. If the user allows file \
+     access, the file tools work on SSH sessions and file explorer tabs over SFTP.";
 
 /// What agents are doing, for the app to show.
 #[derive(Clone, Debug, Default)]
@@ -107,6 +109,10 @@ struct Listing {
     activity: HashMap<u64, Use>,
     agents: Vec<(u64, String)>,
     next_agent: u64,
+    /// Sessions agents want connected again, and who asked, for the app's next frame.
+    reconnects: Vec<(u64, String)>,
+    /// Sessions waiting for the user to type a password or passphrase.
+    asking: Vec<u64>,
 }
 
 struct Inner {
@@ -226,6 +232,16 @@ impl Server {
         self.inner.listing.lock().explorers = explorers.collect();
     }
 
+    /// Reconnects agents have asked for since the last call.
+    pub fn take_reconnects(&self) -> Vec<(u64, String)> {
+        std::mem::take(&mut self.inner.listing.lock().reconnects)
+    }
+
+    /// The sessions that can't reconnect until the user answers a dialog.
+    pub fn sync_asking(&self, asking: Vec<u64>) {
+        self.inner.listing.lock().asking = asking;
+    }
+
     pub fn activity(&self) -> Activity {
         let listing = self.inner.listing.lock();
         Activity {
@@ -309,6 +325,7 @@ async fn call(inner: &Inner, agent: &str, tool: &str, arguments: &Value) -> Resu
             Ok(all[all.len().saturating_sub(lines)..].join("\n"))
         }
         "send_command" => send_command(inner, agent, &find(listing, arguments)?, arguments).await,
+        "reconnect_session" => reconnect_session(inner, agent, &find(listing, arguments)?, arguments).await,
         tool if files::handles(tool) => files::call(inner, agent, tool, arguments).await,
         "send_keys" => {
             let session = find(listing, arguments)?;
@@ -377,7 +394,53 @@ fn find(listing: &Mutex<Listing>, arguments: &Value) -> Result<Remote, String> {
 }
 
 fn not_connected(session: &Remote) -> String {
-    format!("{} is {}, so nothing was sent. Ask the user to reconnect it.", session.name, state_text(&session.state()))
+    format!(
+        "{} is {}, so nothing was sent. Use reconnect_session to bring it back.",
+        session.name,
+        state_text(&session.state())
+    )
+}
+
+/// Asks the app to connect a dropped session again, the way its Reconnect
+/// button does, so every question still goes to the user.
+async fn reconnect_session(inner: &Inner, agent: &str, session: &Remote, arguments: &Value) -> Result<String, String> {
+    let name = &session.name;
+    match session.state() {
+        State::Connected => return Ok(format!("{name} is already connected. Nothing changed.")),
+        State::Connecting => return Ok(format!("{name} is already connecting. Check list_sessions for the result.")),
+        State::Closed(None) => {
+            return Err(format!("The user disconnected {name}, so it was left alone. Ask the user to reconnect it."));
+        }
+        State::Closed(Some(_)) => {}
+    }
+    let wait = arguments["timeout_seconds"].as_u64().unwrap_or(RECONNECT_SECONDS).clamp(1, MAX_COMMAND_SECONDS);
+    let before = session.connection_generation();
+    inner.listing.lock().reconnects.push((session.id, agent.into()));
+    inner.wrote(session.id, agent);
+    let start = Instant::now();
+    loop {
+        tokio::time::sleep(POLL).await;
+        if inner.listing.lock().asking.contains(&session.id) {
+            return Err(format!(
+                "Snekkie is asking the user for the password or passphrase of {name}. Only the user can answer. Try \
+                 list_sessions after they have."
+            ));
+        }
+        if session.connection_generation() != before {
+            match session.state() {
+                State::Connected => return Ok(format!("{name} is connected again, with a cleared screen.")),
+                State::Connecting => {}
+                closed => return Err(format!("{name} did not reconnect. It is {}.", state_text(&closed))),
+            }
+        }
+        if start.elapsed().as_secs() >= wait {
+            return Err(format!(
+                "{name} is {} after {wait} s. Snekkie may be waiting for the user to answer a host key or network \
+                 question, or to bring its window back. Check list_sessions later.",
+                state_text(&session.state())
+            ));
+        }
+    }
 }
 
 async fn send_command(inner: &Inner, agent: &str, session: &Remote, arguments: &Value) -> Result<String, String> {
@@ -774,6 +837,24 @@ fn terminal_tools() -> Value {
             },
             "annotations": { "destructiveHint": true },
         },
+        {
+            "name": "reconnect_session",
+            "description": "Connect a dropped session again, such as after a host reboots. Clears its screen and \
+                scrollback, and runs nothing on the device. Leaves connected sessions and ones the user disconnected \
+                alone. The user answers any password, host key or network question in Snekkie; you never see them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": session_id,
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Longest to wait for the connection (default 30, at most 120).",
+                    },
+                },
+                "required": ["session_id"],
+            },
+            "annotations": { "destructiveHint": false, "openWorldHint": true },
+        },
     ])
 }
 
@@ -886,6 +967,8 @@ mod tests {
         session.connect(ConnectContext {
             runtime: runtime.handle(),
             ask_host_key: Arc::new(|_| {}),
+            ask_prompts: None,
+            jumps: Vec::new(),
             password: String::new(),
             key_passphrase: String::new(),
             network: Default::default(),
@@ -970,6 +1053,15 @@ mod tests {
         let mut reply = String::new();
         stranger.read_to_string(&mut reply).unwrap();
         assert_eq!(reply, "");
+
+        // Connected, then hung up by the user: neither is an agent's to reconnect.
+        let reconnect = json!({ "session_id": session.id });
+        let (text, error) = forward(&file, "Test agent", "reconnect_session", &reconnect).unwrap();
+        assert!(!error && text.contains("already connected"), "{text}");
+        session.shutdown();
+        let (text, error) = forward(&file, "Test agent", "reconnect_session", &reconnect).unwrap();
+        assert!(error && text.contains("user disconnected"), "{text}");
+        assert!(server.take_reconnects().is_empty());
 
         drop(server);
         assert!(!file.exists());

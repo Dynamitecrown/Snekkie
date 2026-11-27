@@ -14,9 +14,11 @@ use egui::{
 };
 
 use crate::invade::content::{ARENA_H, ARENA_W, ASPECT, WORLD_H, WORLD_W};
+use crate::invade::loot::POISON_MAX_STACKS;
 use crate::invade::rng::mix;
 use crate::invade::run::{
-    Curtain, EffectKind, HostileKind, RESUME_COUNTDOWN, Role, SCAN_WIDTH, STEP, ShotKind, Summary,
+    CLOAK_TIME, Curtain, EffectKind, HostileKind, MINE_TRIGGER, RESUME_COUNTDOWN, Role, SCAN_WIDTH, STEP,
+    STINGER_SHOT_RADIUS, ShotKind, Summary,
 };
 use crate::invade::upgrades::{Card, Stats, weapon_details};
 use crate::invade::{
@@ -237,7 +239,7 @@ impl InvadeTab {
                 wave: 0,
                 completed_wave: 0,
                 score: 0,
-                integrity: 5,
+                integrity: self.loadout.rig.base().max_integrity,
                 paused: true,
                 state: "Choose loadout",
             };
@@ -784,15 +786,23 @@ impl InvadeTab {
         }
 
         // HUD.
-        let integrity: String = (0..5).map(|i| if i < run.integrity() { '#' } else { '-' }).collect::<String>();
+        let max = run.max_integrity();
+        let integrity: String = (0..max).map(|i| if i < run.integrity() { '#' } else { '-' }).collect::<String>();
+        // A fixed 17-column streak slot keeps INTEGRITY still and the widest
+        // row (8 integrity, SHIELD, a 4-digit streak) within 80 columns.
+        let prefix = format!("INVADE  WAVE {:02}  SCORE {:06}", run.wave(), run.score());
         let hud = format!(
-            "INVADE   WAVE {:02}   SCORE {:06}   INTEGRITY [{integrity}] {}/5{}",
-            run.wave(),
-            run.score(),
+            "{prefix}{:17}  INTEGRITY [{integrity}] {}/{max}{}",
+            "",
             run.integrity(),
             if run.player().shield_ready { "  SHIELD" } else { "" }
         );
         text(0.0, 0.0, &hud, palette.fg);
+        if run.streak_multiplier() > 1.0 {
+            let fading = run.streak_remaining() < 0.75;
+            let streak = format!(" x{:.1} STREAK {}", run.streak_multiplier(), run.streak());
+            text(prefix.len() as f32, 0.0, &streak, if fading { palette.dim } else { palette.fg });
+        }
         let special = special_meter(run, stats);
         let mobility = mobility_meter(run);
         let tag = if self.store.progress.is_unlocked(Unlock::RootAccess) { "   root@invade" } else { "" };
@@ -823,7 +833,7 @@ impl InvadeTab {
             layout.detail_text(&painter, -GLYPH, row as f32 / DETAIL, "|", palette.dim);
             layout.detail_text(&painter, ARENA_W, row as f32 / DETAIL, "|", palette.dim);
         }
-        for (row, footer) in control_footer(run.rig()).lines().enumerate() {
+        for (row, footer) in control_footer(run.rig(), run.special_name()).lines().enumerate() {
             text(0.0, ARENA_TOP_ROW + ARENA_H + 1.0 + row as f32, footer, palette.dim);
         }
 
@@ -951,11 +961,21 @@ impl InvadeTab {
                 palette.warning
             } else if enemy.telegraphing && device {
                 palette.danger
-            } else if enemy.elite {
+            } else if enemy.elite || enemy.poison > 0 {
                 palette.experience
             } else {
                 palette.fg
             };
+            if enemy.poison > 0 {
+                // One drip per poison stack, under the ship.
+                let drips = "~".repeat(usize::from(enemy.poison));
+                put(
+                    enemy.x + enemy.w / 2.0 - drips.len() as f32 * GLYPH / 2.0,
+                    enemy.y + enemy.h,
+                    &drips,
+                    palette.experience,
+                );
+            }
             if enemy.telegraphing {
                 // Above the ship when there is room, otherwise just below it.
                 let row = if enemy.y - camera.1 >= 1.0 { enemy.y - 1.0 } else { enemy.y + enemy.h };
@@ -1009,8 +1029,17 @@ impl InvadeTab {
                 ShotKind::Missile => "=>",
                 ShotKind::Flame => "^",
                 ShotKind::Reflected => "+",
+                ShotKind::Stinger => "(@)",
+                ShotKind::Worm => "&",
+                ShotKind::Mine => "(=)",
             };
-            let base_radius = if shot.kind == ShotKind::Missile { 0.45 } else { 0.15 };
+            let base_radius = match shot.kind {
+                ShotKind::Missile => 0.45,
+                ShotKind::Mine => MINE_TRIGGER / 3.0,
+                // Drawn three times bullet size, unlike its collision-sized peers.
+                ShotKind::Stinger => STINGER_SHOT_RADIUS / 3.0,
+                _ => 0.15,
+            };
             let mut font = layout.bullet_font.clone();
             font.size *= shot.radius / base_radius;
             arena.text(
@@ -1018,7 +1047,11 @@ impl InvadeTab {
                 Align2::CENTER_CENTER,
                 glyph,
                 font,
-                if shot.kind == ShotKind::Flame { palette.warning } else { palette.friendly },
+                match shot.kind {
+                    ShotKind::Flame => palette.warning,
+                    ShotKind::Stinger => palette.experience,
+                    _ => palette.friendly,
+                },
             );
         }
         for orbital in run.orbitals() {
@@ -1048,7 +1081,14 @@ impl InvadeTab {
             let glyph =
                 if hostile.unblockable && hostile.kind != HostileKind::Stream { '#' } else { hostile.kind.glyph() }
                     .to_string();
-            let color = if hostile.kind == HostileKind::Aimed { palette.warning } else { palette.danger };
+            // Rate Limit shows as dimmed, crawling packets.
+            let color = if run.rate_limited() > 0.0 {
+                palette.dim
+            } else if hostile.kind == HostileKind::Aimed {
+                palette.warning
+            } else {
+                palette.danger
+            };
             let at = layout.at(hostile.x - camera.0, hostile.y - camera.1);
             arena.text(at, Align2::CENTER_CENTER, glyph, layout.bullet_font.clone(), color);
         }
@@ -1069,7 +1109,8 @@ impl InvadeTab {
                     put(effect.x - 1.5 * GLYPH, effect.y - GLYPH / 2.0, glyph, palette.warning);
                 }
                 EffectKind::Spark => put(effect.x - GLYPH / 2.0, effect.y - GLYPH / 2.0, "'", palette.friendly),
-                EffectKind::Chain => {
+                EffectKind::Chain | EffectKind::Repair => {
+                    let color = if effect.kind == EffectKind::Repair { palette.danger } else { palette.friendly };
                     let (dx, dy) = (effect.to.0 - effect.x, effect.to.1 - effect.y);
                     let steps = ((dx.abs()).max(dy.abs() * ASPECT) / 0.75).ceil().max(1.0) as usize;
                     for i in 0..=steps {
@@ -1078,20 +1119,25 @@ impl InvadeTab {
                             effect.x + dx * t - GLYPH / 2.0,
                             effect.y + dy * t - GLYPH / 2.0,
                             if i == steps { "*" } else { "." },
-                            palette.friendly,
+                            color,
                         );
                     }
                 }
                 EffectKind::Absorb => put(effect.x - 3.5 * GLYPH, effect.y - GLYPH / 2.0, "(     )", palette.friendly),
                 EffectKind::Damage => put(effect.x - 2.5 * GLYPH, effect.y - GLYPH / 2.0, "## ##", palette.danger),
-                EffectKind::Pulse => {
-                    let color = palette.friendly.gamma_multiply(1.0 - age * 0.75);
+                EffectKind::Pulse | EffectKind::Poison => {
+                    let (base, glyph) = if effect.kind == EffectKind::Poison {
+                        (palette.experience, "~")
+                    } else {
+                        (palette.friendly, ":")
+                    };
+                    let color = base.gamma_multiply(1.0 - age * 0.75);
                     for point in 0..72 {
                         let angle = point as f32 / 72.0 * std::f32::consts::TAU;
                         put(
                             effect.x + angle.cos() * effect.radius - GLYPH / 2.0,
                             effect.y + angle.sin() * effect.radius / ASPECT - GLYPH / 2.0,
-                            ":",
+                            glyph,
                             color,
                         );
                     }
@@ -1103,13 +1149,13 @@ impl InvadeTab {
         let player = run.player();
         let width = run.rig().width();
         let blink = player.invulnerable > 0.0 && !paused && (now * 10.0) as i64 % 2 == 0;
+        for &(x, y) in &player.tail {
+            put(x - 1.0, y - 0.5, &sprites::tail_car().join("\n"), palette.friendly);
+        }
         if !blink {
-            put(
-                player.x - width / 2.0,
-                player.y,
-                &sprites::flight_rig(run.rig(), player.heading).join("\n"),
-                palette.friendly,
-            );
+            // A cloaked Ghost is a faint outline.
+            let hull = if player.cloak > 0.0 { palette.friendly.gamma_multiply(0.3) } else { palette.friendly };
+            put(player.x - width / 2.0, player.y, &sprites::flight_rig(run.rig(), player.heading).join("\n"), hull);
             draw_flight_markers(
                 &put,
                 (player.x, player.y + 0.5),
@@ -1117,10 +1163,10 @@ impl InvadeTab {
                 player.nose(),
                 player.thrusting,
                 player.braking,
-                palette.friendly,
+                hull,
             );
         }
-        if player.protection > 0.0 {
+        if player.protection > 0.0 && player.cloak == 0.0 {
             let shield = if player.barrier {
                 format!(".{}.", "=".repeat((width * DETAIL) as usize))
             } else {
@@ -1336,20 +1382,30 @@ impl InvadeTab {
             }
         });
         ui.label(self.loadout.weapon.summary());
-        if self.loadout.rig == Rig::Probe {
-            ui.separator();
-            ui.label(RichText::new("Pivot weapon").strong());
-            ui.horizontal_wrapped(|ui| {
-                for kind in PivotKind::ALL {
-                    let radio = ui.radio(self.pivot_kind == kind, kind.name());
-                    self.overlay_controls.push(radio.id);
-                    if radio.clicked() {
-                        self.pivot_kind = kind;
-                    }
-                }
-            });
-            ui.label(self.pivot_kind.description());
+        let rig = self.loadout.rig;
+        if !self.pivot_kind.allowed(rig, |u| self.store.progress.is_unlocked(u)) {
+            self.pivot_kind = PivotKind::Chain;
         }
+        ui.separator();
+        ui.label(RichText::new("Pivot weapon").strong());
+        ui.horizontal_wrapped(|ui| {
+            for &kind in PivotKind::options(rig) {
+                let available = kind.allowed(rig, |u| self.store.progress.is_unlocked(u));
+                let label =
+                    if available { kind.label(rig).to_string() } else { format!("{} (locked)", kind.label(rig)) };
+                let radio = ui.add_enabled(available, egui::RadioButton::new(self.pivot_kind == kind, label));
+                self.overlay_controls.push(radio.id);
+                let radio = radio.on_hover_text(if available {
+                    kind.description_for(rig)
+                } else {
+                    kind.unlock().map_or("", Unlock::milestone)
+                });
+                if radio.clicked() {
+                    self.pivot_kind = kind;
+                }
+            }
+        });
+        ui.label(self.pivot_kind.description_for(rig));
         ui.separator();
         ui.label(RichText::new("Starter module").strong());
         ui.horizontal_wrapped(|ui| {
@@ -1396,10 +1452,31 @@ impl InvadeTab {
         ui.separator();
         self.rig_ui(ui, "Rig for the next run");
         ui.separator();
-        Self::controls_ui(ui, self.run.rig());
+        Self::controls_ui(ui, self.run.rig(), self.run.special_name());
         ui.separator();
         self.unlocks_ui(ui, palette);
+        ui.separator();
+        self.codex_ui(ui, palette);
         action
+    }
+
+    fn codex_ui(&mut self, ui: &mut Ui, palette: &Palette) {
+        // Best waves count completed waves; the current one counts once it is reached.
+        let best = self.store.progress.best.values().map(|b| b.wave).chain([self.run.wave().saturating_sub(1)]).max();
+        let header = egui::CollapsingHeader::new("Codex").id_salt("invade_codex").default_open(false).show(ui, |ui| {
+            for (section, entries) in crate::invade::content::codex(best.unwrap_or(0)) {
+                ui.label(RichText::new(section).strong());
+                for entry in entries {
+                    let color = if entry.revealed { palette.panel_text } else { palette.dim_text };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{:<11}", entry.sprite)).monospace().color(color));
+                        ui.label(RichText::new(entry.name).strong().color(color));
+                        ui.add(egui::Label::new(RichText::new(entry.detail).color(color)).wrap());
+                    });
+                }
+            }
+        });
+        self.overlay_controls.push(header.header_response.id);
     }
 
     fn warning_ui(&self, ui: &mut Ui, palette: &Palette) {
@@ -1425,7 +1502,7 @@ impl InvadeTab {
         }
     }
 
-    fn controls_ui(ui: &mut Ui, rig: Rig) {
+    fn controls_ui(ui: &mut Ui, rig: Rig, special: &str) {
         ui.label(RichText::new("Controls").strong());
         egui::Grid::new("invade_controls").num_columns(2).spacing(vec2(12.0, 2.0)).show(ui, |ui| {
             for (keys, what) in [
@@ -1434,7 +1511,7 @@ impl InvadeTab {
                 ("S or Down", "Brake without reversing (overrides thrust)".to_string()),
                 ("Automatic fire", "Weapons fire continuously; aim tracks the nearest visible device".to_string()),
                 ("Shift", format!("{} along the nose", rig.mobility_name())),
-                ("X", format!("{} (special)", rig.special_name())),
+                ("X", format!("{special} (special)")),
                 ("Esc or P", "Pause".to_string()),
                 ("B", "Pause and show the build".to_string()),
                 ("1, 2, 3", "Choose an offered upgrade".to_string()),
@@ -1488,8 +1565,9 @@ impl InvadeTab {
         let run = &self.run;
         ui.label(format!("{} · {}", run.rig().name(), run.rig().summary()));
         ui.label(RichText::new("Weapons").strong());
-        if run.rig() == Rig::Probe {
-            ui.label(format!("{}: {}", run.pivot_kind().name(), run.pivot_kind().description()));
+        if run.rig() == Rig::Probe || run.pivot_kind() != PivotKind::Chain {
+            let kind = run.pivot_kind();
+            ui.label(format!("{}: {}", kind.label(run.rig()), kind.description_for(run.rig())));
         }
         for item in run.items() {
             ui.label(format!("{}: {}", item.name(), item.description()));
@@ -1497,7 +1575,7 @@ impl InvadeTab {
         for weapon in run.weapons() {
             ui.label(format!(
                 "{} — rank {} of {}: {}",
-                weapon.kind.name(),
+                weapon.display_name(),
                 weapon.rank,
                 weapon.kind.cap(),
                 weapon.kind.summary()
@@ -1508,17 +1586,29 @@ impl InvadeTab {
         ui.separator();
         egui::Grid::new("invade_stats").num_columns(2).spacing(vec2(12.0, 2.0)).show(ui, |ui| {
             for (name, value) in stat_lines(run.rig(), s) {
-                let (name, value) = if name == "Pivot" && run.pivot_kind() == PivotKind::Missile {
-                    (
+                let native =
+                    matches!(name, "Pivot" | "Slip protection" | "Barrier" | "Reflect" | "Overclock" | "Purge radius");
+                let (name, value) = match run.pivot_kind() {
+                    PivotKind::Missile if native => (
                         "Missile Pivot",
                         format!(
                             "{:.0} splash damage, {:.0} radius",
                             s.pivot_direct * 2.0,
                             8.0 + f32::from(s.pivot_jumps.saturating_sub(3))
                         ),
-                    )
-                } else {
-                    (name, value)
+                    ),
+                    PivotKind::Cloak if native => ("Cloak", format!("{CLOAK_TIME:.1} s invisible and unhittable")),
+                    PivotKind::RateLimit if native => {
+                        ("Rate Limit", format!("{:.0} s of slowed packets and ordinary ships", run.rate_limit_time()))
+                    }
+                    PivotKind::Stinger if native => (
+                        "Stinger",
+                        format!(
+                            "{:.2} poison damage/s per stack, up to {POISON_MAX_STACKS} stacks",
+                            run.poison_per_stack()
+                        ),
+                    ),
+                    _ => (name, value),
                 };
                 ui.label(name);
                 ui.label(RichText::new(value).monospace());
@@ -1535,7 +1625,7 @@ impl InvadeTab {
             ui.label(format!("{} — rank {rank} of {}: {}", id.name(), id.cap(), id.rule()));
         }
         ui.separator();
-        Self::controls_ui(ui, run.rig());
+        Self::controls_ui(ui, run.rig(), run.special_name());
         if back {
             self.overlay = Some(Overlay::Pause);
             self.focus_overlay = true;
@@ -1618,6 +1708,7 @@ impl InvadeTab {
             seed: self.run.seed(),
             reason: self.run.ended().unwrap_or(EndReason::Defeated),
             compromised: self.run.compromised(),
+            best_streak: self.run.best_streak(),
             unlocks: self.run.earned_unlocks().to_vec(),
         });
         Self::heading(ui, &format!("RUN OVER — {}", summary.reason.label().to_uppercase()));
@@ -1629,6 +1720,7 @@ impl InvadeTab {
                 ("Rig", summary.rig.name().to_string()),
                 ("Time played", format!("{}:{:02}", minutes.floor() as u64, (summary.duration % 60.0).floor() as u64)),
                 ("Devices compromised", summary.compromised.to_string()),
+                ("Best kill streak", summary.best_streak.to_string()),
             ] {
                 ui.label(name);
                 ui.label(RichText::new(value).monospace());
@@ -1760,12 +1852,11 @@ fn direction_glyph(dx: f32, dy: f32) -> &'static str {
     }
 }
 
-fn control_footer(rig: Rig) -> String {
+fn control_footer(rig: Rig, special: &str) -> String {
     format!(
         "[A/D or Left/Right] Turn [W/Up] Thrust [S/Down] Brake - release to coast\n\
-         Auto-fire: always on [Shift] {} [X] {} [Esc/P] Pause [B] Build",
-        rig.mobility_name(),
-        rig.special_name()
+         Auto-fire: always on [Shift] {} [X] {special} [Esc/P] Pause [B] Build",
+        rig.mobility_name()
     )
 }
 
@@ -1830,8 +1921,10 @@ fn weapon_summary(run: &InvadeRun) -> String {
                 WeaponKind::Pulse => "PLS",
                 WeaponKind::Flamethrower => "FLM",
                 WeaponKind::Shield => "SHLD",
+                WeaponKind::Worm => "WRM",
+                WeaponKind::Mine => "BMB",
             };
-            format!("{glyph}{}", weapon.rank)
+            format!("{glyph}{}{}", weapon.rank, if weapon.evolved() { "*" } else { "" })
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -1839,18 +1932,22 @@ fn weapon_summary(run: &InvadeRun) -> String {
 
 fn special_meter(run: &InvadeRun, stats: &Stats) -> String {
     let player = run.player();
-    let name = if run.rig() == Rig::Probe && run.pivot_kind() == PivotKind::Missile {
-        "MISSILE".into()
-    } else {
-        run.rig().special_name().to_uppercase()
-    };
+    let name = run.special_name().to_uppercase();
     let filled = if player.charges >= stats.max_charges {
         10
     } else {
         ((player.recharge / stats.recharge) * 10.0).floor().clamp(0.0, 10.0) as usize
     };
     let bar: String = (0..10).map(|i| if i < filled { '#' } else { '-' }).collect();
-    let state = if player.charges > 0 { "READY" } else { "CHARGING" };
+    let state = if run.rate_limited() > 0.0 {
+        format!("ACTIVE {:.1}s", run.rate_limited())
+    } else if run.overclocked() > 0.0 {
+        format!("ACTIVE {:.1}s", run.overclocked())
+    } else if player.charges > 0 {
+        "READY".to_string()
+    } else {
+        "CHARGING".to_string()
+    };
     let charges =
         if stats.max_charges > 1 { format!(" x{}/{}", player.charges, stats.max_charges) } else { String::new() };
     format!("{name:<8} [{bar}] {state}{charges}")
@@ -1871,10 +1968,17 @@ fn stat_lines(rig: Rig, s: &Stats) -> Vec<(&'static str, String)> {
         ("Special recharge", format!("{:.1} s × {} charge(s)", s.recharge, s.max_charges)),
     ];
     lines.push(match rig {
-        Rig::Probe => ("Pivot", format!("{:.0} direct, {} jumps of 3", s.pivot_direct, s.pivot_jumps)),
+        Rig::Probe | Rig::Train => ("Pivot", format!("{:.0} direct, {} jumps of 3", s.pivot_direct, s.pivot_jumps)),
         Rig::Ghost => ("Slip protection", format!("{:.2} s", s.slip_protection)),
         Rig::Bastion => ("Barrier", format!("{:.1} s", s.barrier_protection)),
+        Rig::Tonk => ("Reflect", format!("{:.1} s", s.reflect_protection)),
+        Rig::Relay => ("Overclock", format!("{:.1} s", s.overclock_time)),
+        Rig::Kernel => ("Purge radius", format!("{:.0} units", s.purge_radius)),
     });
+    lines.push(("Max integrity", format!("{}", s.max_integrity)));
+    if rig == Rig::Train {
+        lines.push(("Tail cars", format!("{}", s.tail)));
+    }
     if let Some(fork) = s.fork_damage {
         lines.push(("Fork packets", format!("2 × {fork:.2}")));
     }
@@ -2214,7 +2318,7 @@ mod tests {
             assert_eq!(direction_glyph(direction.0, direction.1), expected);
         }
         for rig in Rig::ALL {
-            let footer = control_footer(rig);
+            let footer = control_footer(rig, rig.special_name());
             assert!(footer.is_ascii() && footer.lines().all(|line| line.len() <= COLUMNS as usize), "{footer}");
             assert!(!footer.contains("[Space]"));
             for control in ["Turn", "Thrust", "Brake", "coast", "Auto-fire", "[Esc/P] Pause", "[B] Build"] {

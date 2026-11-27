@@ -20,7 +20,7 @@ pub const THEME_KEYS: [&str; 4] = ["fg", "bg", "cursor", "selection"];
 pub const DEFAULT_THEME: &str = "Snekkie Dark";
 
 /// Built-in presets: foreground, background, cursor, selection.
-pub const THEMES: [(&str, [&str; 4]); 21] = [
+pub const THEMES: [(&str, [&str; 4]); 30] = [
     ("Snekkie Dark", ["#e1e4df", "#151716", "#9bc88a", "#334436"]),
     ("Solarized Dark", ["#93a1a1", "#002b36", "#268bd2", "#073642"]),
     ("Solarized Light", ["#52676f", "#fdf6e3", "#268bd2", "#eee8d5"]),
@@ -33,6 +33,9 @@ pub const THEMES: [(&str, [&str; 4]); 21] = [
     ("E-Ink Super", ["#252722", "#ecece2", "#343830", "#c6c9bb"]),
     ("Blueprint Super", ["#ccecff", "#102c49", "#73d5ff", "#284e6b"]),
     ("Amber Super", ["#ffd078", "#1c1209", "#ffe0a3", "#634323"]),
+    ("Space Super", ["#e6ecff", "#060a18", "#8fb8ff", "#2c3f73"]),
+    ("Neon Super", ["#f4ebff", "#0f0a22", "#ff5fd9", "#4a2a7a"]),
+    ("Sonar Super", ["#9df6e2", "#04181b", "#41ffcb", "#11504d"]),
     ("Amber Terminal", ["#ffbf5a", "#171008", "#ffda91", "#604018"]),
     ("Midnight Blue", ["#d7e3ff", "#101827", "#82b5ff", "#29466d"]),
     ("Ocean", ["#c7ece8", "#0c242b", "#5de0c7", "#24535d"]),
@@ -42,6 +45,12 @@ pub const THEMES: [(&str, [&str; 4]); 21] = [
     ("Frost Light", ["#293b44", "#f0f5f5", "#236d7b", "#c9dfe2"]),
     ("Copper Night", ["#eee2d6", "#1c1a18", "#d5a57e", "#4b3b30"]),
     ("Forest Night", ["#dce8dd", "#171d19", "#94c6a3", "#33493a"]),
+    ("Aurora", ["#d9f2e6", "#0e1b22", "#5ff0b0", "#234a4a"]),
+    ("Rose Dusk", ["#f2dfe3", "#241820", "#f08aa8", "#553044"]),
+    ("Graphite", ["#d4d7dc", "#1b1d21", "#7fb2ff", "#3a404a"]),
+    ("Ember", ["#f3e2cf", "#1d1310", "#ff8a4c", "#5a3022"]),
+    ("Sandstone Light", ["#3f352a", "#f4ecdd", "#9a5620", "#e3d3b8"]),
+    ("Harbor Light", ["#22364a", "#eef3f8", "#1f6fb2", "#c9dcec"]),
 ];
 
 /// Themes that have been renamed. A settings.json written before the app
@@ -57,10 +66,14 @@ pub enum AppAppearance {
     EInk,
     Blueprint,
     Amber,
+    Space,
+    Neon,
+    Sonar,
 }
 
 impl AppAppearance {
-    pub const ALL: [Self; 5] = [Self::Standard, Self::Crt, Self::EInk, Self::Blueprint, Self::Amber];
+    pub const ALL: [Self; 8] =
+        [Self::Standard, Self::Crt, Self::EInk, Self::Blueprint, Self::Amber, Self::Space, Self::Neon, Self::Sonar];
     pub fn label(self) -> &'static str {
         match self {
             Self::Standard => "Standard",
@@ -68,6 +81,9 @@ impl AppAppearance {
             Self::EInk => "E-Ink reader",
             Self::Blueprint => "Blueprint console",
             Self::Amber => "Amber workstation",
+            Self::Space => "Space observatory",
+            Self::Neon => "Neon grid",
+            Self::Sonar => "Sonar console",
         }
     }
 }
@@ -144,6 +160,7 @@ fn preset(name: &str) -> Option<Theme> {
                     | "E-Ink Super"
                     | "Blueprint Super"
                     | "Amber Super"
+                    | "Sonar Super"
             ),
             crt: matches!(name, "CRT" | "CRT Super" | "Amber Super"),
             retro_ui: name == "CRT Super",
@@ -151,6 +168,9 @@ fn preset(name: &str) -> Option<Theme> {
                 "E-Ink Super" => AppAppearance::EInk,
                 "Blueprint Super" => AppAppearance::Blueprint,
                 "Amber Super" => AppAppearance::Amber,
+                "Space Super" => AppAppearance::Space,
+                "Neon Super" => AppAppearance::Neon,
+                "Sonar Super" => AppAppearance::Sonar,
                 _ => AppAppearance::Standard,
             },
         },
@@ -208,6 +228,31 @@ impl Theme {
             );
         }
         scheme
+    }
+}
+
+/// One of the user's own highlights, drawn over device highlighting in
+/// every session. Display only, like device highlighting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HighlightRule {
+    #[serde(deserialize_with = "lenient")]
+    pub text: String,
+    /// `text` is a regular expression rather than plain text.
+    #[serde(deserialize_with = "lenient")]
+    pub regex: bool,
+    #[serde(deserialize_with = "lenient")]
+    pub match_case: bool,
+    /// "#rrggbb" text color.
+    #[serde(deserialize_with = "lenient")]
+    pub color: String,
+    #[serde(deserialize_with = "lenient")]
+    pub bold: bool,
+}
+
+impl Default for HighlightRule {
+    fn default() -> Self {
+        HighlightRule { text: String::new(), regex: false, match_case: false, color: "#ffd75f".into(), bold: false }
     }
 }
 
@@ -270,11 +315,47 @@ pub struct AppSettings {
     pub preview_multiline_paste: bool,
     #[serde(deserialize_with = "lenient_paste_delay")]
     pub paste_delay_ms: u64,
+    /// Remote programs may write the local clipboard with OSC 52. Never read.
+    #[serde(deserialize_with = "lenient")]
+    pub remote_clipboard: bool,
+    /// Tabs show the window title the far end sets instead of the profile name.
+    #[serde(deserialize_with = "lenient")]
+    pub remote_titles: bool,
     /// Shared by every device syntax and all open sessions.
     #[serde(deserialize_with = "lenient")]
     pub highlighting_intensity: u8,
+    /// At most `highlight::MAX_USER_RULES`, applied in order.
+    #[serde(deserialize_with = "lenient")]
+    pub highlight_rules: Vec<HighlightRule>,
     #[serde(deserialize_with = "lenient")]
     pub animations: Animations,
+    /// A row of pinned snippet buttons above the terminal.
+    #[serde(deserialize_with = "lenient")]
+    pub button_bar: bool,
+    /// Reopen saved-session tabs, disconnected, on the next start.
+    #[serde(deserialize_with = "lenient")]
+    pub restore_tabs: bool,
+    /// The tabs open when Snekkie last closed, while `restore_tabs` is on.
+    #[serde(deserialize_with = "lenient")]
+    pub last_tabs: LastTabs,
+}
+
+/// Open tabs by saved profile name. No connection details, never secrets.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LastTabs {
+    pub tabs: Vec<LastTab>,
+    /// Split view columns, top to bottom, as indexes into `tabs`.
+    pub split: Vec<Vec<usize>>,
+    pub active: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LastTab {
+    pub profile: String,
+    /// A file explorer tab rather than a terminal.
+    pub explorer: bool,
 }
 
 impl Default for AppSettings {
@@ -302,8 +383,14 @@ impl Default for AppSettings {
             right_click_paste: true,
             preview_multiline_paste: true,
             paste_delay_ms: crate::paste::DEFAULT_DELAY_MS,
+            remote_clipboard: false,
+            remote_titles: false,
             highlighting_intensity: crate::terminal::highlight::DEFAULT_INTENSITY,
+            highlight_rules: Vec::new(),
             animations: Animations::default(),
+            button_bar: false,
+            restore_tabs: false,
+            last_tabs: LastTabs::default(),
         }
     }
 }
@@ -381,6 +468,7 @@ animation_kind! {
         Fade = "fade", "Fade", "The cursor fades out and back in.";
         Pulse = "pulse", "Pulse", "The cursor dims and brightens without ever disappearing.";
         Glow = "glow", "Glow", "The cursor stays on, with a soft halo that swells and fades around it.";
+        Heartbeat = "heartbeat", "Heartbeat", "The cursor rests dim and gives two quick pulses, then waits.";
         Steady = "steady", "Steady", "The cursor stays fully visible without blinking or a halo.";
     }
 }
@@ -395,6 +483,8 @@ animation_kind! {
         Fade = "fade", "Fade", "Each character fades in.";
         Stamp = "stamp", "Stamp", "Each character stamps down from above and settles into the cell.";
         Laser = "laser", "Laser", "A bright laser pulse writes each character, then cools.";
+        Jelly = "jelly", "Jelly", "Each character lands soft and wobbles in size before it settles.";
+        Neon = "neon", "Neon", "Each character stutters on in the cursor color, like a neon tube.";
     }
 }
 
@@ -412,6 +502,9 @@ animation_kind! {
         Lasers = "lasers", "Lasers", "Glowing laser bolts shoot outward from the cursor.";
         Lightning = "lightning", "Lightning", "Short branching bolts of electricity crackle around the cursor.";
         Portal = "portal", "Portal", "A ring opens with orbiting sparks, then fades closed.";
+        Comet = "comet", "Comet", "A comet streaks away from the cursor with a trail of dust.";
+        Fireflies = "fireflies", "Fireflies", "A few slow, glowing fireflies wander off and blink out.";
+        Orbit = "orbit", "Orbit", "Small moons circle the cursor once and fade.";
     }
 }
 
@@ -437,6 +530,8 @@ animation_kind! {
         Hologram = "hologram", "Hologram", "New text materializes with a gentle holographic shimmer.";
         Matrix = "matrix", "Binary decode", "A shower of binary digits resolves into the actual output.";
         Focus = "focus", "Focus", "New text fades in at almost full size and gently settles into focus.";
+        Flicker = "flicker", "Flicker", "New text stutters on like a fluorescent tube warming up.";
+        Glitch = "glitch", "Glitch", "A few characters of new text scramble in the cursor color, then snap to what they are.";
     }
 }
 
@@ -474,6 +569,8 @@ animation_kind! {
         Radar = "radar", "Radar pulse", "An expanding radar ring marks fresh output.";
         Bookends = "bookends", "Bookends", "Short brackets mark the ends of fresh output and quickly fade without moving the text.";
         Outline = "outline", "Outline", "A thin outline briefly frames fresh output, then fades without covering the text.";
+        Wipe = "wipe", "Wipe", "A soft band of the cursor color opens across new lines and is gone.";
+        Beacon = "beacon", "Beacon", "A small light in the margin blinks twice beside new lines.";
     }
 }
 
@@ -665,6 +762,7 @@ impl SettingsStore {
         settings.animations.speed = settings.animations.pace();
         settings.highlighting_intensity =
             crate::terminal::highlight::normalize_intensity(settings.highlighting_intensity);
+        settings.highlight_rules.truncate(crate::terminal::highlight::MAX_USER_RULES);
         // The installer writes only this small policy file, leaving all existing
         // themes, profiles and JSON preferences intact. Preferences keeps it in sync.
         let policy_path = self.path.with_file_name("network.ini");
@@ -747,7 +845,9 @@ mod tests {
     fn all_super_appearances_round_trip_and_legacy_crt_still_loads() {
         let dir = tempfile::tempdir().unwrap();
         let store = SettingsStore::new(dir.path().join("settings.json"));
-        for name in ["E-Ink Super", "Blueprint Super", "Amber Super", "CRT Super"] {
+        for name in
+            ["E-Ink Super", "Blueprint Super", "Amber Super", "CRT Super", "Space Super", "Neon Super", "Sonar Super"]
+        {
             let mut settings = AppSettings::default();
             let theme = settings.theme_named(name);
             assert!(theme.effects.is_super());
@@ -762,6 +862,44 @@ mod tests {
         }
         let legacy = load(r##"{"saved_themes":{"Old CRT":{"fg":"#33ff33","retro_ui":true}},"theme":"Old CRT"}"##);
         assert_eq!(legacy.colors().effects.appearance(), AppAppearance::Crt);
+    }
+
+    #[test]
+    fn new_presets_and_appearances_load_and_older_files_are_untouched() {
+        for (name, appearance) in [
+            ("Space Super", AppAppearance::Space),
+            ("Neon Super", AppAppearance::Neon),
+            ("Sonar Super", AppAppearance::Sonar),
+            ("Aurora", AppAppearance::Standard),
+            ("Rose Dusk", AppAppearance::Standard),
+            ("Graphite", AppAppearance::Standard),
+            ("Ember", AppAppearance::Standard),
+            ("Sandstone Light", AppAppearance::Standard),
+            ("Harbor Light", AppAppearance::Standard),
+        ] {
+            assert!(is_builtin(name));
+            assert_eq!(AppSettings::default().theme_named(name).effects.appearance(), appearance);
+        }
+        // Stored names, so files stay readable by name and not by position.
+        let custom = load(r##"{"theme":"Custom","custom_fg":"#112233","custom_effects":{"appearance":"space"}}"##);
+        assert_eq!(custom.colors().effects.appearance(), AppAppearance::Space);
+        let saved = load(r##"{"theme":"Sky","saved_themes":{"Sky":{"fg":"#112233","appearance":"space"}}}"##);
+        assert_eq!(saved.colors().effects.appearance(), AppAppearance::Space);
+        // A saved theme from before these existed keeps its name and colors, even a clashing one.
+        let older = load(r##"{"theme":"Ember","saved_themes":{"Ember":{"fg":"#112233","bg":"#445566"}}}"##);
+        assert_eq!(older.colors().fg, parse_hex("#112233").unwrap());
+        assert!(!older.colors().effects.is_super());
+        // An appearance this version doesn't know is the standard one, and the rest still loads.
+        let future = load(r##"{"theme":"F","saved_themes":{"F":{"fg":"#112233","appearance":"hologram"}}}"##);
+        assert_eq!(future.colors().effects.appearance(), AppAppearance::Standard);
+        // New animation choices are saved by name, and an unknown one falls back.
+        let styles = load(
+            r##"{"animations":{"keystroke_burst":"comet","new_text":"glitch","new_lines":"beacon","typed_text":"nope"}}"##,
+        );
+        assert_eq!(styles.animations.keystroke_burst, KeystrokeBurst::Comet);
+        assert_eq!(styles.animations.new_text, NewText::Glitch);
+        assert_eq!(styles.animations.new_lines, NewLines::Beacon);
+        assert_eq!(styles.animations.typed_text, TypedText::default());
     }
 
     #[test]
@@ -823,7 +961,13 @@ mod tests {
             let settings = load(json);
             assert!(settings.preview_multiline_paste);
             assert_eq!(settings.paste_delay_ms, 100);
+            assert!(!settings.remote_clipboard && !settings.remote_titles);
+            assert!(settings.highlight_rules.is_empty());
+            assert!(!settings.button_bar && !settings.restore_tabs);
+            assert_eq!(settings.last_tabs, LastTabs::default());
         }
+        let bad = load(r#"{"restore_tabs":true,"last_tabs":{"tabs":"oops"}}"#);
+        assert!(bad.restore_tabs && bad.last_tabs.tabs.is_empty());
         assert_eq!(load(r#"{"paste_delay_ms":999999}"#).paste_delay_ms, crate::paste::MAX_DELAY_MS);
         let dir = tempfile::tempdir().unwrap();
         let store = SettingsStore::new(dir.path().join("settings.json"));

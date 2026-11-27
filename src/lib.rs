@@ -11,6 +11,7 @@ pub mod putty;
 pub mod session;
 pub mod settings;
 pub mod snippets;
+pub mod ssh_config;
 pub mod terminal;
 pub mod transport;
 pub mod ui;
